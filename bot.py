@@ -13,7 +13,7 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -656,9 +656,21 @@ def _menu_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До меню", callback_data="menu_back")]])
 
 
+def _persistent_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📋 Меню")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
+    await update.message.reply_text(
+        "Кнопка «📋 Меню» тепер закріплена внизу — можна відкривати меню одним тапом, без набору команди.",
+        reply_markup=_persistent_menu_keyboard(),
+    )
     await update.message.reply_text("Оберіть дію:", reply_markup=_menu_main_keyboard())
 
 
@@ -922,6 +934,7 @@ def main():
     application.add_handler(CommandHandler("testsegment", testsegment))
     application.add_handler(CommandHandler("sendto", sendto_start))
     application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(MessageHandler(filters.Regex("^📋 Меню$"), menu_command))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
     application.add_handler(CallbackQueryHandler(sendto_cancel_callback, pattern=r"^sendto_cancel$"))
