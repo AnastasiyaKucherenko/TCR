@@ -76,6 +76,25 @@ def init_db():
             schedule_time TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schedules (
+            segment TEXT NOT NULL,
+            weekday INTEGER NOT NULL,
+            hhmm TEXT NOT NULL,
+            PRIMARY KEY (segment, weekday, hhmm)
+        )
+    """)
+    # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
+    # таблицю schedules, щоб не втратити те, що вже було задано раніше.
+    old_rows = conn.execute(
+        "SELECT name, schedule_day, schedule_time FROM segments "
+        "WHERE schedule_day IS NOT NULL AND schedule_time IS NOT NULL"
+    ).fetchall()
+    for r in old_rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO schedules (segment, weekday, hhmm) VALUES (?, ?, ?)",
+            (r["name"], r["schedule_day"], r["schedule_time"]),
+        )
     conn.commit()
     conn.close()
 
@@ -109,8 +128,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     await update.message.reply_text(
-        "Привіт! Дякуємо, що підписались на новини нашої ростерії ☕️\n"
-        "Тут ви отримуватимете новини про кавові новинки, акції та зміни в асортименті.\n\n"
+        "Привіт! Дякуємо, що підписались на новини нашої ростерії 🫶\n"
+        "Тут ви отримуватимете нагадування, інформацію про кавові новинки, акції та зміни в асортименті😉\n\n"
         "Якщо захочете відписатись — просто напишіть /stop."
     )
 
@@ -137,6 +156,47 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     await update.message.reply_text("Ви відписались від розсилки. Щоб повернутись — надішліть /start.")
+
+
+async def setsegment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Дозволяє будь-коли перепризначити сегмент існуючому клієнту — за юзернеймом або chat_id."""
+    if not is_admin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Використання: /setsegment @юзернейм_або_chat_id новий_сегмент\n"
+            "Приклад: /setsegment @ivan_kava gurt_pravyi\n"
+            "Щоб прибрати клієнта з усіх сегментів: /setsegment @ivan_kava __none__\n"
+            "Список клієнтів і їхні chat_id — команда /clients"
+        )
+        return
+    identifier = context.args[0].lstrip("@")
+    new_segment = context.args[1]
+    segment_value = None if new_segment == "__none__" else new_segment
+
+    conn = db()
+    if identifier.isdigit():
+        row = conn.execute("SELECT * FROM subscribers WHERE chat_id=?", (int(identifier),)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM subscribers WHERE LOWER(username)=LOWER(?)", (identifier,)
+        ).fetchone()
+
+    if not row:
+        conn.close()
+        await update.message.reply_text(
+            f"Клієнта «{context.args[0]}» не знайдено серед підписників. Перевірте /clients."
+        )
+        return
+
+    conn.execute("UPDATE subscribers SET segment=? WHERE chat_id=?", (segment_value, row["chat_id"]))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"Готово. {row['name']} (@{row['username'] or '—'}) тепер у сегменті: "
+        f"{segment_value or 'без сегмента'}."
+    )
 
 
 # ---------- Callback: призначення сегмента ----------
@@ -176,32 +236,40 @@ async def segments_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     conn = db()
     rows = conn.execute("SELECT * FROM segments").fetchall()
-    conn.close()
     if not rows:
+        conn.close()
         await update.message.reply_text("Сегментів ще немає. Створіть: /addsegment назва")
         return
     text = "Сегменти:\n\n"
     for r in rows:
-        conn = db()
         count = conn.execute("SELECT COUNT(*) c FROM subscribers WHERE segment=? AND active=1", (r["name"],)).fetchone()["c"]
-        conn.close()
-        day = WEEKDAYS_UA.get(r["schedule_day"], "не задано")
+        sched_rows = conn.execute(
+            "SELECT weekday, hhmm FROM schedules WHERE segment=? ORDER BY weekday, hhmm", (r["name"],)
+        ).fetchall()
+        if sched_rows:
+            schedule_lines = "\n".join(
+                f"      • {WEEKDAYS_UA[s['weekday']]} о {s['hhmm']}" for s in sched_rows
+            )
+        else:
+            schedule_lines = "      (розклад не задано)"
         text += (
             f"📁 {r['name']} ({count} клієнтів)\n"
-            f"   Розклад: {day} {r['schedule_time'] or ''}\n"
+            f"   Розклад:\n{schedule_lines}\n"
             f"   Повідомлення: {r['message'][:60] + '...' if r['message'] and len(r['message']) > 60 else (r['message'] or '(порожнє)')}\n\n"
         )
+    conn.close()
     await update.message.reply_text(text)
 
 
 async def setschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Повністю ЗАМІНЮЄ розклад сегмента на один запис (видаляє всі попередні)."""
     if not is_admin(update):
         return
-    if len(context.args) < 2 or context.args[0] not in [] and len(context.args) < 3:
-        pass
     if len(context.args) < 3:
         await update.message.reply_text(
             "Використання: /setschedule сегмент день ГГ:ХХ\n"
+            "⚠️ Ця команда ЗАМІНЮЄ весь розклад сегмента одним записом.\n"
+            "Якщо потрібно ДОДАТИ ще один час (не видаляючи наявні) — використовуйте /addschedule.\n"
             "День: mon, tue, wed, thu, fri, sat, sun\n"
             "Приклад: /setschedule wholesale mon 10:00"
         )
@@ -219,17 +287,98 @@ async def setschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = db()
     conn.execute("INSERT OR IGNORE INTO segments (name) VALUES (?)", (name,))
+    conn.execute("DELETE FROM schedules WHERE segment=?", (name,))
     conn.execute(
-        "UPDATE segments SET schedule_day=?, schedule_time=? WHERE name=?",
-        (WEEKDAYS[day_str], time_str, name),
+        "INSERT INTO schedules (segment, weekday, hhmm) VALUES (?, ?, ?)",
+        (name, WEEKDAYS[day_str], time_str),
     )
     conn.commit()
     conn.close()
 
-    schedule_segment_job(context.application, name, WEEKDAYS[day_str], hh, mm)
+    remove_all_segment_jobs(context.application, name)
+    create_segment_job(context.application, name, WEEKDAYS[day_str], hh, mm)
     await update.message.reply_text(
-        f"Готово. Сегмент «{name}» тепер отримує розсилку щотижня "
-        f"у {WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str}."
+        f"Готово. Розклад сегмента «{name}» ЗАМІНЕНО одним записом: "
+        f"{WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str}.\n"
+        f"Щоб додати ще один час без видалення цього — /addschedule {name} день ГГ:ХХ"
+    )
+
+
+async def addschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ДОДАЄ ще один час розсилки для сегмента, не видаляючи наявні."""
+    if not is_admin(update):
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Використання: /addschedule сегмент день ГГ:ХХ\n"
+            "Додає ще один час розсилки для сегмента (наявні розклади лишаються).\n"
+            "Приклад: /addschedule wholesale thu 16:00"
+        )
+        return
+    name, day_str, time_str = context.args[0], context.args[1].lower(), context.args[2]
+    if day_str not in WEEKDAYS:
+        await update.message.reply_text("Невірний день. Використовуйте: mon, tue, wed, thu, fri, sat, sun")
+        return
+    try:
+        hh, mm = map(int, time_str.split(":"))
+        assert 0 <= hh < 24 and 0 <= mm < 60
+    except Exception:
+        await update.message.reply_text("Невірний формат часу. Приклад: 10:00")
+        return
+
+    conn = db()
+    conn.execute("INSERT OR IGNORE INTO segments (name) VALUES (?)", (name,))
+    conn.execute(
+        "INSERT OR IGNORE INTO schedules (segment, weekday, hhmm) VALUES (?, ?, ?)",
+        (name, WEEKDAYS[day_str], time_str),
+    )
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) c FROM schedules WHERE segment=?", (name,)).fetchone()["c"]
+    conn.close()
+
+    create_segment_job(context.application, name, WEEKDAYS[day_str], hh, mm)
+    await update.message.reply_text(
+        f"Додано. Сегмент «{name}» тепер отримує розсилку у {WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str} "
+        f"(додатково до вже наявних). Всього записів розкладу: {count}."
+    )
+
+
+async def removeschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Видаляє один конкретний запис розкладу сегмента."""
+    if not is_admin(update):
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Використання: /removeschedule сегмент день ГГ:ХХ\n"
+            "Видаляє один конкретний час розсилки (інші лишаються).\n"
+            "Приклад: /removeschedule wholesale thu 16:00"
+        )
+        return
+    name, day_str, time_str = context.args[0], context.args[1].lower(), context.args[2]
+    if day_str not in WEEKDAYS:
+        await update.message.reply_text("Невірний день. Використовуйте: mon, tue, wed, thu, fri, sat, sun")
+        return
+    try:
+        hh, mm = map(int, time_str.split(":"))
+        assert 0 <= hh < 24 and 0 <= mm < 60
+    except Exception:
+        await update.message.reply_text("Невірний формат часу. Приклад: 10:00")
+        return
+
+    conn = db()
+    conn.execute(
+        "DELETE FROM schedules WHERE segment=? AND weekday=? AND hhmm=?",
+        (name, WEEKDAYS[day_str], time_str),
+    )
+    conn.commit()
+    conn.close()
+
+    job_name = _job_name(name, WEEKDAYS[day_str], hh, mm)
+    for job in context.application.job_queue.get_jobs_by_name(job_name):
+        job.schedule_removal()
+
+    await update.message.reply_text(
+        f"Видалено запис розкладу для «{name}»: {WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str}."
     )
 
 
@@ -297,6 +446,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_segment_broadcast(context: ContextTypes.DEFAULT_TYPE):
     segment = context.job.data["segment"]
+    logger.info(f"[FIRE] Спрацювало завдання розсилки для сегмента «{segment}» о {datetime.now(TZ)}")
     conn = db()
     seg_row = conn.execute("SELECT message FROM segments WHERE name=?", (segment,)).fetchone()
     if not seg_row or not seg_row["message"]:
@@ -320,27 +470,59 @@ async def send_segment_broadcast(context: ContextTypes.DEFAULT_TYPE):
         await notify_admins(context, f"✅ Автоматична розсилка сегменту «{segment}» виконана. Надіслано: {sent}, помилок: {failed}")
 
 
-def schedule_segment_job(application: Application, name: str, weekday: int, hh: int, mm: int):
-    # прибираємо старе завдання для цього сегмента, якщо було
-    for job in application.job_queue.get_jobs_by_name(f"segment_{name}"):
+def _job_name(segment: str, weekday: int, hh: int, mm: int) -> str:
+    return f"segment_{segment}_{weekday}_{hh:02d}{mm:02d}"
+
+
+def create_segment_job(application: Application, segment: str, weekday: int, hh: int, mm: int):
+    """Створює (або перестворює) ОДНЕ конкретне завдання розсилки, не чіпаючи інші розклади цього сегмента."""
+    name = _job_name(segment, weekday, hh, mm)
+    for job in application.job_queue.get_jobs_by_name(name):
         job.schedule_removal()
-    application.job_queue.run_daily(
+    new_job = application.job_queue.run_daily(
         send_segment_broadcast,
         time=time(hour=hh, minute=mm, tzinfo=TZ),
         days=(weekday,),
-        name=f"segment_{name}",
-        data={"segment": name},
+        name=name,
+        data={"segment": segment},
     )
+    logger.info(
+        f"[SCHEDULE] Створено завдання {name}: weekday={weekday}, "
+        f"time={hh:02d}:{mm:02d} TZ={TZ}. Наступний запуск: {new_job.next_t}"
+    )
+
+
+def remove_all_segment_jobs(application: Application, segment: str) -> int:
+    """Видаляє УСІ заплановані завдання для сегмента (використовується в /setschedule, який замінює розклад повністю)."""
+    prefix = f"segment_{segment}_"
+    jobs = [j for j in application.job_queue.jobs() if j.name and j.name.startswith(prefix)]
+    for j in jobs:
+        j.schedule_removal()
+    return len(jobs)
 
 
 async def load_schedules_on_startup(application: Application):
     conn = db()
-    rows = conn.execute("SELECT * FROM segments WHERE schedule_day IS NOT NULL AND schedule_time IS NOT NULL").fetchall()
+    rows = conn.execute("SELECT segment, weekday, hhmm FROM schedules").fetchall()
     conn.close()
     for r in rows:
-        hh, mm = map(int, r["schedule_time"].split(":"))
-        schedule_segment_job(application, r["name"], r["schedule_day"], hh, mm)
-        logger.info(f"Заплановано розсилку для сегмента {r['name']}: {WEEKDAYS_UA[r['schedule_day']]} {r['schedule_time']}")
+        hh, mm = map(int, r["hhmm"].split(":"))
+        create_segment_job(application, r["segment"], r["weekday"], hh, mm)
+        logger.info(f"Заплановано розсилку для сегмента {r['segment']}: {WEEKDAYS_UA[r['weekday']]} {r['hhmm']}")
+
+
+async def jobs_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    jobs = context.application.job_queue.jobs()
+    if not jobs:
+        await update.message.reply_text("Заплановних завдань немає.")
+        return
+    text = f"Поточний час сервера: {datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}\n\nЗавдання:\n\n"
+    for j in jobs:
+        next_run = j.next_t.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if j.next_t else "не заплановано"
+        text += f"• {j.name} — наступний запуск: {next_run}\n"
+    await update.message.reply_text(text)
 
 
 # ---------- Довідка ----------
@@ -352,11 +534,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Команди адміністратора:\n\n"
         "/addsegment назва — створити сегмент клієнтів\n"
-        "/setschedule сегмент день ГГ:ХХ — задати щотижневий розклад (mon..sun)\n"
+        "/setschedule сегмент день ГГ:ХХ — ЗАМІНИТИ весь розклад сегмента одним записом (mon..sun)\n"
+        "/addschedule сегмент день ГГ:ХХ — ДОДАТИ ще один час розсилки, не видаляючи наявні (для 2+ разів на тиждень)\n"
+        "/removeschedule сегмент день ГГ:ХХ — видалити один конкретний запис розкладу\n"
         "/setmsg сегмент текст — задати повідомлення для автоматичної розсилки сегмента\n"
-        "/segments — список сегментів, розкладів і повідомлень\n"
+        "/segments — список сегментів, усіх їхніх розкладів і повідомлень\n"
         "/clients — список активних підписників\n"
+        "/setsegment @юзернейм_або_chat_id сегмент — будь-коли перепризначити клієнту сегмент\n"
         "/broadcast текст — надіслати повідомлення ОДРАЗУ всім підписникам (акції, зміни цін)\n"
+        "/jobs — перевірити заплановані розсилки і час наступного запуску (діагностика)\n"
     )
 
 
@@ -376,9 +562,13 @@ def main():
     application.add_handler(CommandHandler("addsegment", addsegment))
     application.add_handler(CommandHandler("segments", segments_list))
     application.add_handler(CommandHandler("setschedule", setschedule))
+    application.add_handler(CommandHandler("addschedule", addschedule))
+    application.add_handler(CommandHandler("removeschedule", removeschedule))
     application.add_handler(CommandHandler("setmsg", setmsg))
     application.add_handler(CommandHandler("clients", clients_list))
+    application.add_handler(CommandHandler("setsegment", setsegment))
     application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CallbackQueryHandler(assign_callback, pattern=r"^assign:"))
 
     logger.info("Бот запущено")
