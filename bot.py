@@ -542,6 +542,20 @@ async def load_schedules_on_startup(application: Application):
         logger.info(f"Заплановано розсилку для сегмента {r['segment']}: {WEEKDAYS_UA[r['weekday']]} {r['hhmm']}")
 
 
+async def testsegment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Негайно запускає розсилку для сегмента — для перевірки тексту й доставки без очікування розкладу."""
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Використання: /testsegment сегмент\nПриклад: /testsegment staff")
+        return
+    segment = context.args[0]
+    fake_job = type("FakeJob", (), {"data": {"segment": segment}})()
+    fake_context = type("FakeContext", (), {"job": fake_job, "bot": context.bot})()
+    await update.message.reply_text(f"Запускаю тестову розсилку для «{segment}» прямо зараз...")
+    await send_segment_broadcast(fake_context)
+
+
 async def jobs_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -576,6 +590,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/broadcastfile — надішліть PDF (або інший файл) боту з підписом, що починається на "
         "«/broadcastfile ваш текст», і він одразу розійде цей файл усім підписникам\n"
         "/jobs — перевірити заплановані розсилки і час наступного запуску (діагностика)\n"
+        "/testsegment сегмент — надіслати розсилку сегмента ПРЯМО ЗАРАЗ, без очікування розкладу (для перевірки)\n"
     )
 
 
@@ -605,6 +620,7 @@ def main():
         MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/broadcastfile"), broadcast_file)
     )
     application.add_handler(CommandHandler("jobs", jobs_list))
+    application.add_handler(CommandHandler("testsegment", testsegment))
     application.add_handler(CallbackQueryHandler(assign_callback, pattern=r"^assign:"))
 
     logger.info("Бот запущено")
