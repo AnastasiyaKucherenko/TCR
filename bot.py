@@ -49,6 +49,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Тимчасовий стан для інтерактивного вибору отримувачів команди /sendto
+# (тримається в пам'яті, скидається при перезапуску бота — це нормально для цього сценарію)
+SENDTO_SELECTIONS: dict[int, set[int]] = {}
+SENDTO_AWAITING_TEXT: dict[int, list[int]] = {}
+
 
 # ---------- База даних ----------
 
@@ -473,6 +478,111 @@ async def broadcast_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Розсилка файлу завершена. Надіслано: {sent}, помилок: {failed}")
 
 
+# ---------- Розсилка обраним вручну зі списку (кнопки-перемикачі) ----------
+
+def _build_sendto_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup:
+    selected = SENDTO_SELECTIONS.get(admin_id, set())
+    buttons = []
+    for c in clients:
+        mark = "✅" if c["chat_id"] in selected else "⬜"
+        label = f"{mark} {c['name']} (@{c['username'] or '—'})"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"sendto_toggle:{c['chat_id']}")])
+    buttons.append([
+        InlineKeyboardButton("✅ Надіслати обраним", callback_data="sendto_done"),
+        InlineKeyboardButton("❌ Скасувати", callback_data="sendto_cancel"),
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def sendto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    conn = db()
+    rows = conn.execute(
+        "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("Поки немає активних підписників.")
+        return
+
+    SENDTO_SELECTIONS[admin_id] = set()
+    clients = [dict(r) for r in rows]
+    context.chat_data["sendto_clients"] = clients
+    await update.message.reply_text(
+        "Оберіть, кому надіслати повідомлення (натисніть на людину, щоб додати/прибрати позначку):",
+        reply_markup=_build_sendto_keyboard(admin_id, clients),
+    )
+
+
+async def sendto_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    _, chat_id_str = query.data.split(":", 1)
+    chat_id = int(chat_id_str)
+
+    selected = SENDTO_SELECTIONS.setdefault(admin_id, set())
+    if chat_id in selected:
+        selected.discard(chat_id)
+    else:
+        selected.add(chat_id)
+
+    clients = context.chat_data.get("sendto_clients", [])
+    await query.edit_message_reply_markup(reply_markup=_build_sendto_keyboard(admin_id, clients))
+
+
+async def sendto_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    selected = SENDTO_SELECTIONS.get(admin_id, set())
+    if not selected:
+        await query.answer("Спочатку оберіть хоча б одну людину.", show_alert=True)
+        return
+
+    SENDTO_AWAITING_TEXT[admin_id] = list(selected)
+    SENDTO_SELECTIONS.pop(admin_id, None)
+    await query.edit_message_text(
+        f"Обрано отримувачів: {len(selected)}.\n\n"
+        f"Тепер просто напишіть звичайним повідомленням текст, який хочете їм надіслати."
+    )
+
+
+async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    SENDTO_SELECTIONS.pop(admin_id, None)
+    SENDTO_AWAITING_TEXT.pop(admin_id, None)
+    await query.edit_message_text("Скасовано.")
+
+
+async def sendto_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_chat.id
+    if not is_admin(update) or admin_id not in SENDTO_AWAITING_TEXT:
+        return
+    recipients = SENDTO_AWAITING_TEXT.pop(admin_id)
+    text = update.message.text
+
+    sent, failed = 0, 0
+    for chat_id in recipients:
+        try:
+            await context.bot.send_message(chat_id, text)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Не вдалось надіслати {chat_id}: {e}")
+            failed += 1
+    await update.message.reply_text(f"Надіслано обраним: {sent}, помилок: {failed}.")
+
+
 # ---------- Автоматична розсилка по сегменту (виклик за розкладом) ----------
 
 async def send_segment_broadcast(context: ContextTypes.DEFAULT_TYPE):
@@ -591,6 +701,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«/broadcastfile ваш текст», і він одразу розійде цей файл усім підписникам\n"
         "/jobs — перевірити заплановані розсилки і час наступного запуску (діагностика)\n"
         "/testsegment сегмент — надіслати розсилку сегмента ПРЯМО ЗАРАЗ, без очікування розкладу (для перевірки)\n"
+        "/sendto — обрати конкретних людей зі списку (кнопками) і надіслати їм окреме повідомлення\n"
     )
 
 
@@ -621,7 +732,12 @@ def main():
     )
     application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CommandHandler("testsegment", testsegment))
+    application.add_handler(CommandHandler("sendto", sendto_start))
+    application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
+    application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
+    application.add_handler(CallbackQueryHandler(sendto_cancel_callback, pattern=r"^sendto_cancel$"))
     application.add_handler(CallbackQueryHandler(assign_callback, pattern=r"^assign:"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sendto_receive_text))
 
     logger.info("Бот запущено")
     application.run_polling()
