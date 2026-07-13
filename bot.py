@@ -54,6 +54,9 @@ logger = logging.getLogger(__name__)
 SENDTO_SELECTIONS: dict[int, set[int]] = {}
 SENDTO_AWAITING_TEXT: dict[int, list[int]] = {}
 
+# Стан для кроків меню з кнопками (наприклад, очікування тексту після вибору дії)
+MENU_PENDING: dict[int, dict] = {}
+
 
 # ---------- База даних ----------
 
@@ -238,16 +241,13 @@ async def addsegment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Сегмент «{name}» створено. Тепер задайте йому розклад і повідомлення.")
 
 
-async def segments_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
+def _segments_text() -> str:
     conn = db()
     rows = conn.execute("SELECT * FROM segments").fetchall()
     if not rows:
         conn.close()
-        await update.message.reply_text("Сегментів ще немає. Створіть: /addsegment назва")
-        return
-    text = "Сегменти:\n\n"
+        return "Груп ще немає. Створіть: /addsegment назва"
+    text = "Групи:\n\n"
     for r in rows:
         count = conn.execute("SELECT COUNT(*) c FROM subscribers WHERE segment=? AND active=1", (r["name"],)).fetchone()["c"]
         sched_rows = conn.execute(
@@ -265,7 +265,13 @@ async def segments_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   Повідомлення: {r['message'][:60] + '...' if r['message'] and len(r['message']) > 60 else (r['message'] or '(порожнє)')}\n\n"
         )
     conn.close()
-    await update.message.reply_text(text)
+    return text
+
+
+async def segments_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text(_segments_text())
 
 
 async def setschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -408,21 +414,24 @@ async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Повідомлення для сегмента «{name}» оновлено. Воно надсилатиметься автоматично за розкладом.")
 
 
-async def clients_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
+def _clients_text() -> str:
     conn = db()
     rows = conn.execute("SELECT * FROM subscribers WHERE active=1 ORDER BY joined_at DESC").fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("Поки немає активних підписників.")
-        return
+        return "Поки немає активних підписників."
     text = f"Активних підписників: {len(rows)}\n\n"
     for r in rows[:50]:
         text += f"• {r['name']} (@{r['username'] or '—'}) — сегмент: {r['segment'] or 'немає'}\n"
     if len(rows) > 50:
         text += f"\n...і ще {len(rows) - 50}"
-    await update.message.reply_text(text)
+    return text
+
+
+async def clients_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text(_clients_text())
 
 
 # ---------- Миттєва розсилка всім ----------
@@ -494,26 +503,30 @@ def _build_sendto_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(buttons)
 
 
-async def sendto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    admin_id = update.effective_chat.id
+async def _sendto_send_picker(context: ContextTypes.DEFAULT_TYPE, admin_id: int):
     conn = db()
     rows = conn.execute(
         "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
     ).fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("Поки немає активних підписників.")
+        await context.bot.send_message(admin_id, "Поки немає активних підписників.")
         return
 
     SENDTO_SELECTIONS[admin_id] = set()
     clients = [dict(r) for r in rows]
     context.chat_data["sendto_clients"] = clients
-    await update.message.reply_text(
+    await context.bot.send_message(
+        admin_id,
         "Оберіть, кому надіслати повідомлення (натисніть на людину, щоб додати/прибрати позначку):",
         reply_markup=_build_sendto_keyboard(admin_id, clients),
     )
+
+
+async def sendto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await _sendto_send_picker(context, update.effective_chat.id)
 
 
 async def sendto_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -565,22 +578,196 @@ async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text("Скасовано.")
 
 
-async def sendto_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_chat.id
-    if not is_admin(update) or admin_id not in SENDTO_AWAITING_TEXT:
+    if not is_admin(update):
         return
-    recipients = SENDTO_AWAITING_TEXT.pop(admin_id)
+
+    # 1) Якщо очікуємо текст для розсилки обраним (/sendto)
+    if admin_id in SENDTO_AWAITING_TEXT:
+        recipients = SENDTO_AWAITING_TEXT.pop(admin_id)
+        text = update.message.text
+        sent, failed = 0, 0
+        for chat_id in recipients:
+            try:
+                await context.bot.send_message(chat_id, text)
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Не вдалось надіслати {chat_id}: {e}")
+                failed += 1
+        await update.message.reply_text(f"Надіслано обраним: {sent}, помилок: {failed}.")
+        return
+
+    # 2) Якщо очікуємо текст для одного з кроків меню
+    pending = MENU_PENDING.get(admin_id)
+    if not pending:
+        return
+    action = pending["action"]
     text = update.message.text
 
-    sent, failed = 0, 0
-    for chat_id in recipients:
-        try:
-            await context.bot.send_message(chat_id, text)
-            sent += 1
-        except Exception as e:
-            logger.warning(f"Не вдалось надіслати {chat_id}: {e}")
-            failed += 1
-    await update.message.reply_text(f"Надіслано обраним: {sent}, помилок: {failed}.")
+    if action == "broadcast_text":
+        MENU_PENDING.pop(admin_id, None)
+        conn = db()
+        rows = conn.execute("SELECT chat_id FROM subscribers WHERE active=1").fetchall()
+        conn.close()
+        sent, failed = 0, 0
+        for r in rows:
+            try:
+                await context.bot.send_message(r["chat_id"], text)
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
+                failed += 1
+        await update.message.reply_text(
+            f"✅ Розсилка всім завершена. Надіслано: {sent}, помилок: {failed}.",
+            reply_markup=_menu_back_keyboard(),
+        )
+        return
+
+    if action == "setmsg_text":
+        MENU_PENDING.pop(admin_id, None)
+        segment = pending["segment"]
+        conn = db()
+        conn.execute("INSERT OR IGNORE INTO segments (name) VALUES (?)", (segment,))
+        conn.execute("UPDATE segments SET message=? WHERE name=?", (text, segment))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(
+            f"✅ Повідомлення для групи «{segment}» оновлено.",
+            reply_markup=_menu_back_keyboard(),
+        )
+        return
+
+
+# ---------- Меню з кнопками українською (альтернатива текстовим командам) ----------
+
+def _menu_main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Написати всім", callback_data="menu_broadcast")],
+        [InlineKeyboardButton("🎯 Написати обраним", callback_data="menu_sendto")],
+        [InlineKeyboardButton("👥 Змінити групу клієнта", callback_data="menu_changeseg")],
+        [InlineKeyboardButton("✏️ Змінити повідомлення групи", callback_data="menu_setmsg")],
+        [InlineKeyboardButton("📁 Переглянути групи", callback_data="menu_viewsegments")],
+        [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
+    ])
+
+
+def _menu_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До меню", callback_data="menu_back")]])
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text("Оберіть дію:", reply_markup=_menu_main_keyboard())
+
+
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    data = query.data
+
+    if data == "menu_back":
+        MENU_PENDING.pop(admin_id, None)
+        await query.edit_message_text("Оберіть дію:", reply_markup=_menu_main_keyboard())
+        return
+
+    if data == "menu_broadcast":
+        MENU_PENDING[admin_id] = {"action": "broadcast_text"}
+        await query.edit_message_text(
+            "Напишіть текст, який хочете надіслати ВСІМ клієнтам одразу (просто звичайним повідомленням):"
+        )
+        return
+
+    if data == "menu_sendto":
+        await query.edit_message_text("Завантажую список клієнтів...")
+        await _sendto_send_picker(context, admin_id)
+        return
+
+    if data == "menu_changeseg":
+        conn = db()
+        rows = conn.execute(
+            "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
+            return
+        buttons = [
+            [InlineKeyboardButton(f"{r['name']} (@{r['username'] or '—'})", callback_data=f"menu_pickclient:{r['chat_id']}")]
+            for r in rows
+        ]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "Оберіть клієнта, якому хочете змінити групу:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data == "menu_setmsg":
+        conn = db()
+        rows = conn.execute("SELECT name FROM segments").fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text(
+                "Груп ще немає. Створіть спочатку командою /addsegment назва.",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        buttons = [[InlineKeyboardButton(r["name"], callback_data=f"menu_setmsg_pick:{r['name']}")] for r in rows]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "Для якої групи змінити повідомлення?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data == "menu_viewsegments":
+        await query.edit_message_text(_segments_text(), reply_markup=_menu_back_keyboard())
+        return
+
+    if data == "menu_viewclients":
+        await query.edit_message_text(_clients_text(), reply_markup=_menu_back_keyboard())
+        return
+
+    if data.startswith("menu_pickclient:"):
+        _, chat_id_str = data.split(":", 1)
+        chat_id = int(chat_id_str)
+        conn = db()
+        rows = conn.execute("SELECT name FROM segments").fetchall()
+        conn.close()
+        buttons = [
+            [InlineKeyboardButton(r["name"], callback_data=f"menu_pickseg:{chat_id}:{r['name']}")] for r in rows
+        ]
+        buttons.append([InlineKeyboardButton("Без групи", callback_data=f"menu_pickseg:{chat_id}:__none__")])
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "Оберіть нову групу для цього клієнта:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("menu_pickseg:"):
+        _, chat_id_str, seg = data.split(":", 2)
+        chat_id = int(chat_id_str)
+        segment_value = None if seg == "__none__" else seg
+        conn = db()
+        conn.execute("UPDATE subscribers SET segment=? WHERE chat_id=?", (segment_value, chat_id))
+        conn.commit()
+        row = conn.execute("SELECT name FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
+        conn.close()
+        client_name = row["name"] if row else str(chat_id)
+        await query.edit_message_text(
+            f"✅ Готово. {client_name} тепер у групі: {segment_value or 'без групи'}.",
+            reply_markup=_menu_back_keyboard(),
+        )
+        return
+
+    if data.startswith("menu_setmsg_pick:"):
+        _, seg = data.split(":", 1)
+        MENU_PENDING[admin_id] = {"action": "setmsg_text", "segment": seg}
+        await query.edit_message_text(f"Напишіть новий текст повідомлення для групи «{seg}»:")
+        return
 
 
 # ---------- Автоматична розсилка по сегменту (виклик за розкладом) ----------
@@ -702,6 +889,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/jobs — перевірити заплановані розсилки і час наступного запуску (діагностика)\n"
         "/testsegment сегмент — надіслати розсилку сегмента ПРЯМО ЗАРАЗ, без очікування розкладу (для перевірки)\n"
         "/sendto — обрати конкретних людей зі списку (кнопками) і надіслати їм окреме повідомлення\n"
+        "/menu — відкрити меню з кнопками українською (усі дії без потреби набирати команди)\n"
     )
 
 
@@ -733,11 +921,13 @@ def main():
     application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CommandHandler("testsegment", testsegment))
     application.add_handler(CommandHandler("sendto", sendto_start))
+    application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
     application.add_handler(CallbackQueryHandler(sendto_cancel_callback, pattern=r"^sendto_cancel$"))
     application.add_handler(CallbackQueryHandler(assign_callback, pattern=r"^assign:"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sendto_receive_text))
+    application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu_"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
     logger.info("Бот запущено")
     application.run_polling()
