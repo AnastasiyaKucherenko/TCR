@@ -19,6 +19,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 load_dotenv()
@@ -442,6 +444,35 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Розсилка завершена. Надіслано: {sent}, помилок: {failed}")
 
 
+async def broadcast_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Розсилає прикріплений файл (PDF тощо) усім активним підписникам.
+    Спрацьовує, коли адмін надсилає боту документ із підписом, що починається на /broadcastfile."""
+    if not is_admin(update):
+        return
+    document = update.message.document
+    if not document:
+        return
+
+    caption = update.message.caption or ""
+    text = caption
+    if text.lower().startswith("/broadcastfile"):
+        text = text[len("/broadcastfile"):].strip()
+
+    conn = db()
+    rows = conn.execute("SELECT chat_id FROM subscribers WHERE active=1").fetchall()
+    conn.close()
+
+    sent, failed = 0, 0
+    for r in rows:
+        try:
+            await context.bot.send_document(r["chat_id"], document.file_id, caption=text or None)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Не вдалось надіслати файл {r['chat_id']}: {e}")
+            failed += 1
+    await update.message.reply_text(f"Розсилка файлу завершена. Надіслано: {sent}, помилок: {failed}")
+
+
 # ---------- Автоматична розсилка по сегменту (виклик за розкладом) ----------
 
 async def send_segment_broadcast(context: ContextTypes.DEFAULT_TYPE):
@@ -542,6 +573,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clients — список активних підписників\n"
         "/setsegment @юзернейм_або_chat_id сегмент — будь-коли перепризначити клієнту сегмент\n"
         "/broadcast текст — надіслати повідомлення ОДРАЗУ всім підписникам (акції, зміни цін)\n"
+        "/broadcastfile — надішліть PDF (або інший файл) боту з підписом, що починається на "
+        "«/broadcastfile ваш текст», і він одразу розійде цей файл усім підписникам\n"
         "/jobs — перевірити заплановані розсилки і час наступного запуску (діагностика)\n"
     )
 
@@ -568,6 +601,9 @@ def main():
     application.add_handler(CommandHandler("clients", clients_list))
     application.add_handler(CommandHandler("setsegment", setsegment))
     application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(
+        MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/broadcastfile"), broadcast_file)
+    )
     application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CallbackQueryHandler(assign_callback, pattern=r"^assign:"))
 
