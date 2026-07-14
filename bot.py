@@ -70,6 +70,9 @@ QNA_SELECTIONS: dict[int, set[int]] = {}
 # Ключ: (admin_chat_id, message_id повідомлення з пересилкою) -> chat_id клієнта
 FORWARD_MAP: dict[tuple[int, int], int] = {}
 
+# Стан опитувальника замовлення клієнта: chat_id клієнта -> {"step":..., "point_name":..., ...}
+ORDER_PENDING: dict[int, dict] = {}
+
 WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 BC_MINUTES = [0, 15, 30, 45]
@@ -971,7 +974,10 @@ async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_chat.id
     if not is_admin(update):
-        await forward_client_text(update, context)
+        if admin_id in ORDER_PENDING:
+            await handle_order_text_step(update, context)
+        else:
+            await forward_client_text(update, context)
         return
 
     # 0) Якщо адмін відповідає (Reply) на переслане повідомлення клієнта — надсилаємо відповідь клієнту
@@ -1172,6 +1178,7 @@ def _set_setting(key: str, value: str) -> None:
 CLIENT_BTN_ASSORTMENT = "☕ Асортимент"
 CLIENT_BTN_MANAGER = "💬 Зв'язок з менеджером"
 CLIENT_BTN_DELIVERY = "🚚 Умови доставки"
+CLIENT_BTN_ORDER = "📝 Замовити"
 
 DEFAULT_DELIVERY_TEXT = (
     "Умови доставки:\n\n"
@@ -1194,7 +1201,7 @@ def _client_persistent_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(CLIENT_BTN_ASSORTMENT), KeyboardButton(CLIENT_BTN_DELIVERY)],
-            [KeyboardButton(CLIENT_BTN_MANAGER)],
+            [KeyboardButton(CLIENT_BTN_ORDER), KeyboardButton(CLIENT_BTN_MANAGER)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -1206,8 +1213,11 @@ ASSORTMENT_CATEGORIES = [
     ("blend", "🎨 Бленд"),
     ("palay", "✨ Палай"),
     ("drip", "💧 Дріп"),
+    ("suputni", "🧰 Супутні товари"),
     ("school", "🎓 Школа бариста"),
 ]
+
+ORDER_CATEGORIES = [c for c in ASSORTMENT_CATEGORIES if c[0] != "school"]
 
 
 def _assortment_category_keyboard(prefix: str) -> InlineKeyboardMarkup:
@@ -1265,7 +1275,182 @@ async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_T
         )
 
 
-def _persistent_menu_keyboard() -> ReplyKeyboardMarkup:
+# ---------- Опитувальник замовлення (клієнт) ----------
+
+ORDER_WEIGHTS = ["1 кг", "0,5 кг", "0,25 кг"]
+
+
+def _order_date_keyboard() -> InlineKeyboardMarkup:
+    today = datetime.now(TZ).date()
+    buttons, row = [], []
+    for i in range(14):
+        d = today + timedelta(days=i)
+        label = f"{d.strftime('%d.%m')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
+        row.append(InlineKeyboardButton(label, callback_data=f"order_date:{d.isoformat()}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _order_category_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"order_cat:{key}")]
+        for key, label in ORDER_CATEGORIES
+    ]
+    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _order_weight_keyboard() -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(w, callback_data=f"order_weight:{w}") for w in ORDER_WEIGHTS]
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")]])
+
+
+def _order_summary_text(order: dict) -> str:
+    lines = [
+        f"📝 Нове замовлення",
+        f"Точка: {order.get('point_name', '—')}",
+        f"Адреса: {order.get('address', '—')}",
+        f"Дата: {order.get('date', '—')}",
+        "",
+        "Позиції:",
+    ]
+    for i, item in enumerate(order.get("items", []), 1):
+        cat_label = dict(ORDER_CATEGORIES).get(item.get("category"), item.get("category"))
+        lines.append(
+            f"{i}. {cat_label} — {item.get('item_text', '—')} — {item.get('weight', '—')}\n"
+            f"   Примітка: {item.get('note') or '—'}"
+        )
+    return "\n".join(lines)
+
+
+async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    ORDER_PENDING[chat_id] = {"step": "point_name", "items": []}
+    await update.message.reply_text(
+        "📝 Оформімо замовлення! Напишіть, будь ласка, назву вашої точки (кав'ярні/закладу):"
+    )
+
+
+async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    order = ORDER_PENDING.get(chat_id)
+    if not order:
+        return
+    step = order.get("step")
+    text = update.message.text or ""
+
+    if step == "point_name":
+        order["point_name"] = text
+        order["step"] = "address"
+        await update.message.reply_text("Дякуємо! Тепер напишіть адресу доставки:")
+        return
+
+    if step == "address":
+        order["address"] = text
+        order["step"] = "date"
+        await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+        return
+
+    if step == "item_text":
+        order["current_item"]["item_text"] = text
+        order["step"] = "weight"
+        await update.message.reply_text("Оберіть вагу:", reply_markup=_order_weight_keyboard())
+        return
+
+    if step == "note":
+        order["current_item"]["note"] = text
+        order["items"].append(order.pop("current_item"))
+        order["step"] = "addmore"
+        buttons = [
+            [InlineKeyboardButton("➕ Додати ще позицію", callback_data="order_addmore")],
+            [InlineKeyboardButton("✅ Завершити замовлення", callback_data="order_finish")],
+            [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")],
+        ]
+        await update.message.reply_text(
+            "Додано! Хочете додати ще одну позицію, чи завершити замовлення?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+
+async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    order = ORDER_PENDING.get(chat_id)
+    data = query.data
+
+    if data == "order_cancel":
+        ORDER_PENDING.pop(chat_id, None)
+        await query.edit_message_text("Замовлення скасовано. Якщо передумаєте — просто натисніть «📝 Замовити» ще раз.")
+        return
+
+    if not order:
+        await query.edit_message_text("Це замовлення вже неактуальне. Натисніть «📝 Замовити», щоб почати заново.")
+        return
+
+    if data.startswith("order_date:"):
+        _, date_str = data.split(":", 1)
+        d = datetime.fromisoformat(date_str).date()
+        order["date"] = f"{d.strftime('%d.%m.%Y')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
+        order["step"] = "category"
+        await query.edit_message_text("Яку категорію товару додати до замовлення?", reply_markup=_order_category_keyboard())
+        return
+
+    if data.startswith("order_cat:"):
+        _, cat_key = data.split(":", 1)
+        order["current_item"] = {"category": cat_key}
+        order["step"] = "item_text"
+        label = dict(ORDER_CATEGORIES).get(cat_key, cat_key)
+        await query.edit_message_text(
+            f"{label}\n\nНапишіть, будь ласка, назву позиції (можна подивитись у «☕ Асортимент»):"
+        )
+        return
+
+    if data.startswith("order_weight:"):
+        _, weight = data.split(":", 1)
+        order["current_item"]["weight"] = weight
+        order["step"] = "note"
+        await query.edit_message_text(
+            "Примітка до цієї позиції (пакування, помел тощо)? Якщо немає — напишіть «немає»:"
+        )
+        return
+
+    if data == "order_addmore":
+        order["step"] = "category"
+        await query.edit_message_text("Яку категорію товару додати?", reply_markup=_order_category_keyboard())
+        return
+
+    if data == "order_finish":
+        order = ORDER_PENDING.pop(chat_id, None)
+        if not order or not order.get("items"):
+            await query.edit_message_text("Замовлення порожнє, скасовано.")
+            return
+        summary = _order_summary_text(order)
+        client = update.effective_user
+        target_admin = _resolve_target_admin(chat_id)
+        await query.edit_message_text(
+            "✅ Дякуємо! Ваше замовлення передано менеджеру, скоро з вами зв'яжуться."
+        )
+        if target_admin:
+            try:
+                sent = await context.bot.send_message(
+                    target_admin,
+                    f"{summary}\n\nВід: {client.full_name} (@{client.username or '—'}, chat_id: {chat_id})\n\n"
+                    f"Щоб відповісти клієнту — зробіть Reply на це повідомлення.",
+                )
+                FORWARD_MAP[(target_admin, sent.message_id)] = chat_id
+            except Exception as e:
+                logger.warning(f"Не вдалось переслати замовлення адміну: {e}")
+        return
+
+
+
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📋 Меню")]],
         resize_keyboard=True,
@@ -2469,6 +2654,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ASSORTMENT)}$"), client_show_assortment))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_DELIVERY)}$"), client_show_delivery))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_MANAGER)}$"), client_contact_manager))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER)}$"), order_start))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
@@ -2480,6 +2666,7 @@ def main():
     application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^(bc_|bcq_)"))
     application.add_handler(CallbackQueryHandler(qna_router, pattern=r"^qna_"))
     application.add_handler(CallbackQueryHandler(wg_router, pattern=r"^wg_"))
+    application.add_handler(CallbackQueryHandler(order_router, pattern=r"^order_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
     logger.info("Бот запущено")
@@ -2488,3 +2675,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
