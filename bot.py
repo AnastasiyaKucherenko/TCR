@@ -1021,24 +1021,61 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Меню з кнопками українською (альтернатива текстовим командам) ----------
 
-def _menu_main_keyboard() -> InlineKeyboardMarkup:
+def _menu_root_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Написати всім зараз", callback_data="menu_broadcast")],
-        [InlineKeyboardButton("🎯 Написати обраним зараз", callback_data="menu_sendto")],
-        [InlineKeyboardButton("❓ Запитати так/ні (з посиланням на менеджера)", callback_data="qna_start")],
-        [InlineKeyboardButton("📅 Запланувати розсилку", callback_data="bc_start")],
-        [InlineKeyboardButton("📅❓ Запланувати запитання так/ні", callback_data="bcq_start")],
-        [InlineKeyboardButton("🗑 Скасувати заплановану розсилку", callback_data="bc_cancellist")],
-        [InlineKeyboardButton("📖 Поточні заплановані розсилки", callback_data="bc_viewlist")],
-        [InlineKeyboardButton("➕ Створити нову групу", callback_data="menu_addsegment")],
-        [InlineKeyboardButton("☕ Редагувати асортимент (бачать клієнти)", callback_data="menu_editassortment")],
-        [InlineKeyboardButton("🚚 Редагувати умови доставки (бачать клієнти)", callback_data="menu_editdelivery")],
-        [InlineKeyboardButton("👥 Змінити групу клієнта", callback_data="menu_changeseg")],
-        [InlineKeyboardButton("🙋 Призначити відповідального клієнту", callback_data="menu_setresp")],
+        [InlineKeyboardButton("📤 Зараз (написати/запитати)", callback_data="menu_now")],
+        [InlineKeyboardButton("📅 Заплановано (на потім)", callback_data="menu_scheduled")],
+        [InlineKeyboardButton("👥 Клієнти", callback_data="menu_clients")],
+        [InlineKeyboardButton("⚙️ Налаштування", callback_data="menu_settings")],
+    ])
+
+
+def _menu_now_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📢 Всім зараз", callback_data="menu_broadcast"),
+            InlineKeyboardButton("🎯 Обраним зараз", callback_data="menu_sendto"),
+        ],
+        [InlineKeyboardButton("✉️ Групі зараз (текст/PDF)", callback_data="wg_start")],
+        [InlineKeyboardButton("❓ Запитати так/ні", callback_data="qna_start")],
+        [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
+    ])
+
+
+def _menu_scheduled_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 Розсилка", callback_data="bc_start"),
+            InlineKeyboardButton("📅❓ Запитання", callback_data="bcq_start"),
+        ],
+        [
+            InlineKeyboardButton("📖 Заплановані", callback_data="bc_viewlist"),
+            InlineKeyboardButton("🗑 Скасувати", callback_data="bc_cancellist"),
+        ],
+        [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
+    ])
+
+
+def _menu_clients_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👥 Змінити групу", callback_data="menu_changeseg"),
+            InlineKeyboardButton("🙋 Відповідальний", callback_data="menu_setresp"),
+        ],
         [InlineKeyboardButton("📋 Список клієнтів і відповідальних", callback_data="menu_resplist")],
-        [InlineKeyboardButton("✏️ Змінити повідомлення групи", callback_data="menu_setmsg")],
-        [InlineKeyboardButton("📁 Переглянути групи", callback_data="menu_viewsegments")],
         [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
+        [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
+    ])
+
+
+def _menu_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Створити нову групу", callback_data="menu_addsegment")],
+        [InlineKeyboardButton("☕ Асортимент", callback_data="menu_editassortment"),
+         InlineKeyboardButton("🚚 Доставка", callback_data="menu_editdelivery")],
+        [InlineKeyboardButton("✏️ Повідомлення групи", callback_data="menu_setmsg")],
+        [InlineKeyboardButton("📁 Переглянути групи", callback_data="menu_viewsegments")],
+        [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
     ])
 
 
@@ -1174,7 +1211,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Кнопка «📋 Меню» тепер закріплена внизу — можна відкривати меню одним тапом, без набору команди.",
         reply_markup=_persistent_menu_keyboard(),
     )
-    await update.message.reply_text("Оберіть дію:", reply_markup=_menu_main_keyboard())
+    await update.message.reply_text("Оберіть дію:", reply_markup=_menu_root_keyboard())
 
 
 async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1187,7 +1224,23 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_back":
         MENU_PENDING.pop(admin_id, None)
-        await query.edit_message_text("Оберіть дію:", reply_markup=_menu_main_keyboard())
+        await query.edit_message_text("Оберіть дію:", reply_markup=_menu_root_keyboard())
+        return
+
+    if data == "menu_settings":
+        await query.edit_message_text("⚙️ Налаштування:", reply_markup=_menu_settings_keyboard())
+        return
+
+    if data == "menu_now":
+        await query.edit_message_text("📤 Написати або запитати зараз:", reply_markup=_menu_now_keyboard())
+        return
+
+    if data == "menu_scheduled":
+        await query.edit_message_text("📅 Заплановано на потім:", reply_markup=_menu_scheduled_keyboard())
+        return
+
+    if data == "menu_clients":
+        await query.edit_message_text("👥 Клієнти:", reply_markup=_menu_clients_keyboard())
         return
 
     if data == "menu_broadcast":
@@ -1401,6 +1454,77 @@ def _bc_group_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+# ---------- Миттєве написання групі (текст або файл — прямо зараз) ----------
+
+def _wg_group_keyboard() -> InlineKeyboardMarkup:
+    conn = db()
+    rows = conn.execute("SELECT name FROM segments").fetchall()
+    conn.close()
+    buttons = [[InlineKeyboardButton(r["name"], callback_data=f"wg_pickgroup:{r['name']}")] for r in rows]
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def wg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    data = query.data
+
+    if data == "wg_start":
+        conn = db()
+        has_segments = conn.execute("SELECT COUNT(*) c FROM segments").fetchone()["c"]
+        conn.close()
+        if not has_segments:
+            await query.edit_message_text("Груп ще немає.", reply_markup=_menu_back_keyboard())
+            return
+        await query.edit_message_text("Оберіть групу:", reply_markup=_wg_group_keyboard())
+        return
+
+    if data.startswith("wg_pickgroup:"):
+        _, seg = data.split(":", 1)
+        clients = _get_admin_clients(admin_id, segment=seg)
+        if not clients:
+            await query.edit_message_text(
+                f"У вас немає власних клієнтів у групі «{seg}» 🙈",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        buttons = [
+            [InlineKeyboardButton(f"📢 Усій групі ({len(clients)} осіб)", callback_data=f"wg_whole:{seg}")],
+            [InlineKeyboardButton("🎯 Обрати конкретних", callback_data=f"wg_select:{seg}")],
+            [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
+        ]
+        await query.edit_message_text(
+            f"Група «{seg}» — {len(clients)} ваших клієнтів. Кому написати зараз?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("wg_whole:"):
+        _, seg = data.split(":", 1)
+        clients = _get_admin_clients(admin_id, segment=seg)
+        SENDTO_AWAITING_TEXT[admin_id] = [c["chat_id"] for c in clients]
+        await query.edit_message_text(
+            f"Напишіть текст, або надішліть файл — піде одразу всім вашим клієнтам групи «{seg}» "
+            f"({len(clients)} осіб):"
+        )
+        return
+
+    if data.startswith("wg_select:"):
+        _, seg = data.split(":", 1)
+        clients = _get_admin_clients(admin_id, segment=seg)
+        SENDTO_SELECTIONS[admin_id] = set()
+        context.chat_data["sendto_clients"] = clients
+        await query.edit_message_text(
+            f"Ваші клієнти в групі «{seg}» — оберіть, кому надіслати:",
+            reply_markup=_build_sendto_keyboard(admin_id, clients),
+        )
+        return
+
+
 def _bc_select_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup:
     selected = BC_SELECTIONS.get(admin_id, set())
     buttons = []
@@ -1574,6 +1698,29 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=_menu_back_keyboard(),
             )
             return
+        BC_PENDING.setdefault(admin_id, {})["group_for_selection"] = seg
+        buttons = [
+            [InlineKeyboardButton(f"📢 Усій групі ({len(clients)} осіб)", callback_data="bc_wholegroup")],
+            [InlineKeyboardButton("🎯 Обрати конкретних", callback_data="bc_selectingroup")],
+            [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
+        ]
+        await query.edit_message_text(
+            f"Група «{seg}» — {len(clients)} ваших клієнтів. Кому надіслати?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data == "bc_wholegroup":
+        seg = BC_PENDING.get(admin_id, {}).get("group_for_selection")
+        clients = _get_admin_clients(admin_id, segment=seg)
+        BC_PENDING.setdefault(admin_id, {})["target_type"] = "selected"
+        BC_PENDING[admin_id]["target_value"] = ",".join(str(c["chat_id"]) for c in clients)
+        await query.edit_message_text("Коли надіслати?", reply_markup=_bc_timing_keyboard())
+        return
+
+    if data == "bc_selectingroup":
+        seg = BC_PENDING.get(admin_id, {}).get("group_for_selection")
+        clients = _get_admin_clients(admin_id, segment=seg)
         BC_PENDING.setdefault(admin_id, {})["target_type"] = "selected"
         BC_SELECTIONS[admin_id] = set()
         context.chat_data["bc_clients"] = clients
@@ -1812,6 +1959,32 @@ async def qna_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=_menu_back_keyboard(),
             )
             return
+        QNA_PENDING.setdefault(admin_id, {})["group_for_selection"] = seg
+        buttons = [
+            [InlineKeyboardButton(f"📢 Усій групі ({len(clients)} осіб)", callback_data="qna_wholegroup")],
+            [InlineKeyboardButton("🎯 Обрати конкретних", callback_data="qna_selectingroup")],
+            [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
+        ]
+        await query.edit_message_text(
+            f"Група «{seg}» — {len(clients)} ваших клієнтів. Кому поставити запитання?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data == "qna_wholegroup":
+        seg = QNA_PENDING.get(admin_id, {}).get("group_for_selection")
+        clients = _get_admin_clients(admin_id, segment=seg)
+        QNA_PENDING.setdefault(admin_id, {})["target_type"] = "selected"
+        QNA_PENDING[admin_id]["target_value"] = ",".join(str(c["chat_id"]) for c in clients)
+        MENU_PENDING[admin_id] = {"action": "qna_text"}
+        await query.edit_message_text(
+            "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?») — або надішліть файл із підписом:"
+        )
+        return
+
+    if data == "qna_selectingroup":
+        seg = QNA_PENDING.get(admin_id, {}).get("group_for_selection")
+        clients = _get_admin_clients(admin_id, segment=seg)
         QNA_PENDING.setdefault(admin_id, {})["target_type"] = "selected"
         QNA_SELECTIONS[admin_id] = set()
         context.chat_data["qna_clients"] = clients
@@ -2237,6 +2410,7 @@ def main():
     application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu_"))
     application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^bc_"))
     application.add_handler(CallbackQueryHandler(qna_router, pattern=r"^qna_"))
+    application.add_handler(CallbackQueryHandler(wg_router, pattern=r"^wg_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
     logger.info("Бот запущено")
