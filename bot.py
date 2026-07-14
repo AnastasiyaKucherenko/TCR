@@ -131,6 +131,9 @@ def init_db():
     existing_cols = [r["name"] for r in conn.execute("PRAGMA table_info(subscribers)").fetchall()]
     if "responsible_admin" not in existing_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN responsible_admin INTEGER")
+    bc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
+    if "is_question" not in bc_cols:
+        conn.execute("ALTER TABLE broadcasts ADD COLUMN is_question INTEGER DEFAULT 0")
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
     # таблицю schedules, щоб не втратити те, що вже було задано раніше.
     old_rows = conn.execute(
@@ -794,6 +797,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kind = bc.get("kind")
         hour = bc.get("hour")
         minute = bc.get("minute", 0)
+        is_question = 1 if bc.get("is_question") else 0
 
         if not all([target_type, target_value, kind]) or hour is None:
             await update.message.reply_text(
@@ -809,17 +813,17 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 datetime.fromisoformat(date_str).date(), time(hour=hour, minute=minute), tzinfo=TZ
             )
             cur = conn.execute(
-                "INSERT INTO broadcasts (kind, target_type, target_value, message, run_at, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (kind, target_type, target_value, text, run_at.isoformat(), datetime.now(TZ).isoformat()),
+                "INSERT INTO broadcasts (kind, target_type, target_value, message, run_at, is_question, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (kind, target_type, target_value, text, run_at.isoformat(), is_question, datetime.now(TZ).isoformat()),
             )
         else:
             weekday = bc.get("weekday")
             hhmm = f"{hour:02d}:{minute:02d}"
             cur = conn.execute(
-                "INSERT INTO broadcasts (kind, target_type, target_value, message, weekday, hhmm, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (kind, target_type, target_value, text, weekday, hhmm, datetime.now(TZ).isoformat()),
+                "INSERT INTO broadcasts (kind, target_type, target_value, message, weekday, hhmm, is_question, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (kind, target_type, target_value, text, weekday, hhmm, is_question, datetime.now(TZ).isoformat()),
             )
         broadcast_id = cur.lastrowid
         conn.commit()
@@ -828,8 +832,9 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         schedule_broadcast_job(context.application, row)
 
+        kind_label = "Запитання так/ні" if is_question else "Розсилку"
         await update.message.reply_text(
-            f"✅ Розсилку заплановано!\n\n"
+            f"✅ {kind_label} заплановано!\n\n"
             f"Кому: {_bc_target_label(target_type, target_value)}\n"
             f"Коли: {_bc_timing_label(row)}\n"
             f"Текст: {text}",
@@ -846,6 +851,7 @@ def _menu_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎯 Написати обраним зараз", callback_data="menu_sendto")],
         [InlineKeyboardButton("❓ Запитати так/ні (з посиланням на менеджера)", callback_data="qna_start")],
         [InlineKeyboardButton("📅 Запланувати розсилку", callback_data="bc_start")],
+        [InlineKeyboardButton("📅❓ Запланувати запитання так/ні", callback_data="bcq_start")],
         [InlineKeyboardButton("🗑 Скасувати заплановану розсилку", callback_data="bc_cancellist")],
         [InlineKeyboardButton("📖 Поточні заплановані розсилки", callback_data="bc_viewlist")],
         [InlineKeyboardButton("➕ Створити нову групу", callback_data="menu_addsegment")],
@@ -1155,6 +1161,14 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Кому запланувати розсилку?", reply_markup=_bc_target_keyboard())
         return
 
+    if data == "bcq_start":
+        BC_PENDING[admin_id] = {"is_question": True}
+        BC_SELECTIONS.pop(admin_id, None)
+        await query.edit_message_text(
+            "Кому запланувати запитання так/ні?", reply_markup=_bc_target_keyboard()
+        )
+        return
+
     if data == "bc_target_group":
         conn = db()
         has_segments = conn.execute("SELECT COUNT(*) c FROM segments").fetchone()["c"]
@@ -1245,7 +1259,12 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = BC_PENDING.setdefault(admin_id, {})
         pending["minute"] = int(mm_str)
         MENU_PENDING[admin_id] = {"action": "bc_text"}
-        await query.edit_message_text("Напишіть текст повідомлення для цієї розсилки:")
+        if pending.get("is_question"):
+            await query.edit_message_text(
+                "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?»):"
+            )
+        else:
+            await query.edit_message_text("Напишіть текст повідомлення для цієї розсилки:")
         return
 
     if data == "bc_cancellist":
@@ -1257,7 +1276,7 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         buttons = [
             [InlineKeyboardButton(
-                f"{_bc_target_label(r['target_type'], r['target_value'])} — {_bc_timing_label(r)}",
+                f"{'❓ ' if r['is_question'] else ''}{_bc_target_label(r['target_type'], r['target_value'])} — {_bc_timing_label(r)}",
                 callback_data=f"bc_cancelpick:{r['id']}",
             )]
             for r in rows
@@ -1312,8 +1331,9 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = "Заплановані розсилки:\n\n"
         for r in rows:
+            marker = "❓ Запитання так/ні" if r["is_question"] else "📌"
             text += (
-                f"📌 Кому: {_bc_target_label(r['target_type'], r['target_value'])}\n"
+                f"{marker} Кому: {_bc_target_label(r['target_type'], r['target_value'])}\n"
                 f"   Коли: {_bc_timing_label(r)}\n"
                 f"   Текст: {r['message']}\n\n"
             )
@@ -1588,34 +1608,52 @@ async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
 
+    is_question = bool(row["is_question"]) if "is_question" in row.keys() else False
+
     if row["target_type"] == "segment":
-        recipients = [
-            r["chat_id"] for r in conn.execute(
-                "SELECT chat_id FROM subscribers WHERE segment=? AND active=1", (row["target_value"],)
-            ).fetchall()
-        ]
+        recip_rows = conn.execute(
+            "SELECT chat_id, responsible_admin FROM subscribers WHERE segment=? AND active=1",
+            (row["target_value"],),
+        ).fetchall()
     else:
-        recipients = [int(x) for x in row["target_value"].split(",") if x]
+        ids = [int(x) for x in row["target_value"].split(",") if x]
+        recip_rows = conn.execute(
+            f"SELECT chat_id, responsible_admin FROM subscribers WHERE chat_id IN "
+            f"({','.join('?' * len(ids))})", ids
+        ).fetchall() if ids else []
 
     if row["kind"] == "once":
         conn.execute("UPDATE broadcasts SET active=0 WHERE id=?", (broadcast_id,))
         conn.commit()
     conn.close()
 
+    fallback_admin = ADMIN_IDS[0] if ADMIN_IDS else None
     sent, failed = 0, 0
-    for chat_id in recipients:
+    for r in recip_rows:
         try:
-            await context.bot.send_message(chat_id, row["message"])
+            if is_question:
+                resp_admin = r["responsible_admin"] or fallback_admin
+                yes_button = _admin_link_button(resp_admin, "✅ Так") if resp_admin else None
+                buttons = [[InlineKeyboardButton("❌ Ні", callback_data=f"qna_no:{r['chat_id']}")]]
+                if yes_button:
+                    buttons.append([yes_button])
+                await context.bot.send_message(
+                    r["chat_id"], row["message"], reply_markup=InlineKeyboardMarkup(buttons)
+                )
+            else:
+                await context.bot.send_message(r["chat_id"], row["message"])
             sent += 1
         except Exception as e:
-            logger.warning(f"Не вдалось надіслати {chat_id}: {e}")
+            logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
             failed += 1
 
     if ADMIN_IDS:
+        label = "запитання" if is_question else "розсилка"
         await notify_admins(
             context,
-            f"✅ Запланована розсилка ({_bc_target_label(row['target_type'], row['target_value'])}) "
-            f"виконана. Надіслано: {sent}, помилок: {failed}.",
+            f"✅ Запланован{'е' if is_question else 'а'} {label} "
+            f"({_bc_target_label(row['target_type'], row['target_value'])}) "
+            f"виконан{'о' if is_question else 'а'}. Надіслано: {sent}, помилок: {failed}.",
         )
 
 
