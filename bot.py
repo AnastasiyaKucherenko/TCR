@@ -2408,7 +2408,7 @@ def main():
     application.add_handler(CallbackQueryHandler(pickresp_callback, pattern=r"^pickresp:"))
     application.add_handler(CallbackQueryHandler(respme_callback, pattern=r"^respme:"))
     application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu_"))
-    application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^bc_"))
+    application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^(bc_|bcq_)"))
     application.add_handler(CallbackQueryHandler(qna_router, pattern=r"^qna_"))
     application.add_handler(CallbackQueryHandler(wg_router, pattern=r"^wg_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
