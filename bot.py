@@ -73,6 +73,9 @@ FORWARD_MAP: dict[tuple[int, int], int] = {}
 # Стан опитувальника замовлення клієнта: chat_id клієнта -> {"step":..., "point_name":..., ...}
 ORDER_PENDING: dict[int, dict] = {}
 
+# Стан заповнення "картки клієнта": chat_id клієнта -> {"step":..., дані...}
+PROFILE_PENDING: dict[int, dict] = {}
+
 WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 BC_MINUTES = [0, 15, 30, 45]
@@ -150,6 +153,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS client_profiles (
+            chat_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            point_name TEXT,
+            address TEXT,
+            phone TEXT,
+            fop TEXT,
+            updated_at TEXT
         )
     """)
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
@@ -232,17 +246,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     admins_avail = _admins_with_username()
-    if len(admins_avail) >= 2:
-        buttons = [
-            [InlineKeyboardButton(a["name"], callback_data=f"pickresp:{a['chat_id']}")]
-            for a in admins_avail
-        ]
-        await update.message.reply_text(
-            "Оберіть, хто з команди буде вашим відповідальним контактом "
-            "(до цієї людини вестиме кнопка «Так» у наших повідомленнях):",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-    elif len(admins_avail) == 1:
+    if len(admins_avail) == 1:
         conn = db()
         conn.execute(
             "UPDATE subscribers SET responsible_admin=? WHERE chat_id=?",
@@ -974,7 +978,9 @@ async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_chat.id
     if not is_admin(update):
-        if admin_id in ORDER_PENDING:
+        if admin_id in PROFILE_PENDING:
+            await handle_profile_text_step(update, context)
+        elif admin_id in ORDER_PENDING:
             await handle_order_text_step(update, context)
         else:
             await forward_client_text(update, context)
@@ -1179,6 +1185,7 @@ CLIENT_BTN_ASSORTMENT = "☕ Асортимент"
 CLIENT_BTN_MANAGER = "💬 Зв'язок з менеджером"
 CLIENT_BTN_DELIVERY = "🚚 Умови доставки"
 CLIENT_BTN_ORDER = "📝 Замовити"
+CLIENT_BTN_PROFILE = "🪪 Моя картка"
 
 DEFAULT_DELIVERY_TEXT = (
     "Умови доставки:\n\n"
@@ -1201,7 +1208,8 @@ def _client_persistent_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(CLIENT_BTN_ASSORTMENT), KeyboardButton(CLIENT_BTN_DELIVERY)],
-            [KeyboardButton(CLIENT_BTN_ORDER), KeyboardButton(CLIENT_BTN_MANAGER)],
+            [KeyboardButton(CLIENT_BTN_ORDER), KeyboardButton(CLIENT_BTN_PROFILE)],
+            [KeyboardButton(CLIENT_BTN_MANAGER)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -1275,9 +1283,94 @@ async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_T
         )
 
 
+# ---------- Картка клієнта (одноразова, редагована) ----------
+
+def _get_client_profile(chat_id: int):
+    conn = db()
+    row = conn.execute("SELECT * FROM client_profiles WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _profile_summary_text(profile: dict) -> str:
+    return (
+        f"🪪 Ваша картка:\n\n"
+        f"ПІБ: {profile.get('full_name') or '—'}\n"
+        f"Назва точки: {profile.get('point_name') or '—'}\n"
+        f"Адреса: {profile.get('address') or '—'}\n"
+        f"Контактний номер: {profile.get('phone') or '—'}\n"
+        f"ФОП: {profile.get('fop') or '—'}"
+    )
+
+
+PROFILE_STEPS = ["full_name", "point_name", "address", "phone", "fop"]
+PROFILE_STEP_PROMPTS = {
+    "full_name": "Напишіть, будь ласка, ваше ПІБ:",
+    "point_name": "Назва точки (кав'ярні/закладу):",
+    "address": "Адреса:",
+    "phone": "Контактний номер телефону:",
+    "fop": "ФОП (назва/номер, або «немає», якщо не застосовується):",
+}
+
+
+async def profile_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    profile = _get_client_profile(chat_id)
+    if not profile:
+        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
+        await update.message.reply_text(
+            "Картка ще не заповнена. Заповнімо її зараз — це знадобиться для замовлень.\n\n"
+            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
+        )
+        return
+    buttons = [[InlineKeyboardButton("✏️ Редагувати картку", callback_data="profile_edit")]]
+    await update.message.reply_text(_profile_summary_text(profile), reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def profile_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
+    await query.edit_message_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]])
+
+
+async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    pending = PROFILE_PENDING.get(chat_id)
+    if not pending:
+        return
+    step_idx = pending["step_idx"]
+    field = PROFILE_STEPS[step_idx]
+    pending["data"][field] = update.message.text or ""
+
+    if step_idx + 1 < len(PROFILE_STEPS):
+        pending["step_idx"] += 1
+        await update.message.reply_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[pending["step_idx"]]])
+        return
+
+    data = PROFILE_PENDING.pop(chat_id)["data"]
+    conn = db()
+    conn.execute(
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, address, phone, fop, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
+        "address=excluded.address, phone=excluded.phone, fop=excluded.fop, updated_at=excluded.updated_at",
+        (chat_id, data["full_name"], data["point_name"], data["address"], data["phone"], data["fop"],
+         datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        "✅ Картку збережено! Тепер можна оформлювати замовлення — натисніть «📝 Замовити».\n\n"
+        + _profile_summary_text(data)
+    )
+
+
 # ---------- Опитувальник замовлення (клієнт) ----------
 
-ORDER_WEIGHTS = ["1 кг", "0,5 кг", "0,25 кг"]
+ORDER_WEIGHTS = ["1 кг", "0,5 кг", "0,25 кг", "250 г", "40 г"]
+ORDER_QUANTITIES = ["1", "2", "3", "4", "5"]
 
 
 def _order_date_keyboard() -> InlineKeyboardMarkup:
@@ -1306,15 +1399,35 @@ def _order_category_keyboard() -> InlineKeyboardMarkup:
 
 
 def _order_weight_keyboard() -> InlineKeyboardMarkup:
-    row = [InlineKeyboardButton(w, callback_data=f"order_weight:{w}") for w in ORDER_WEIGHTS]
-    return InlineKeyboardMarkup([row, [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")]])
+    buttons, row = [], []
+    for w in ORDER_WEIGHTS:
+        row.append(InlineKeyboardButton(w, callback_data=f"order_weight:{w}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    return InlineKeyboardMarkup(buttons)
 
 
-def _order_summary_text(order: dict) -> str:
+def _order_qty_keyboard() -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(q, callback_data=f"order_qty:{q}") for q in ORDER_QUANTITIES]
+    return InlineKeyboardMarkup([
+        row,
+        [InlineKeyboardButton("✏️ Інша кількість", callback_data="order_qty_other")],
+        [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")],
+    ])
+
+
+def _order_summary_text(order: dict, profile: dict) -> str:
     lines = [
-        f"📝 Нове замовлення",
-        f"Точка: {order.get('point_name', '—')}",
-        f"Адреса: {order.get('address', '—')}",
+        "📝 Нове замовлення",
+        f"ПІБ: {profile.get('full_name') or '—'}",
+        f"Точка: {profile.get('point_name') or '—'}",
+        f"Адреса: {profile.get('address') or '—'}",
+        f"Телефон: {profile.get('phone') or '—'}",
+        f"ФОП: {profile.get('fop') or '—'}",
         f"Дата: {order.get('date', '—')}",
         "",
         "Позиції:",
@@ -1322,7 +1435,8 @@ def _order_summary_text(order: dict) -> str:
     for i, item in enumerate(order.get("items", []), 1):
         cat_label = dict(ORDER_CATEGORIES).get(item.get("category"), item.get("category"))
         lines.append(
-            f"{i}. {cat_label} — {item.get('item_text', '—')} — {item.get('weight', '—')}\n"
+            f"{i}. {cat_label} — {item.get('item_text', '—')} — {item.get('weight', '—')} "
+            f"× {item.get('qty', '—')}\n"
             f"   Примітка: {item.get('note') or '—'}"
         )
     return "\n".join(lines)
@@ -1330,10 +1444,16 @@ def _order_summary_text(order: dict) -> str:
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    ORDER_PENDING[chat_id] = {"step": "point_name", "items": []}
-    await update.message.reply_text(
-        "📝 Оформімо замовлення! Напишіть, будь ласка, назву вашої точки (кав'ярні/закладу):"
-    )
+    profile = _get_client_profile(chat_id)
+    if not profile:
+        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
+        await update.message.reply_text(
+            "Перш ніж оформити замовлення, заповніть, будь ласка, картку клієнта (це одноразово) 🙏\n\n"
+            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
+        )
+        return
+    ORDER_PENDING[chat_id] = {"step": "date", "items": []}
+    await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
 
 
 async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1344,22 +1464,18 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
     step = order.get("step")
     text = update.message.text or ""
 
-    if step == "point_name":
-        order["point_name"] = text
-        order["step"] = "address"
-        await update.message.reply_text("Дякуємо! Тепер напишіть адресу доставки:")
-        return
-
-    if step == "address":
-        order["address"] = text
-        order["step"] = "date"
-        await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
-        return
-
     if step == "item_text":
         order["current_item"]["item_text"] = text
         order["step"] = "weight"
-        await update.message.reply_text("Оберіть вагу:", reply_markup=_order_weight_keyboard())
+        await update.message.reply_text("Оберіть вагу/фасування:", reply_markup=_order_weight_keyboard())
+        return
+
+    if step == "qty_other":
+        order["current_item"]["qty"] = text
+        order["step"] = "note"
+        await update.message.reply_text(
+            "Примітка до цієї позиції (пакування, помел тощо)? Якщо немає — напишіть «немає»:"
+        )
         return
 
     if step == "note":
@@ -1415,10 +1531,22 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("order_weight:"):
         _, weight = data.split(":", 1)
         order["current_item"]["weight"] = weight
+        order["step"] = "qty"
+        await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard())
+        return
+
+    if data.startswith("order_qty:"):
+        _, qty = data.split(":", 1)
+        order["current_item"]["qty"] = qty
         order["step"] = "note"
         await query.edit_message_text(
             "Примітка до цієї позиції (пакування, помел тощо)? Якщо немає — напишіть «немає»:"
         )
+        return
+
+    if data == "order_qty_other":
+        order["step"] = "qty_other"
+        await query.edit_message_text("Напишіть потрібну кількість:")
         return
 
     if data == "order_addmore":
@@ -1431,7 +1559,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not order or not order.get("items"):
             await query.edit_message_text("Замовлення порожнє, скасовано.")
             return
-        summary = _order_summary_text(order)
+        profile = _get_client_profile(chat_id) or {}
+        summary = _order_summary_text(order, profile)
         client = update.effective_user
         target_admin = _resolve_target_admin(chat_id)
         await query.edit_message_text(
@@ -1451,6 +1580,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+def _persistent_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📋 Меню")]],
         resize_keyboard=True,
@@ -2655,6 +2786,8 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_DELIVERY)}$"), client_show_delivery))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_MANAGER)}$"), client_contact_manager))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER)}$"), order_start))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_PROFILE)}$"), profile_show))
+    application.add_handler(CallbackQueryHandler(profile_edit_callback, pattern=r"^profile_edit$"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
@@ -2675,4 +2808,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
