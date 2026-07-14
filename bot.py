@@ -8,6 +8,7 @@ Telegram-бот для ростерії: збір клієнтів через /s
 
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -136,6 +137,12 @@ def init_db():
         conn.execute("ALTER TABLE broadcasts ADD COLUMN is_question INTEGER DEFAULT 0")
     if "file_id" not in bc_cols:
         conn.execute("ALTER TABLE broadcasts ADD COLUMN file_id TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
     # таблицю schedules, щоб не втратити те, що вже було задано раніше.
     old_rows = conn.execute(
@@ -211,7 +218,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привіт! Дякуємо, що підписались на новини нашої ростерії 🫶\n"
         "Тут ви отримуватимете нагадування, інформацію про кавові новинки, акції та зміни в асортименті😉\n\n"
-        "Якщо захочете відписатись — просто напишіть /stop."
+        "Якщо захочете відписатись — просто напишіть /stop.",
+        reply_markup=_client_persistent_keyboard(),
     )
 
     admins_avail = _admins_with_username()
@@ -856,6 +864,16 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action == "assortment_text":
+        MENU_PENDING.pop(admin_id, None)
+        _set_setting("assortment", text)
+        await update.message.reply_text(
+            "✅ Асортимент оновлено! Клієнти одразу побачать нову версію, "
+            "коли натиснуть «☕ Асортимент».",
+            reply_markup=_menu_back_keyboard(),
+        )
+        return
+
     if action == "qna_text":
         MENU_PENDING.pop(admin_id, None)
         await qna_send(context, admin_id, text)
@@ -879,6 +897,7 @@ def _menu_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗑 Скасувати заплановану розсилку", callback_data="bc_cancellist")],
         [InlineKeyboardButton("📖 Поточні заплановані розсилки", callback_data="bc_viewlist")],
         [InlineKeyboardButton("➕ Створити нову групу", callback_data="menu_addsegment")],
+        [InlineKeyboardButton("☕ Редагувати асортимент (бачать клієнти)", callback_data="menu_editassortment")],
         [InlineKeyboardButton("👥 Змінити групу клієнта", callback_data="menu_changeseg")],
         [InlineKeyboardButton("🙋 Призначити відповідального клієнту", callback_data="menu_setresp")],
         [InlineKeyboardButton("✏️ Змінити повідомлення групи", callback_data="menu_setmsg")],
@@ -889,6 +908,65 @@ def _menu_main_keyboard() -> InlineKeyboardMarkup:
 
 def _menu_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До меню", callback_data="menu_back")]])
+
+
+def _get_setting(key: str, default: str = "") -> str:
+    conn = db()
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row and row["value"] is not None else default
+
+
+def _set_setting(key: str, value: str) -> None:
+    conn = db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+CLIENT_BTN_ASSORTMENT = "☕ Асортимент"
+CLIENT_BTN_MANAGER = "💬 Зв'язок з менеджером"
+
+
+def _client_persistent_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(CLIENT_BTN_ASSORTMENT), KeyboardButton(CLIENT_BTN_MANAGER)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+async def client_show_assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = _get_setting("assortment", "").strip()
+    if not text:
+        await update.message.reply_text(
+            "Наразі асортимент ще не додано 🙈 Скоро оновимо — зазирніть трохи пізніше!"
+        )
+        return
+    await update.message.reply_text(f"☕ Наш поточний асортимент:\n\n{text}")
+
+
+async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    conn = db()
+    row = conn.execute("SELECT responsible_admin FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    resp_admin = (row["responsible_admin"] if row else None) or (ADMIN_IDS[0] if ADMIN_IDS else None)
+    button = _admin_link_button(resp_admin, "😊 Написати менеджеру") if resp_admin else None
+    if button:
+        await update.message.reply_text(
+            "Раді допомогти! Тисніть кнопку нижче, щоб написати нам напряму — "
+            "відповімо якомога швидше 💬",
+            reply_markup=InlineKeyboardMarkup([[button]]),
+        )
+    else:
+        await update.message.reply_text(
+            "Раді допомогти! Наразі не можемо сформувати пряме посилання — "
+            "спробуйте трохи пізніше, або напишіть нам в іншому зручному місці 🙏"
+        )
 
 
 def _persistent_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -939,6 +1017,16 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "Напишіть назву нової групи одним словом, без пробілів, латиницею "
             "(наприклад: postiyni, vip, wholesale):"
+        )
+        return
+
+    if data == "menu_editassortment":
+        current = _get_setting("assortment", "").strip()
+        preview = f"\n\nЗараз там написано:\n{current}" if current else "\n\nЗараз там ще нічого не додано."
+        MENU_PENDING[admin_id] = {"action": "assortment_text"}
+        await query.edit_message_text(
+            "Напишіть новий текст асортименту (список позицій кави) — саме це побачать клієнти, "
+            "коли натиснуть свою кнопку «☕ Асортимент»." + preview
         )
         return
 
@@ -1535,7 +1623,7 @@ async def qna_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("qna_no:"):
         _, client_chat_id_str = data.split(":", 1)
         client_chat_id = int(client_chat_id_str)
-        await query.edit_message_text("❌ Ви позначили: не потрібно. Дякуємо за відповідь!")
+        await query.edit_message_text("Дякуємо, що дали знати! 🙏 Якщо передумаєте — завжди можна написати нам.")
         conn = db()
         row = conn.execute(
             "SELECT name, username, responsible_admin FROM subscribers WHERE chat_id=?", (client_chat_id,)
@@ -1689,10 +1777,11 @@ def _bc_timing_label(row) -> str:
     return f"щотижня, {WEEKDAYS_UA[row['weekday']]} о {row['hhmm']}"
 
 
-YES_BUTTON_LABEL = "✅ Так (написати менеджеру)"
+YES_BUTTON_LABEL = "✅ Так, зв'язатися з менеджером 😊"
 QNA_CLARIFICATION = (
-    "\n\n💬 Кнопка «Так» відкриє особистий чат з менеджером — там і напишіть. "
-    "Відповідати сюди в бот не потрібно, бот повідомлень не читає."
+    "\n\n💬 Щоб домовитись — просто натисніть «Так», і одразу потрапите в особистий чат "
+    "з менеджером, там і поспілкуємось 😊 Відповідати сюди, у бота, не потрібно — тут ми "
+    "лише надсилаємо новини й нагадування."
 )
 
 
@@ -1889,6 +1978,8 @@ def main():
     application.add_handler(CommandHandler("sendto", sendto_start))
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(MessageHandler(filters.Regex("^📋 Меню$"), menu_command))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ASSORTMENT)}$"), client_show_assortment))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_MANAGER)}$"), client_contact_manager))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
     application.add_handler(CallbackQueryHandler(sendto_cancel_callback, pattern=r"^sendto_cancel$"))
