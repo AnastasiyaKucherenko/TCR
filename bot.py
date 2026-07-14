@@ -163,9 +163,16 @@ def init_db():
             address TEXT,
             phone TEXT,
             fop TEXT,
+            ipn TEXT,
+            payment_method TEXT,
             updated_at TEXT
         )
     """)
+    profile_cols = [r["name"] for r in conn.execute("PRAGMA table_info(client_profiles)").fetchall()]
+    if "ipn" not in profile_cols:
+        conn.execute("ALTER TABLE client_profiles ADD COLUMN ipn TEXT")
+    if "payment_method" not in profile_cols:
+        conn.execute("ALTER TABLE client_profiles ADD COLUMN payment_method TEXT")
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
     # таблицю schedules, щоб не втратити те, що вже було задано раніше.
     old_rows = conn.execute(
@@ -1292,6 +1299,9 @@ async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_T
 
 # ---------- Картка клієнта (одноразова, редагована) ----------
 
+PAYMENT_METHODS = ["Передоплата на рахунок", "По факту отримання"]
+
+
 def _get_client_profile(chat_id: int):
     conn = db()
     row = conn.execute("SELECT * FROM client_profiles WHERE chat_id=?", (chat_id,)).fetchone()
@@ -1302,22 +1312,44 @@ def _get_client_profile(chat_id: int):
 def _profile_summary_text(profile: dict) -> str:
     return (
         f"🪪 Ваша картка:\n\n"
-        f"ПІБ: {profile.get('full_name') or '—'}\n"
+        f"Ім'я: {profile.get('full_name') or '—'}\n"
         f"Назва точки: {profile.get('point_name') or '—'}\n"
         f"Адреса: {profile.get('address') or '—'}\n"
         f"Контактний номер: {profile.get('phone') or '—'}\n"
-        f"ФОП: {profile.get('fop') or '—'}"
+        f"ФОП: {profile.get('fop') or '—'}\n"
+        f"ІПН: {profile.get('ipn') or '—'}\n"
+        f"Спосіб оплати: {profile.get('payment_method') or '—'}"
     )
 
 
-PROFILE_STEPS = ["full_name", "point_name", "address", "phone", "fop"]
+def _is_valid_phone(text: str) -> bool:
+    digits = re.sub(r"\D", "", text)
+    return 9 <= len(digits) <= 13
+
+
+def _normalize_phone(text: str) -> str:
+    digits = re.sub(r"\D", "", text)
+    if digits.startswith("380") and len(digits) == 12:
+        return "+" + digits
+    if digits.startswith("0") and len(digits) == 10:
+        return "+38" + digits
+    return "+" + digits if not text.strip().startswith("+") else text.strip()
+
+
+PROFILE_STEPS = ["full_name", "point_name", "address", "phone", "fop", "ipn"]
 PROFILE_STEP_PROMPTS = {
-    "full_name": "Напишіть, будь ласка, ваше ПІБ:",
+    "full_name": "Напишіть, будь ласка, ваше ім'я:",
     "point_name": "Назва точки (кав'ярні/закладу):",
     "address": "Адреса:",
-    "phone": "Контактний номер телефону:",
+    "phone": "Контактний номер телефону (наприклад: +380671234567):",
     "fop": "ФОП (назва/номер, або «немає», якщо не застосовується):",
+    "ipn": "ІПН (або «немає», якщо не застосовується):",
 }
+
+
+def _payment_method_keyboard() -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(m, callback_data=f"profile_payment:{m}")] for m in PAYMENT_METHODS]
+    return InlineKeyboardMarkup(buttons)
 
 
 async def profile_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1349,29 +1381,55 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
         return
     step_idx = pending["step_idx"]
     field = PROFILE_STEPS[step_idx]
-    pending["data"][field] = update.message.text or ""
+    text = update.message.text or ""
+
+    if field == "phone":
+        if not _is_valid_phone(text):
+            await update.message.reply_text(
+                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+            )
+            return
+        text = _normalize_phone(text)
+
+    pending["data"][field] = text
 
     if step_idx + 1 < len(PROFILE_STEPS):
         pending["step_idx"] += 1
         await update.message.reply_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[pending["step_idx"]]])
         return
 
+    await update.message.reply_text("Оберіть спосіб оплати:", reply_markup=_payment_method_keyboard())
+
+
+async def profile_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    pending = PROFILE_PENDING.get(chat_id)
+    if not pending:
+        await query.edit_message_text("Це вже неактуально. Натисніть «🪪 Моя картка», щоб почати заново.")
+        return
+    _, method = query.data.split(":", 1)
     data = PROFILE_PENDING.pop(chat_id)["data"]
+    data["payment_method"] = method
+
     conn = db()
     conn.execute(
-        "INSERT INTO client_profiles (chat_id, full_name, point_name, address, phone, fop, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, address, phone, fop, ipn, payment_method, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
-        "address=excluded.address, phone=excluded.phone, fop=excluded.fop, updated_at=excluded.updated_at",
+        "address=excluded.address, phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, "
+        "payment_method=excluded.payment_method, updated_at=excluded.updated_at",
         (chat_id, data["full_name"], data["point_name"], data["address"], data["phone"], data["fop"],
-         datetime.now(TZ).isoformat()),
+         data["ipn"], data["payment_method"], datetime.now(TZ).isoformat()),
     )
     conn.commit()
     conn.close()
-    await update.message.reply_text(
+    await query.edit_message_text(
         "✅ Картку збережено! Тепер можна оформлювати замовлення — натисніть «📝 Замовити».\n\n"
         + _profile_summary_text(data)
     )
+
 
 
 # ---------- Опитувальник замовлення (клієнт) ----------
@@ -1430,11 +1488,13 @@ def _order_qty_keyboard() -> InlineKeyboardMarkup:
 def _order_summary_text(order: dict, profile: dict) -> str:
     lines = [
         "📝 Нове замовлення",
-        f"ПІБ: {profile.get('full_name') or '—'}",
+        f"Ім'я: {profile.get('full_name') or '—'}",
         f"Точка: {profile.get('point_name') or '—'}",
         f"Адреса: {profile.get('address') or '—'}",
         f"Телефон: {profile.get('phone') or '—'}",
         f"ФОП: {profile.get('fop') or '—'}",
+        f"ІПН: {profile.get('ipn') or '—'}",
+        f"Спосіб оплати: {profile.get('payment_method') or '—'}",
         f"Дата: {order.get('date', '—')}",
         "",
         "Позиції:",
@@ -1447,6 +1507,21 @@ def _order_summary_text(order: dict, profile: dict) -> str:
             f"   Примітка: {item.get('note') or '—'}"
         )
     return "\n".join(lines)
+
+
+def _parse_assortment_items(cat_key: str) -> list:
+    """Розбирає текст асортименту категорії на окремі позиції (по рядках),
+    прибираючи порожні рядки й декоративні розділювачі."""
+    text = _get_setting(f"assortment_{cat_key}", "")
+    items = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.strip("━-—=• ") == "":
+            continue
+        items.append(line)
+    return items
 
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1471,10 +1546,29 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
     step = order.get("step")
     text = update.message.text or ""
 
-    if step == "item_text":
-        order["current_item"]["item_text"] = text
-        order["step"] = "weight"
-        await update.message.reply_text("Оберіть вагу/фасування:", reply_markup=_order_weight_keyboard())
+    if step == "item_filter":
+        cat_key = order["current_item"]["category"]
+        items = _parse_assortment_items(cat_key)
+        query_text = text.strip().lower()
+        matches = [i for i in items if i.lower().startswith(query_text)]
+        if not matches:
+            matches = [i for i in items if query_text in i.lower()]
+        if not matches:
+            await update.message.reply_text(
+                "Нічого не знайдено 🙈 Спробуйте написати інші літери назви "
+                "(перевірте написання у розділі «☕ Асортимент»):"
+            )
+            return
+        order["current_item_choices"] = matches[:25]
+        buttons = [
+            [InlineKeyboardButton(m, callback_data=f"order_pick_item:{i}")]
+            for i, m in enumerate(order["current_item_choices"])
+        ]
+        buttons.append([InlineKeyboardButton("🔄 Інший пошук", callback_data="order_research")])
+        buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+        await update.message.reply_text(
+            f"Знайдено {len(matches)} позицій — оберіть потрібну:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
         return
 
     if step == "qty_other":
@@ -1527,12 +1621,38 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_cat:"):
         _, cat_key = data.split(":", 1)
-        order["current_item"] = {"category": cat_key}
-        order["step"] = "item_text"
+        items = _parse_assortment_items(cat_key)
         label = dict(ORDER_CATEGORIES).get(cat_key, cat_key)
+        if not items:
+            await query.edit_message_text(
+                f"{label}\n\nЦя категорія ще порожня — зверніться до менеджера, або оберіть іншу категорію.",
+                reply_markup=_order_category_keyboard(),
+            )
+            return
+        order["current_item"] = {"category": cat_key}
+        order["step"] = "item_filter"
         await query.edit_message_text(
-            f"{label}\n\nНапишіть, будь ласка, назву позиції (можна подивитись у «☕ Асортимент»):"
+            f"{label}\n\nНапишіть перші літери назви позиції — покажу відповідні варіанти зі списку:"
         )
+        return
+
+    if data.startswith("order_pick_item:"):
+        _, idx_str = data.split(":", 1)
+        idx = int(idx_str)
+        choices = order.get("current_item_choices", [])
+        if idx >= len(choices):
+            await query.answer("Ця позиція вже неактуальна, спробуйте ще раз.", show_alert=True)
+            return
+        order["current_item"]["item_text"] = choices[idx]
+        order["step"] = "weight"
+        await query.edit_message_text(
+            f"Обрано: {choices[idx]}\n\nОберіть вагу/фасування:", reply_markup=_order_weight_keyboard()
+        )
+        return
+
+    if data == "order_research":
+        order["step"] = "item_filter"
+        await query.edit_message_text("Напишіть перші літери назви позиції ще раз:")
         return
 
     if data.startswith("order_weight:"):
@@ -2795,6 +2915,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER)}$"), order_start))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_PROFILE)}$"), profile_show))
     application.add_handler(CallbackQueryHandler(profile_edit_callback, pattern=r"^profile_edit$"))
+    application.add_handler(CallbackQueryHandler(profile_payment_callback, pattern=r"^profile_payment:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
