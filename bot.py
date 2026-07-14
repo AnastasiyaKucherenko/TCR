@@ -976,14 +976,21 @@ async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_chat.id
+    chat_id = update.effective_chat.id
+
+    # Пріоритет: якщо цей chat_id саме зараз щось заповнює як клієнт (картка/замовлення) —
+    # обробляємо це незалежно від того, чи цей самий chat_id є ще й адміном
+    # (адмін міг тестувати ці кроки на своєму ж акаунті).
+    if chat_id in PROFILE_PENDING:
+        await handle_profile_text_step(update, context)
+        return
+    if chat_id in ORDER_PENDING:
+        await handle_order_text_step(update, context)
+        return
+
+    admin_id = chat_id
     if not is_admin(update):
-        if admin_id in PROFILE_PENDING:
-            await handle_profile_text_step(update, context)
-        elif admin_id in ORDER_PENDING:
-            await handle_order_text_step(update, context)
-        else:
-            await forward_client_text(update, context)
+        await forward_client_text(update, context)
         return
 
     # 0) Якщо адмін відповідає (Reply) на переслане повідомлення клієнта — надсилаємо відповідь клієнту
