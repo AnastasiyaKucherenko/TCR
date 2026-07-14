@@ -874,6 +874,16 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action == "delivery_text":
+        MENU_PENDING.pop(admin_id, None)
+        _set_setting("delivery", text)
+        await update.message.reply_text(
+            "✅ Умови доставки оновлено! Клієнти одразу побачать нову версію, "
+            "коли натиснуть «🚚 Умови доставки».",
+            reply_markup=_menu_back_keyboard(),
+        )
+        return
+
     if action == "qna_text":
         MENU_PENDING.pop(admin_id, None)
         await qna_send(context, admin_id, text)
@@ -898,6 +908,7 @@ def _menu_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📖 Поточні заплановані розсилки", callback_data="bc_viewlist")],
         [InlineKeyboardButton("➕ Створити нову групу", callback_data="menu_addsegment")],
         [InlineKeyboardButton("☕ Редагувати асортимент (бачать клієнти)", callback_data="menu_editassortment")],
+        [InlineKeyboardButton("🚚 Редагувати умови доставки (бачать клієнти)", callback_data="menu_editdelivery")],
         [InlineKeyboardButton("👥 Змінити групу клієнта", callback_data="menu_changeseg")],
         [InlineKeyboardButton("🙋 Призначити відповідального клієнту", callback_data="menu_setresp")],
         [InlineKeyboardButton("✏️ Змінити повідомлення групи", callback_data="menu_setmsg")],
@@ -929,11 +940,31 @@ def _set_setting(key: str, value: str) -> None:
 
 CLIENT_BTN_ASSORTMENT = "☕ Асортимент"
 CLIENT_BTN_MANAGER = "💬 Зв'язок з менеджером"
+CLIENT_BTN_DELIVERY = "🚚 Умови доставки"
+
+DEFAULT_DELIVERY_TEXT = (
+    "Умови доставки:\n\n"
+    "Доставка роздрібних замовлень від 2000грн безкоштовно, менше за тарифами перевізника "
+    "або 190 грн по Києву.\n\n"
+    "Доставка гуртових замовлень від 10 кг будь-якої кави - безкоштовно. "
+    "До 10-ти кг - 190 грн. по Києву, або за тарифами нової пошти.\n\n"
+    "Ви можете обрати по одному кілограму різних сортів, та отримати знижку в залежності "
+    "від загального об'єму замовлення.\n\n"
+    "Замовлення прийняті до 09:00 - можуть бути доставлені КУР'ЄРОМ в той самий день.\n\n"
+    "Замовлення новою поштою прийняті до 11:00 - відправляються у той самий день.\n\n"
+    "Доставка на наступний після замовлення день з понеділка по п'ятницю, з 10 до 16.\n\n"
+    "Доставка замовлень відбувається за умови повної передплати на рахунок, або по факту "
+    "отримання кави.\n\n"
+    "Кава обсмажується на професійному ростері COGEN C15"
+)
 
 
 def _client_persistent_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(CLIENT_BTN_ASSORTMENT), KeyboardButton(CLIENT_BTN_MANAGER)]],
+        [
+            [KeyboardButton(CLIENT_BTN_ASSORTMENT), KeyboardButton(CLIENT_BTN_DELIVERY)],
+            [KeyboardButton(CLIENT_BTN_MANAGER)],
+        ],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -947,6 +978,11 @@ async def client_show_assortment(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
     await update.message.reply_text(f"☕ Наш поточний асортимент:\n\n{text}")
+
+
+async def client_show_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = _get_setting("delivery", DEFAULT_DELIVERY_TEXT).strip()
+    await update.message.reply_text(f"🚚 {text}")
 
 
 async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1027,6 +1063,15 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "Напишіть новий текст асортименту (список позицій кави) — саме це побачать клієнти, "
             "коли натиснуть свою кнопку «☕ Асортимент»." + preview
+        )
+        return
+
+    if data == "menu_editdelivery":
+        current = _get_setting("delivery", DEFAULT_DELIVERY_TEXT).strip()
+        MENU_PENDING[admin_id] = {"action": "delivery_text"}
+        await query.edit_message_text(
+            "Напишіть новий текст умов доставки — саме це побачать клієнти, коли натиснуть "
+            "свою кнопку «🚚 Умови доставки».\n\nЗараз там написано:\n" + current
         )
         return
 
@@ -1979,6 +2024,7 @@ def main():
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(MessageHandler(filters.Regex("^📋 Меню$"), menu_command))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ASSORTMENT)}$"), client_show_assortment))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_DELIVERY)}$"), client_show_delivery))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_MANAGER)}$"), client_contact_manager))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
