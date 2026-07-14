@@ -245,12 +245,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(
+    welcome_msg = await update.message.reply_text(
         "Привіт! Дякуємо, що підписались на новини нашої ростерії 🫶\n"
         "Тут ви отримуватимете нагадування, інформацію про кавові новинки, акції та зміни в асортименті😉\n\n"
+        "👇👇👇 Кнопки внизу екрана — вони завжди тут: асортимент, доставка, замовлення, картка, менеджер.\n\n"
         "Якщо захочете відписатись — просто напишіть /stop.",
         reply_markup=_client_persistent_keyboard(),
     )
+    try:
+        await context.bot.pin_chat_message(chat.id, welcome_msg.message_id, disable_notification=True)
+    except Exception as e:
+        logger.warning(f"Не вдалось закріпити привітальне повідомлення клієнту {chat.id}: {e}")
 
     admins_avail = _admins_with_username()
     if len(admins_avail) == 1:
@@ -1299,7 +1304,7 @@ async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_T
 
 # ---------- Картка клієнта (одноразова, редагована) ----------
 
-PAYMENT_METHODS = ["Передоплата на рахунок", "По факту отримання"]
+PAYMENT_METHODS = ["Готівка", "Безготівковий"]
 
 
 def _get_client_profile(chat_id: int):
@@ -1317,9 +1322,9 @@ def _profile_summary_text(profile: dict) -> str:
         f"Адреса: {profile.get('address') or '—'}\n"
         f"Контактний номер: {profile.get('phone') or '—'}\n"
         f"ФОП: {profile.get('fop') or '—'}\n"
-        f"ІПН: {profile.get('ipn') or '—'}\n"
-        f"Спосіб оплати: {profile.get('payment_method') or '—'}"
+        f"ІПН: {profile.get('ipn') or '—'}"
     )
+
 
 
 def _is_valid_phone(text: str) -> bool:
@@ -1347,8 +1352,9 @@ PROFILE_STEP_PROMPTS = {
 }
 
 
-def _payment_method_keyboard() -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton(m, callback_data=f"profile_payment:{m}")] for m in PAYMENT_METHODS]
+def _order_payment_keyboard() -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(m, callback_data=f"order_payment:{m}")] for m in PAYMENT_METHODS]
+    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1398,34 +1404,20 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[pending["step_idx"]]])
         return
 
-    await update.message.reply_text("Оберіть спосіб оплати:", reply_markup=_payment_method_keyboard())
-
-
-async def profile_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = update.effective_chat.id
-    pending = PROFILE_PENDING.get(chat_id)
-    if not pending:
-        await query.edit_message_text("Це вже неактуально. Натисніть «🪪 Моя картка», щоб почати заново.")
-        return
-    _, method = query.data.split(":", 1)
     data = PROFILE_PENDING.pop(chat_id)["data"]
-    data["payment_method"] = method
-
     conn = db()
     conn.execute(
-        "INSERT INTO client_profiles (chat_id, full_name, point_name, address, phone, fop, ipn, payment_method, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, address, phone, fop, ipn, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
         "address=excluded.address, phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, "
-        "payment_method=excluded.payment_method, updated_at=excluded.updated_at",
+        "updated_at=excluded.updated_at",
         (chat_id, data["full_name"], data["point_name"], data["address"], data["phone"], data["fop"],
-         data["ipn"], data["payment_method"], datetime.now(TZ).isoformat()),
+         data["ipn"], datetime.now(TZ).isoformat()),
     )
     conn.commit()
     conn.close()
-    await query.edit_message_text(
+    await update.message.reply_text(
         "✅ Картку збережено! Тепер можна оформлювати замовлення — натисніть «📝 Замовити».\n\n"
         + _profile_summary_text(data)
     )
@@ -1501,7 +1493,7 @@ def _order_summary_text(order: dict, profile: dict) -> str:
         f"Телефон: {profile.get('phone') or '—'}",
         f"ФОП: {profile.get('fop') or '—'}",
         f"ІПН: {profile.get('ipn') or '—'}",
-        f"Спосіб оплати: {profile.get('payment_method') or '—'}",
+        f"Спосіб оплати: {order.get('payment_method') or '—'}",
         f"Дата: {order.get('date', '—')}",
         "",
         "Позиції:",
@@ -1633,10 +1625,14 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         order["current_item"] = {"category": cat_key}
         order["current_item_choices"] = items[:80]
-        buttons = [
-            [InlineKeyboardButton(m, callback_data=f"order_pick_item:{i}")]
-            for i, m in enumerate(order["current_item_choices"])
-        ]
+        buttons, row = [], []
+        for i, m in enumerate(order["current_item_choices"]):
+            row.append(InlineKeyboardButton(m, callback_data=f"order_pick_item:{i}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
         buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
         await query.edit_message_text(f"{label}\n\nОберіть позицію:", reply_markup=InlineKeyboardMarkup(buttons))
         return
@@ -1690,16 +1686,33 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "order_finish":
-        order = ORDER_PENDING.pop(chat_id, None)
-        if not order or not order.get("items"):
+        if not order.get("items"):
+            ORDER_PENDING.pop(chat_id, None)
             await query.edit_message_text("Замовлення порожнє, скасовано.")
             return
+        order["step"] = "payment"
+        await query.edit_message_text(
+            "Останній крок — оберіть спосіб оплати:", reply_markup=_order_payment_keyboard()
+        )
+        return
+
+    if data.startswith("order_payment:"):
+        _, method = data.split(":", 1)
+        order = ORDER_PENDING.pop(chat_id, None)
+        if not order:
+            await query.edit_message_text("Це замовлення вже неактуальне.")
+            return
+        order["payment_method"] = method
         profile = _get_client_profile(chat_id) or {}
         summary = _order_summary_text(order, profile)
         client = update.effective_user
         target_admin = _resolve_target_admin(chat_id)
-        await query.edit_message_text(
-            "✅ Дякуємо! Ваше замовлення передано менеджеру, скоро з вами зв'яжуться."
+        await query.edit_message_text("✅ Замовлення оформлено!")
+        await context.bot.send_message(
+            chat_id,
+            "Дякуємо! Ваше замовлення передано менеджеру, скоро з вами зв'яжуться 🙌\n\n"
+            "👇 Кнопки внизу завжди тут, якщо треба щось інше.",
+            reply_markup=_client_persistent_keyboard(),
         )
         if target_admin:
             try:
@@ -2934,7 +2947,6 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER)}$"), order_start))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_PROFILE)}$"), profile_show))
     application.add_handler(CallbackQueryHandler(profile_edit_callback, pattern=r"^profile_edit$"))
-    application.add_handler(CallbackQueryHandler(profile_payment_callback, pattern=r"^profile_payment:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
