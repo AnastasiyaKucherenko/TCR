@@ -134,6 +134,8 @@ def init_db():
     bc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
     if "is_question" not in bc_cols:
         conn.execute("ALTER TABLE broadcasts ADD COLUMN is_question INTEGER DEFAULT 0")
+    if "file_id" not in bc_cols:
+        conn.execute("ALTER TABLE broadcasts ADD COLUMN file_id TEXT")
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
     # таблицю schedules, щоб не втратити те, що вже було задано раніше.
     old_rows = conn.execute(
@@ -587,6 +589,78 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Розсилка завершена. Надіслано: {sent}, помилок: {failed}")
 
 
+async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробляє файл (PDF тощо), надісланий адміном, з урахуванням поточного контексту:
+    очікуваних обраних отримувачів (/sendto), розсилки всім через меню, або прямої команди /broadcastfile."""
+    admin_id = update.effective_chat.id
+    if not is_admin(update):
+        return
+    document = update.message.document
+    if not document:
+        return
+    caption = update.message.caption or ""
+
+    # 1) Якщо очікуємо отримувачів для /sendto (обрані люди)
+    if admin_id in SENDTO_AWAITING_TEXT:
+        recipients = SENDTO_AWAITING_TEXT.pop(admin_id)
+        sent, failed = 0, 0
+        for chat_id in recipients:
+            try:
+                await context.bot.send_document(chat_id, document.file_id, caption=caption or None)
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Не вдалось надіслати файл {chat_id}: {e}")
+                failed += 1
+        await update.message.reply_text(f"Надіслано файл обраним: {sent}, помилок: {failed}.")
+        return
+
+    # 2) Якщо очікуємо текст для розсилки ВСІМ через меню — приймаємо файл замість тексту
+    pending = MENU_PENDING.get(admin_id)
+    if pending and pending.get("action") == "broadcast_text":
+        MENU_PENDING.pop(admin_id, None)
+        conn = db()
+        rows = conn.execute("SELECT chat_id FROM subscribers WHERE active=1").fetchall()
+        conn.close()
+        sent, failed = 0, 0
+        for r in rows:
+            try:
+                await context.bot.send_document(r["chat_id"], document.file_id, caption=caption or None)
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Не вдалось надіслати файл {r['chat_id']}: {e}")
+                failed += 1
+        await update.message.reply_text(
+            f"✅ Розсилка файлу всім завершена. Надіслано: {sent}, помилок: {failed}.",
+            reply_markup=_menu_back_keyboard(),
+        )
+        return
+
+    # 3) Якщо очікуємо текст для запланованої розсилки/питання — приймаємо файл замість тексту
+    if pending and pending.get("action") == "bc_text":
+        MENU_PENDING.pop(admin_id, None)
+        await _finalize_scheduled_broadcast(update, context, admin_id, caption, file_id=document.file_id)
+        return
+
+    # 4) Якщо очікуємо текст для негайного питання так/ні — приймаємо файл замість тексту
+    if pending and pending.get("action") == "qna_text":
+        MENU_PENDING.pop(admin_id, None)
+        await qna_send(context, admin_id, caption, file_id=document.file_id)
+        return
+
+    # 5) Пряма команда: файл із підписом «/broadcastfile текст» — усім одразу, без меню
+    if caption.lower().startswith("/broadcastfile"):
+        await broadcast_file(update, context)
+        return
+
+    # 6) Файл прийшов без жодного контексту — підказуємо, як його розіслати
+    await update.message.reply_text(
+        "Щоб розіслати цей файл, спочатку оберіть дію через меню "
+        "(«Написати всім/обраним зараз», «Запланувати розсилку» або «Запланувати запитання так/ні»), "
+        "а потім надішліть файл ще раз.\n"
+        "Або одразу підпишіть файл текстом «/broadcastfile ваш текст», щоб розіслати його всім негайно."
+    )
+
+
 async def broadcast_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Розсилає прикріплений файл (PDF тощо) усім активним підписникам.
     Спрацьовує, коли адмін надсилає боту документ із підписом, що починається на /broadcastfile."""
@@ -789,57 +863,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "bc_text":
         MENU_PENDING.pop(admin_id, None)
-        bc = BC_PENDING.pop(admin_id, {})
-        BC_SELECTIONS.pop(admin_id, None)
-
-        target_type = bc.get("target_type")
-        target_value = bc.get("target_value")
-        kind = bc.get("kind")
-        hour = bc.get("hour")
-        minute = bc.get("minute", 0)
-        is_question = 1 if bc.get("is_question") else 0
-
-        if not all([target_type, target_value, kind]) or hour is None:
-            await update.message.reply_text(
-                "Щось пішло не так під час налаштування розсилки. Спробуйте ще раз через меню.",
-                reply_markup=_menu_back_keyboard(),
-            )
-            return
-
-        conn = db()
-        if kind == "once":
-            date_str = bc.get("date")
-            run_at = datetime.combine(
-                datetime.fromisoformat(date_str).date(), time(hour=hour, minute=minute), tzinfo=TZ
-            )
-            cur = conn.execute(
-                "INSERT INTO broadcasts (kind, target_type, target_value, message, run_at, is_question, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (kind, target_type, target_value, text, run_at.isoformat(), is_question, datetime.now(TZ).isoformat()),
-            )
-        else:
-            weekday = bc.get("weekday")
-            hhmm = f"{hour:02d}:{minute:02d}"
-            cur = conn.execute(
-                "INSERT INTO broadcasts (kind, target_type, target_value, message, weekday, hhmm, is_question, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (kind, target_type, target_value, text, weekday, hhmm, is_question, datetime.now(TZ).isoformat()),
-            )
-        broadcast_id = cur.lastrowid
-        conn.commit()
-        row = conn.execute("SELECT * FROM broadcasts WHERE id=?", (broadcast_id,)).fetchone()
-        conn.close()
-
-        schedule_broadcast_job(context.application, row)
-
-        kind_label = "Запитання так/ні" if is_question else "Розсилку"
-        await update.message.reply_text(
-            f"✅ {kind_label} заплановано!\n\n"
-            f"Кому: {_bc_target_label(target_type, target_value)}\n"
-            f"Коли: {_bc_timing_label(row)}\n"
-            f"Текст: {text}",
-            reply_markup=_menu_back_keyboard(),
-        )
+        await _finalize_scheduled_broadcast(update, context, admin_id, text)
         return
 
 
@@ -1147,6 +1171,65 @@ def _bc_minute_keyboard(hour: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([row, [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")]])
 
 
+async def _finalize_scheduled_broadcast(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, admin_id: int, message_text: str, file_id: str | None = None
+):
+    """Зберігає й планує розсилку (звичайну або питання так/ні), опційно з прикріпленим файлом.
+    Використовується і коли адмін надіслав текст, і коли надіслав файл замість тексту."""
+    bc = BC_PENDING.pop(admin_id, {})
+    BC_SELECTIONS.pop(admin_id, None)
+
+    target_type = bc.get("target_type")
+    target_value = bc.get("target_value")
+    kind = bc.get("kind")
+    hour = bc.get("hour")
+    minute = bc.get("minute", 0)
+    is_question = 1 if bc.get("is_question") else 0
+
+    if not all([target_type, target_value, kind]) or hour is None:
+        await update.message.reply_text(
+            "Щось пішло не так під час налаштування розсилки. Спробуйте ще раз через меню.",
+            reply_markup=_menu_back_keyboard(),
+        )
+        return
+
+    conn = db()
+    if kind == "once":
+        date_str = bc.get("date")
+        run_at = datetime.combine(
+            datetime.fromisoformat(date_str).date(), time(hour=hour, minute=minute), tzinfo=TZ
+        )
+        cur = conn.execute(
+            "INSERT INTO broadcasts (kind, target_type, target_value, message, run_at, is_question, file_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, target_type, target_value, message_text, run_at.isoformat(), is_question, file_id, datetime.now(TZ).isoformat()),
+        )
+    else:
+        weekday = bc.get("weekday")
+        hhmm = f"{hour:02d}:{minute:02d}"
+        cur = conn.execute(
+            "INSERT INTO broadcasts (kind, target_type, target_value, message, weekday, hhmm, is_question, file_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, target_type, target_value, message_text, weekday, hhmm, is_question, file_id, datetime.now(TZ).isoformat()),
+        )
+    broadcast_id = cur.lastrowid
+    conn.commit()
+    row = conn.execute("SELECT * FROM broadcasts WHERE id=?", (broadcast_id,)).fetchone()
+    conn.close()
+
+    schedule_broadcast_job(context.application, row)
+
+    kind_label = "Запитання так/ні" if is_question else "Розсилку"
+    file_note = "\n📎 З прикріпленим файлом" if file_id else ""
+    await update.message.reply_text(
+        f"✅ {kind_label} заплановано!{file_note}\n\n"
+        f"Кому: {_bc_target_label(target_type, target_value)}\n"
+        f"Коли: {_bc_timing_label(row)}\n"
+        f"Текст: {message_text or '(без тексту)'}",
+        reply_markup=_menu_back_keyboard(),
+    )
+
+
 async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1261,10 +1344,10 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         MENU_PENDING[admin_id] = {"action": "bc_text"}
         if pending.get("is_question"):
             await query.edit_message_text(
-                "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?»):"
+                "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?») — або надішліть файл із підписом:"
             )
         else:
-            await query.edit_message_text("Напишіть текст повідомлення для цієї розсилки:")
+            await query.edit_message_text("Напишіть текст повідомлення для цієї розсилки — або надішліть файл із підписом:")
         return
 
     if data == "bc_cancellist":
@@ -1405,7 +1488,7 @@ async def qna_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         QNA_PENDING.setdefault(admin_id, {})["target_value"] = seg
         MENU_PENDING[admin_id] = {"action": "qna_text"}
         await query.edit_message_text(
-            "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?»):"
+            "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?») — або надішліть файл із підписом:"
         )
         return
 
@@ -1445,7 +1528,7 @@ async def qna_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         QNA_PENDING.setdefault(admin_id, {})["target_value"] = ",".join(str(x) for x in selected)
         MENU_PENDING[admin_id] = {"action": "qna_text"}
         await query.edit_message_text(
-            "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?»):"
+            "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?») — або надішліть файл із підписом:"
         )
         return
 
@@ -1469,7 +1552,7 @@ async def qna_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-async def qna_send(context: ContextTypes.DEFAULT_TYPE, admin_id: int, question_text: str):
+async def qna_send(context: ContextTypes.DEFAULT_TYPE, admin_id: int, question_text: str, file_id: str | None = None):
     pending = QNA_PENDING.pop(admin_id, {})
     QNA_SELECTIONS.pop(admin_id, None)
     target_type = pending.get("target_type")
@@ -1491,18 +1574,24 @@ async def qna_send(context: ContextTypes.DEFAULT_TYPE, admin_id: int, question_t
         ).fetchall()
     conn.close()
 
+    full_text = question_text + QNA_CLARIFICATION
     fallback_admin = ADMIN_IDS[0] if ADMIN_IDS else None
     sent, failed = 0, 0
     for r in rows:
         resp_admin = r["responsible_admin"] or fallback_admin
-        yes_button = _admin_link_button(resp_admin, "✅ Так") if resp_admin else None
+        yes_button = _admin_link_button(resp_admin, YES_BUTTON_LABEL) if resp_admin else None
         buttons = [
             [InlineKeyboardButton("❌ Ні", callback_data=f"qna_no:{r['chat_id']}")],
         ]
         if yes_button:
             buttons.append([yes_button])
         try:
-            await context.bot.send_message(r["chat_id"], question_text, reply_markup=InlineKeyboardMarkup(buttons))
+            if file_id:
+                await context.bot.send_document(
+                    r["chat_id"], file_id, caption=full_text, reply_markup=InlineKeyboardMarkup(buttons)
+                )
+            else:
+                await context.bot.send_message(r["chat_id"], full_text, reply_markup=InlineKeyboardMarkup(buttons))
             sent += 1
         except Exception as e:
             logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
@@ -1600,6 +1689,13 @@ def _bc_timing_label(row) -> str:
     return f"щотижня, {WEEKDAYS_UA[row['weekday']]} о {row['hhmm']}"
 
 
+YES_BUTTON_LABEL = "✅ Так (написати менеджеру)"
+QNA_CLARIFICATION = (
+    "\n\n💬 Кнопка «Так» відкриє особистий чат з менеджером — там і напишіть. "
+    "Відповідати сюди в бот не потрібно, бот повідомлень не читає."
+)
+
+
 async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
     broadcast_id = context.job.data["broadcast_id"]
     conn = db()
@@ -1628,20 +1724,30 @@ async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     fallback_admin = ADMIN_IDS[0] if ADMIN_IDS else None
+    file_id = row["file_id"] if "file_id" in row.keys() else None
     sent, failed = 0, 0
     for r in recip_rows:
         try:
             if is_question:
                 resp_admin = r["responsible_admin"] or fallback_admin
-                yes_button = _admin_link_button(resp_admin, "✅ Так") if resp_admin else None
+                yes_button = _admin_link_button(resp_admin, YES_BUTTON_LABEL) if resp_admin else None
                 buttons = [[InlineKeyboardButton("❌ Ні", callback_data=f"qna_no:{r['chat_id']}")]]
                 if yes_button:
                     buttons.append([yes_button])
-                await context.bot.send_message(
-                    r["chat_id"], row["message"], reply_markup=InlineKeyboardMarkup(buttons)
-                )
+                question_text = (row["message"] or "") + QNA_CLARIFICATION
+                if file_id:
+                    await context.bot.send_document(
+                        r["chat_id"], file_id, caption=question_text, reply_markup=InlineKeyboardMarkup(buttons)
+                    )
+                else:
+                    await context.bot.send_message(
+                        r["chat_id"], question_text, reply_markup=InlineKeyboardMarkup(buttons)
+                    )
             else:
-                await context.bot.send_message(r["chat_id"], row["message"])
+                if file_id:
+                    await context.bot.send_document(r["chat_id"], file_id, caption=row["message"] or None)
+                else:
+                    await context.bot.send_message(r["chat_id"], row["message"])
             sent += 1
         except Exception as e:
             logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
@@ -1776,7 +1882,7 @@ def main():
     application.add_handler(CommandHandler("setsegment", setsegment))
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(
-        MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/broadcastfile"), broadcast_file)
+        MessageHandler(filters.Document.ALL, handle_admin_document)
     )
     application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CommandHandler("testsegment", testsegment))
