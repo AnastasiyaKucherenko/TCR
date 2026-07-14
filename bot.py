@@ -589,7 +589,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent, failed = 0, 0
     for r in rows:
         try:
-            await context.bot.send_message(r["chat_id"], text)
+            await context.bot.send_message(r["chat_id"], text, reply_markup=_client_persistent_keyboard())
             sent += 1
         except Exception as e:
             logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
@@ -614,7 +614,9 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
         sent, failed = 0, 0
         for chat_id in recipients:
             try:
-                await context.bot.send_document(chat_id, document.file_id, caption=caption or None)
+                await context.bot.send_document(
+                    chat_id, document.file_id, caption=caption or None, reply_markup=_client_persistent_keyboard()
+                )
                 sent += 1
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати файл {chat_id}: {e}")
@@ -632,7 +634,9 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
         sent, failed = 0, 0
         for r in rows:
             try:
-                await context.bot.send_document(r["chat_id"], document.file_id, caption=caption or None)
+                await context.bot.send_document(
+                    r["chat_id"], document.file_id, caption=caption or None, reply_markup=_client_persistent_keyboard()
+                )
                 sent += 1
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати файл {r['chat_id']}: {e}")
@@ -690,7 +694,9 @@ async def broadcast_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent, failed = 0, 0
     for r in rows:
         try:
-            await context.bot.send_document(r["chat_id"], document.file_id, caption=text or None)
+            await context.bot.send_document(
+                r["chat_id"], document.file_id, caption=text or None, reply_markup=_client_persistent_keyboard()
+            )
             sent += 1
         except Exception as e:
             logger.warning(f"Не вдалось надіслати файл {r['chat_id']}: {e}")
@@ -801,7 +807,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent, failed = 0, 0
         for chat_id in recipients:
             try:
-                await context.bot.send_message(chat_id, text)
+                await context.bot.send_message(chat_id, text, reply_markup=_client_persistent_keyboard())
                 sent += 1
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати {chat_id}: {e}")
@@ -824,7 +830,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent, failed = 0, 0
         for r in rows:
             try:
-                await context.bot.send_message(r["chat_id"], text)
+                await context.bot.send_message(r["chat_id"], text, reply_markup=_client_persistent_keyboard())
                 sent += 1
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
@@ -1751,7 +1757,7 @@ async def send_segment_broadcast(context: ContextTypes.DEFAULT_TYPE):
     sent, failed = 0, 0
     for r in rows:
         try:
-            await context.bot.send_message(r["chat_id"], seg_row["message"])
+            await context.bot.send_message(r["chat_id"], seg_row["message"], reply_markup=_client_persistent_keyboard())
             sent += 1
         except Exception as e:
             logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
@@ -1879,9 +1885,13 @@ async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
                     )
             else:
                 if file_id:
-                    await context.bot.send_document(r["chat_id"], file_id, caption=row["message"] or None)
+                    await context.bot.send_document(
+                        r["chat_id"], file_id, caption=row["message"] or None, reply_markup=_client_persistent_keyboard()
+                    )
                 else:
-                    await context.bot.send_message(r["chat_id"], row["message"])
+                    await context.bot.send_message(
+                        r["chat_id"], row["message"], reply_markup=_client_persistent_keyboard()
+                    )
             sent += 1
         except Exception as e:
             logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
