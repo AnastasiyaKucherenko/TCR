@@ -137,6 +137,8 @@ def init_db():
         conn.execute("ALTER TABLE broadcasts ADD COLUMN is_question INTEGER DEFAULT 0")
     if "file_id" not in bc_cols:
         conn.execute("ALTER TABLE broadcasts ADD COLUMN file_id TEXT")
+    if "created_by" not in bc_cols:
+        conn.execute("ALTER TABLE broadcasts ADD COLUMN created_by INTEGER")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -573,6 +575,103 @@ async def clients_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_clients_text())
 
 
+def _clients_with_admin_text() -> str:
+    conn = db()
+    rows = conn.execute(
+        "SELECT s.chat_id, s.name, s.username, s.segment, a.name as admin_name "
+        "FROM subscribers s LEFT JOIN admins a ON s.responsible_admin = a.chat_id "
+        "WHERE s.active=1 ORDER BY s.joined_at DESC"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return "Поки немає активних підписників."
+    text = f"Клієнти та їхні відповідальні ({len(rows)}):\n\n"
+    for r in rows[:80]:
+        admin_label = r["admin_name"] if r["admin_name"] else "❓ не призначено"
+        text += (
+            f"• {r['name']} (@{r['username'] or '—'}) — chat_id: {r['chat_id']}\n"
+            f"   Група: {r['segment'] or 'немає'} | Відповідальний: {admin_label}\n"
+        )
+    if len(rows) > 80:
+        text += f"\n...і ще {len(rows) - 80}"
+    text += (
+        "\n\nШвидко призначити відповідального відразу кільком клієнтам:\n"
+        "/bulkresp @юзернейм_адміна id1,id2,id3\n"
+        "або одразу всій групі:\n"
+        "/bulkresp @юзернейм_адміна segment:назва_групи"
+    )
+    return text
+
+
+async def resplist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text(_clients_with_admin_text())
+
+
+async def bulkresp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Швидко призначає одного адміна відповідальним одразу для кількох клієнтів або цілої групи.
+    Використання: /bulkresp @юзернейм id1,id2,id3
+                  /bulkresp @юзернейм segment:назва_групи"""
+    if not is_admin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Використання:\n"
+            "/bulkresp @юзернейм_адміна id1,id2,id3 — призначити конкретних клієнтів за chat_id\n"
+            "/bulkresp @юзернейм_адміна segment:назва_групи — призначити всіх клієнтів групи одразу\n\n"
+            "Chat_id клієнтів можна побачити в «📋 Список клієнтів і відповідальних»."
+        )
+        return
+
+    admin_username = context.args[0].lstrip("@").lower()
+    conn = db()
+    admin_row = conn.execute("SELECT chat_id, name FROM admins WHERE LOWER(username)=?", (admin_username,)).fetchone()
+    if not admin_row:
+        conn.close()
+        await update.message.reply_text(
+            f"Адміна з юзернеймом @{admin_username} не знайдено. Він має хоч раз написати боту будь-яку команду."
+        )
+        return
+    target_admin_id = admin_row["chat_id"]
+
+    selector = context.args[1]
+    if selector.startswith("segment:"):
+        seg = selector[len("segment:"):]
+        cur = conn.execute(
+            "UPDATE subscribers SET responsible_admin=? WHERE segment=? AND active=1", (target_admin_id, seg)
+        )
+        conn.commit()
+        count = cur.rowcount
+        conn.close()
+        await update.message.reply_text(
+            f"✅ Призначено {admin_row['name']} відповідальним для {count} клієнтів групи «{seg}»."
+        )
+        return
+
+    try:
+        ids = [int(x.strip()) for x in selector.split(",") if x.strip()]
+    except ValueError:
+        conn.close()
+        await update.message.reply_text("Не вдалось розпізнати chat_id. Приклад: /bulkresp @admin 111,222,333")
+        return
+
+    if not ids:
+        conn.close()
+        await update.message.reply_text("Не вказано жодного chat_id.")
+        return
+
+    placeholders = ",".join("?" * len(ids))
+    cur = conn.execute(
+        f"UPDATE subscribers SET responsible_admin=? WHERE chat_id IN ({placeholders}) AND active=1",
+        (target_admin_id, *ids),
+    )
+    conn.commit()
+    count = cur.rowcount
+    conn.close()
+    await update.message.reply_text(f"✅ Призначено {admin_row['name']} відповідальним для {count} клієнтів.")
+
+
 # ---------- Миттєва розсилка всім ----------
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -720,18 +819,36 @@ def _build_sendto_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(buttons)
 
 
-async def _sendto_send_picker(context: ContextTypes.DEFAULT_TYPE, admin_id: int):
+def _get_admin_clients(admin_id: int, segment: str | None = None) -> list:
+    """Повертає активних клієнтів, закріплених саме за цим адміном (responsible_admin)."""
     conn = db()
-    rows = conn.execute(
-        "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
-    ).fetchall()
+    if segment:
+        rows = conn.execute(
+            "SELECT chat_id, name, username FROM subscribers "
+            "WHERE active=1 AND responsible_admin=? AND segment=? ORDER BY joined_at DESC LIMIT 100",
+            (admin_id, segment),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT chat_id, name, username FROM subscribers "
+            "WHERE active=1 AND responsible_admin=? ORDER BY joined_at DESC LIMIT 100",
+            (admin_id,),
+        ).fetchall()
     conn.close()
-    if not rows:
-        await context.bot.send_message(admin_id, "Поки немає активних підписників.")
+    return [dict(r) for r in rows]
+
+
+async def _sendto_send_picker(context: ContextTypes.DEFAULT_TYPE, admin_id: int):
+    clients = _get_admin_clients(admin_id)
+    if not clients:
+        await context.bot.send_message(
+            admin_id,
+            "У вас поки немає закріплених клієнтів 🙈 Спочатку призначте собі клієнтів "
+            "(меню → «🙋 Призначити відповідального клієнту» або «📋 Список клієнтів і відповідальних»)."
+        )
         return
 
     SENDTO_SELECTIONS[admin_id] = set()
-    clients = [dict(r) for r in rows]
     context.chat_data["sendto_clients"] = clients
     await context.bot.send_message(
         admin_id,
@@ -871,11 +988,12 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "assortment_text":
+        cat_key = pending.get("category", "")
+        label = dict(ASSORTMENT_CATEGORIES).get(cat_key, cat_key)
         MENU_PENDING.pop(admin_id, None)
-        _set_setting("assortment", text)
+        _set_setting(f"assortment_{cat_key}", text)
         await update.message.reply_text(
-            "✅ Асортимент оновлено! Клієнти одразу побачать нову версію, "
-            "коли натиснуть «☕ Асортимент».",
+            f"✅ Категорію «{label}» оновлено! Клієнти одразу побачать нову версію.",
             reply_markup=_menu_back_keyboard(),
         )
         return
@@ -917,6 +1035,7 @@ def _menu_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚚 Редагувати умови доставки (бачать клієнти)", callback_data="menu_editdelivery")],
         [InlineKeyboardButton("👥 Змінити групу клієнта", callback_data="menu_changeseg")],
         [InlineKeyboardButton("🙋 Призначити відповідального клієнту", callback_data="menu_setresp")],
+        [InlineKeyboardButton("📋 Список клієнтів і відповідальних", callback_data="menu_resplist")],
         [InlineKeyboardButton("✏️ Змінити повідомлення групи", callback_data="menu_setmsg")],
         [InlineKeyboardButton("📁 Переглянути групи", callback_data="menu_viewsegments")],
         [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
@@ -976,14 +1095,43 @@ def _client_persistent_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+ASSORTMENT_CATEGORIES = [
+    ("arabika", "🌱 Арабіка"),
+    ("blend", "🎨 Бленд"),
+    ("palay", "✨ Палай"),
+    ("drip", "💧 Дріп"),
+    ("school", "🎓 Школа бариста"),
+]
+
+
+def _assortment_category_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"{prefix}:{key}")]
+        for key, label in ASSORTMENT_CATEGORIES
+    ]
+    if prefix == "menu_assortcat":
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def client_show_assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = _get_setting("assortment", "").strip()
+    await update.message.reply_text(
+        "☕ Оберіть категорію:", reply_markup=_assortment_category_keyboard("clientassort")
+    )
+
+
+async def client_assortment_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, cat_key = query.data.split(":", 1)
+    label = dict(ASSORTMENT_CATEGORIES).get(cat_key, cat_key)
+    text = _get_setting(f"assortment_{cat_key}", "").strip()
     if not text:
-        await update.message.reply_text(
-            "Наразі асортимент ще не додано 🙈 Скоро оновимо — зазирніть трохи пізніше!"
+        await query.edit_message_text(
+            f"{label}\n\nНаразі ще не додано 🙈 Скоро оновимо — зазирніть трохи пізніше!"
         )
         return
-    await update.message.reply_text(f"☕ Наш поточний асортимент:\n\n{text}")
+    await query.edit_message_text(f"{label}\n\n{text}")
 
 
 async def client_show_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1063,12 +1211,21 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_editassortment":
-        current = _get_setting("assortment", "").strip()
-        preview = f"\n\nЗараз там написано:\n{current}" if current else "\n\nЗараз там ще нічого не додано."
-        MENU_PENDING[admin_id] = {"action": "assortment_text"}
         await query.edit_message_text(
-            "Напишіть новий текст асортименту (список позицій кави) — саме це побачать клієнти, "
-            "коли натиснуть свою кнопку «☕ Асортимент»." + preview
+            "☕ Яку категорію асортименту редагувати?",
+            reply_markup=_assortment_category_keyboard("menu_assortcat"),
+        )
+        return
+
+    if data.startswith("menu_assortcat:"):
+        _, cat_key = data.split(":", 1)
+        label = dict(ASSORTMENT_CATEGORIES).get(cat_key, cat_key)
+        current = _get_setting(f"assortment_{cat_key}", "").strip()
+        preview = f"\n\nЗараз там написано:\n{current}" if current else "\n\nЗараз там ще нічого не додано."
+        MENU_PENDING[admin_id] = {"action": "assortment_text", "category": cat_key}
+        await query.edit_message_text(
+            f"Напишіть новий текст для категорії «{label}» — саме це побачать клієнти, "
+            f"коли оберуть цю категорію." + preview
         )
         return
 
@@ -1117,6 +1274,10 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "Оберіть клієнта, якому призначити відповідального:", reply_markup=InlineKeyboardMarkup(buttons)
         )
+        return
+
+    if data == "menu_resplist":
+        await query.edit_message_text(_clients_with_admin_text(), reply_markup=_menu_back_keyboard())
         return
 
     if data.startswith("menu_pickclientresp:"):
@@ -1339,17 +1500,17 @@ async def _finalize_scheduled_broadcast(
             datetime.fromisoformat(date_str).date(), time(hour=hour, minute=minute), tzinfo=TZ
         )
         cur = conn.execute(
-            "INSERT INTO broadcasts (kind, target_type, target_value, message, run_at, is_question, file_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (kind, target_type, target_value, message_text, run_at.isoformat(), is_question, file_id, datetime.now(TZ).isoformat()),
+            "INSERT INTO broadcasts (kind, target_type, target_value, message, run_at, is_question, file_id, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, target_type, target_value, message_text, run_at.isoformat(), is_question, file_id, admin_id, datetime.now(TZ).isoformat()),
         )
     else:
         weekday = bc.get("weekday")
         hhmm = f"{hour:02d}:{minute:02d}"
         cur = conn.execute(
-            "INSERT INTO broadcasts (kind, target_type, target_value, message, weekday, hhmm, is_question, file_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (kind, target_type, target_value, message_text, weekday, hhmm, is_question, file_id, datetime.now(TZ).isoformat()),
+            "INSERT INTO broadcasts (kind, target_type, target_value, message, weekday, hhmm, is_question, file_id, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, target_type, target_value, message_text, weekday, hhmm, is_question, file_id, admin_id, datetime.now(TZ).isoformat()),
         )
     broadcast_id = cur.lastrowid
     conn.commit()
@@ -1400,28 +1561,39 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Груп ще немає. Спочатку створіть групу через меню.", reply_markup=_menu_back_keyboard()
             )
             return
-        BC_PENDING.setdefault(admin_id, {})["target_type"] = "segment"
         await query.edit_message_text("Оберіть групу:", reply_markup=_bc_group_keyboard())
         return
 
     if data.startswith("bc_pickgroup:"):
         _, seg = data.split(":", 1)
-        BC_PENDING.setdefault(admin_id, {})["target_value"] = seg
-        await query.edit_message_text("Коли надіслати?", reply_markup=_bc_timing_keyboard())
-        return
-
-    if data == "bc_target_selected":
-        conn = db()
-        rows = conn.execute(
-            "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
-        ).fetchall()
-        conn.close()
-        if not rows:
-            await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
+        clients = _get_admin_clients(admin_id, segment=seg)
+        if not clients:
+            await query.edit_message_text(
+                f"У вас немає власних клієнтів у групі «{seg}» 🙈 Спочатку призначте собі клієнтів "
+                f"у цій групі (меню → «📋 Список клієнтів і відповідальних»).",
+                reply_markup=_menu_back_keyboard(),
+            )
             return
         BC_PENDING.setdefault(admin_id, {})["target_type"] = "selected"
         BC_SELECTIONS[admin_id] = set()
-        clients = [dict(r) for r in rows]
+        context.chat_data["bc_clients"] = clients
+        await query.edit_message_text(
+            f"Ваші клієнти в групі «{seg}» — оберіть, кому надіслати (тапніть, щоб додати/прибрати):",
+            reply_markup=_bc_select_keyboard(admin_id, clients),
+        )
+        return
+
+    if data == "bc_target_selected":
+        clients = _get_admin_clients(admin_id)
+        if not clients:
+            await query.edit_message_text(
+                "У вас поки немає закріплених клієнтів 🙈 Спочатку призначте собі клієнтів "
+                "(меню → «📋 Список клієнтів і відповідальних»).",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        BC_PENDING.setdefault(admin_id, {})["target_type"] = "selected"
+        BC_SELECTIONS[admin_id] = set()
         context.chat_data["bc_clients"] = clients
         await query.edit_message_text(
             "Оберіть людей (тапніть, щоб додати/прибрати позначку):",
@@ -1491,10 +1663,12 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "bc_cancellist":
         conn = db()
-        rows = conn.execute("SELECT * FROM broadcasts WHERE active=1 ORDER BY id DESC").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM broadcasts WHERE active=1 AND created_by=? ORDER BY id DESC", (admin_id,)
+        ).fetchall()
         conn.close()
         if not rows:
-            await query.edit_message_text("Активних запланованих розсилок немає.", reply_markup=_menu_back_keyboard())
+            await query.edit_message_text("У вас немає активних запланованих розсилок.", reply_markup=_menu_back_keyboard())
             return
         buttons = [
             [InlineKeyboardButton(
@@ -1513,7 +1687,7 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, bid_str = data.split(":", 1)
         bid = int(bid_str)
         conn = db()
-        row = conn.execute("SELECT * FROM broadcasts WHERE id=?", (bid,)).fetchone()
+        row = conn.execute("SELECT * FROM broadcasts WHERE id=? AND created_by=?", (bid, admin_id)).fetchone()
         conn.close()
         if not row:
             await query.edit_message_text("Цю розсилку вже не знайдено.", reply_markup=_menu_back_keyboard())
@@ -1536,6 +1710,11 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, bid_str = data.split(":", 1)
         bid = int(bid_str)
         conn = db()
+        row = conn.execute("SELECT id FROM broadcasts WHERE id=? AND created_by=?", (bid, admin_id)).fetchone()
+        if not row:
+            conn.close()
+            await query.edit_message_text("Цю розсилку вже не знайдено.", reply_markup=_menu_back_keyboard())
+            return
         conn.execute("UPDATE broadcasts SET active=0 WHERE id=?", (bid,))
         conn.commit()
         conn.close()
@@ -1546,12 +1725,14 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "bc_viewlist":
         conn = db()
-        rows = conn.execute("SELECT * FROM broadcasts WHERE active=1 ORDER BY id DESC").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM broadcasts WHERE active=1 AND created_by=? ORDER BY id DESC", (admin_id,)
+        ).fetchall()
         conn.close()
         if not rows:
-            await query.edit_message_text("Активних запланованих розсилок немає.", reply_markup=_menu_back_keyboard())
+            await query.edit_message_text("У вас немає активних запланованих розсилок.", reply_markup=_menu_back_keyboard())
             return
-        text = "Заплановані розсилки:\n\n"
+        text = "Ваші заплановані розсилки:\n\n"
         for r in rows:
             marker = "❓ Запитання так/ні" if r["is_question"] else "📌"
             text += (
@@ -1618,31 +1799,39 @@ async def qna_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not has_segments:
             await query.edit_message_text("Груп ще немає.", reply_markup=_menu_back_keyboard())
             return
-        QNA_PENDING.setdefault(admin_id, {})["target_type"] = "segment"
         await query.edit_message_text("Оберіть групу:", reply_markup=_qna_group_keyboard())
         return
 
     if data.startswith("qna_pickgroup:"):
         _, seg = data.split(":", 1)
-        QNA_PENDING.setdefault(admin_id, {})["target_value"] = seg
-        MENU_PENDING[admin_id] = {"action": "qna_text"}
+        clients = _get_admin_clients(admin_id, segment=seg)
+        if not clients:
+            await query.edit_message_text(
+                f"У вас немає власних клієнтів у групі «{seg}» 🙈 Спочатку призначте собі клієнтів "
+                f"у цій групі (меню → «📋 Список клієнтів і відповідальних»).",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        QNA_PENDING.setdefault(admin_id, {})["target_type"] = "selected"
+        QNA_SELECTIONS[admin_id] = set()
+        context.chat_data["qna_clients"] = clients
         await query.edit_message_text(
-            "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?») — або надішліть файл із підписом:"
+            f"Ваші клієнти в групі «{seg}» — оберіть, кому поставити запитання:",
+            reply_markup=_qna_select_keyboard(admin_id, clients),
         )
         return
 
     if data == "qna_target_selected":
-        conn = db()
-        rows = conn.execute(
-            "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
-        ).fetchall()
-        conn.close()
-        if not rows:
-            await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
+        clients = _get_admin_clients(admin_id)
+        if not clients:
+            await query.edit_message_text(
+                "У вас поки немає закріплених клієнтів 🙈 Спочатку призначте собі клієнтів "
+                "(меню → «📋 Список клієнтів і відповідальних»).",
+                reply_markup=_menu_back_keyboard(),
+            )
             return
         QNA_PENDING.setdefault(admin_id, {})["target_type"] = "selected"
         QNA_SELECTIONS[admin_id] = set()
-        clients = [dict(r) for r in rows]
         context.chat_data["qna_clients"] = clients
         await query.edit_message_text(
             "Оберіть людей (тапніть, щоб додати/прибрати позначку):",
@@ -2023,6 +2212,8 @@ def main():
     application.add_handler(CommandHandler("removeschedule", removeschedule))
     application.add_handler(CommandHandler("setmsg", setmsg))
     application.add_handler(CommandHandler("clients", clients_list))
+    application.add_handler(CommandHandler("resplist", resplist_command))
+    application.add_handler(CommandHandler("bulkresp", bulkresp_command))
     application.add_handler(CommandHandler("setsegment", setsegment))
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(
@@ -2036,6 +2227,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ASSORTMENT)}$"), client_show_assortment))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_DELIVERY)}$"), client_show_delivery))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_MANAGER)}$"), client_contact_manager))
+    application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
     application.add_handler(CallbackQueryHandler(sendto_cancel_callback, pattern=r"^sendto_cancel$"))
@@ -2043,7 +2235,7 @@ def main():
     application.add_handler(CallbackQueryHandler(pickresp_callback, pattern=r"^pickresp:"))
     application.add_handler(CallbackQueryHandler(respme_callback, pattern=r"^respme:"))
     application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu_"))
-    application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^bc"))
+    application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^bc_"))
     application.add_handler(CallbackQueryHandler(qna_router, pattern=r"^qna_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
