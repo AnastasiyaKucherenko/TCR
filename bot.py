@@ -1,3 +1,4 @@
+
 """
 Telegram-бот для ростерії: збір клієнтів через /start, сегменти з власним
 щотижневим розкладом розсилки, і команда для миттєвої розсилки всім
@@ -9,11 +10,11 @@ Telegram-бот для ростерії: збір клієнтів через /s
 import logging
 import os
 import sqlite3
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -57,6 +58,14 @@ SENDTO_AWAITING_TEXT: dict[int, list[int]] = {}
 # Стан для кроків меню з кнопками (наприклад, очікування тексту після вибору дії)
 MENU_PENDING: dict[int, dict] = {}
 
+# Стан майстра планування розсилок (кому / коли / текст) та вибір обраних людей у ньому
+BC_PENDING: dict[int, dict] = {}
+BC_SELECTIONS: dict[int, set[int]] = {}
+
+WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+BC_MINUTES = [0, 15, 30, 45]
+
 
 # ---------- База даних ----------
 
@@ -92,6 +101,20 @@ def init_db():
             weekday INTEGER NOT NULL,
             hhmm TEXT NOT NULL,
             PRIMARY KEY (segment, weekday, hhmm)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,          -- 'once' або 'weekly'
+            target_type TEXT NOT NULL,   -- 'segment' або 'selected'
+            target_value TEXT NOT NULL,  -- назва групи, або chat_id через кому
+            message TEXT NOT NULL,
+            run_at TEXT,                 -- ISO дата-час, для 'once'
+            weekday INTEGER,             -- 0-6, для 'weekly'
+            hhmm TEXT,                   -- 'ГГ:ХХ', для 'weekly'
+            active INTEGER DEFAULT 1,
+            created_at TEXT
         )
     """)
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
@@ -638,13 +661,85 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action == "addsegment_text":
+        MENU_PENDING.pop(admin_id, None)
+        name = text.strip().split()[0] if text.strip() else ""
+        if not name:
+            await update.message.reply_text("Назва не може бути порожньою.", reply_markup=_menu_back_keyboard())
+            return
+        conn = db()
+        conn.execute("INSERT OR IGNORE INTO segments (name) VALUES (?)", (name,))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(
+            f"✅ Групу «{name}» створено.", reply_markup=_menu_back_keyboard()
+        )
+        return
+
+    if action == "bc_text":
+        MENU_PENDING.pop(admin_id, None)
+        bc = BC_PENDING.pop(admin_id, {})
+        BC_SELECTIONS.pop(admin_id, None)
+
+        target_type = bc.get("target_type")
+        target_value = bc.get("target_value")
+        kind = bc.get("kind")
+        hour = bc.get("hour")
+        minute = bc.get("minute", 0)
+
+        if not all([target_type, target_value, kind]) or hour is None:
+            await update.message.reply_text(
+                "Щось пішло не так під час налаштування розсилки. Спробуйте ще раз через меню.",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+
+        conn = db()
+        if kind == "once":
+            date_str = bc.get("date")
+            run_at = datetime.combine(
+                datetime.fromisoformat(date_str).date(), time(hour=hour, minute=minute), tzinfo=TZ
+            )
+            cur = conn.execute(
+                "INSERT INTO broadcasts (kind, target_type, target_value, message, run_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (kind, target_type, target_value, text, run_at.isoformat(), datetime.now(TZ).isoformat()),
+            )
+        else:
+            weekday = bc.get("weekday")
+            hhmm = f"{hour:02d}:{minute:02d}"
+            cur = conn.execute(
+                "INSERT INTO broadcasts (kind, target_type, target_value, message, weekday, hhmm, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (kind, target_type, target_value, text, weekday, hhmm, datetime.now(TZ).isoformat()),
+            )
+        broadcast_id = cur.lastrowid
+        conn.commit()
+        row = conn.execute("SELECT * FROM broadcasts WHERE id=?", (broadcast_id,)).fetchone()
+        conn.close()
+
+        schedule_broadcast_job(context.application, row)
+
+        await update.message.reply_text(
+            f"✅ Розсилку заплановано!\n\n"
+            f"Кому: {_bc_target_label(target_type, target_value)}\n"
+            f"Коли: {_bc_timing_label(row)}\n"
+            f"Текст: {text}",
+            reply_markup=_menu_back_keyboard(),
+        )
+        return
+
 
 # ---------- Меню з кнопками українською (альтернатива текстовим командам) ----------
 
 def _menu_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Написати всім", callback_data="menu_broadcast")],
-        [InlineKeyboardButton("🎯 Написати обраним", callback_data="menu_sendto")],
+        [InlineKeyboardButton("📢 Написати всім зараз", callback_data="menu_broadcast")],
+        [InlineKeyboardButton("🎯 Написати обраним зараз", callback_data="menu_sendto")],
+        [InlineKeyboardButton("📅 Запланувати розсилку", callback_data="bc_start")],
+        [InlineKeyboardButton("🗑 Скасувати заплановану розсилку", callback_data="bc_cancellist")],
+        [InlineKeyboardButton("📖 Поточні заплановані розсилки", callback_data="bc_viewlist")],
+        [InlineKeyboardButton("➕ Створити нову групу", callback_data="menu_addsegment")],
         [InlineKeyboardButton("👥 Змінити групу клієнта", callback_data="menu_changeseg")],
         [InlineKeyboardButton("✏️ Змінити повідомлення групи", callback_data="menu_setmsg")],
         [InlineKeyboardButton("📁 Переглянути групи", callback_data="menu_viewsegments")],
@@ -656,9 +751,21 @@ def _menu_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До меню", callback_data="menu_back")]])
 
 
+def _persistent_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📋 Меню")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
+    await update.message.reply_text(
+        "Кнопка «📋 Меню» тепер закріплена внизу — можна відкривати меню одним тапом, без набору команди.",
+        reply_markup=_persistent_menu_keyboard(),
+    )
     await update.message.reply_text("Оберіть дію:", reply_markup=_menu_main_keyboard())
 
 
@@ -685,6 +792,14 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_sendto":
         await query.edit_message_text("Завантажую список клієнтів...")
         await _sendto_send_picker(context, admin_id)
+        return
+
+    if data == "menu_addsegment":
+        MENU_PENDING[admin_id] = {"action": "addsegment_text"}
+        await query.edit_message_text(
+            "Напишіть назву нової групи одним словом, без пробілів, латиницею "
+            "(наприклад: postiyni, vip, wholesale):"
+        )
         return
 
     if data == "menu_changeseg":
@@ -770,6 +885,275 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+# ---------- Майстер планування розсилок (кнопки: кому / коли / текст) ----------
+
+def _bc_target_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📁 По групі", callback_data="bc_target_group")],
+        [InlineKeyboardButton("🎯 Обраним людям", callback_data="bc_target_selected")],
+        [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
+    ])
+
+
+def _bc_group_keyboard() -> InlineKeyboardMarkup:
+    conn = db()
+    rows = conn.execute("SELECT name FROM segments").fetchall()
+    conn.close()
+    buttons = [[InlineKeyboardButton(r["name"], callback_data=f"bc_pickgroup:{r['name']}")] for r in rows]
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _bc_select_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup:
+    selected = BC_SELECTIONS.get(admin_id, set())
+    buttons = []
+    for c in clients:
+        mark = "✅" if c["chat_id"] in selected else "⬜"
+        buttons.append([InlineKeyboardButton(
+            f"{mark} {c['name']} (@{c['username'] or '—'})", callback_data=f"bc_toggle:{c['chat_id']}"
+        )])
+    buttons.append([
+        InlineKeyboardButton("➡️ Далі", callback_data="bc_selectdone"),
+        InlineKeyboardButton("❌ Скасувати", callback_data="menu_back"),
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _bc_timing_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📆 Одноразово, конкретна дата", callback_data="bc_timing_once")],
+        [InlineKeyboardButton("🔁 Щотижня, певний день", callback_data="bc_timing_weekly")],
+        [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
+    ])
+
+
+def _bc_date_keyboard() -> InlineKeyboardMarkup:
+    today = datetime.now(TZ).date()
+    buttons, row = [], []
+    for i in range(14):
+        d = today + timedelta(days=i)
+        label = f"{d.strftime('%d.%m')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
+        row.append(InlineKeyboardButton(label, callback_data=f"bc_date:{d.isoformat()}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _bc_weekday_keyboard() -> InlineKeyboardMarkup:
+    buttons, row = [], []
+    for i, label in enumerate(WEEKDAY_LABELS_SHORT):
+        row.append(InlineKeyboardButton(label, callback_data=f"bc_weekday:{i}"))
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _bc_hour_keyboard() -> InlineKeyboardMarkup:
+    buttons, row = [], []
+    for h in BC_HOURS:
+        row.append(InlineKeyboardButton(f"{h:02d}:00", callback_data=f"bc_hour:{h}"))
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _bc_minute_keyboard(hour: int) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(f"{hour:02d}:{m:02d}", callback_data=f"bc_min:{m}") for m in BC_MINUTES]
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")]])
+
+
+async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    data = query.data
+
+    if data == "bc_start":
+        BC_PENDING[admin_id] = {}
+        BC_SELECTIONS.pop(admin_id, None)
+        await query.edit_message_text("Кому запланувати розсилку?", reply_markup=_bc_target_keyboard())
+        return
+
+    if data == "bc_target_group":
+        conn = db()
+        has_segments = conn.execute("SELECT COUNT(*) c FROM segments").fetchone()["c"]
+        conn.close()
+        if not has_segments:
+            await query.edit_message_text(
+                "Груп ще немає. Спочатку створіть групу через меню.", reply_markup=_menu_back_keyboard()
+            )
+            return
+        BC_PENDING.setdefault(admin_id, {})["target_type"] = "segment"
+        await query.edit_message_text("Оберіть групу:", reply_markup=_bc_group_keyboard())
+        return
+
+    if data.startswith("bc_pickgroup:"):
+        _, seg = data.split(":", 1)
+        BC_PENDING.setdefault(admin_id, {})["target_value"] = seg
+        await query.edit_message_text("Коли надіслати?", reply_markup=_bc_timing_keyboard())
+        return
+
+    if data == "bc_target_selected":
+        conn = db()
+        rows = conn.execute(
+            "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
+            return
+        BC_PENDING.setdefault(admin_id, {})["target_type"] = "selected"
+        BC_SELECTIONS[admin_id] = set()
+        clients = [dict(r) for r in rows]
+        context.chat_data["bc_clients"] = clients
+        await query.edit_message_text(
+            "Оберіть людей (тапніть, щоб додати/прибрати позначку):",
+            reply_markup=_bc_select_keyboard(admin_id, clients),
+        )
+        return
+
+    if data.startswith("bc_toggle:"):
+        _, chat_id_str = data.split(":", 1)
+        chat_id = int(chat_id_str)
+        selected = BC_SELECTIONS.setdefault(admin_id, set())
+        selected.discard(chat_id) if chat_id in selected else selected.add(chat_id)
+        clients = context.chat_data.get("bc_clients", [])
+        await query.edit_message_reply_markup(reply_markup=_bc_select_keyboard(admin_id, clients))
+        return
+
+    if data == "bc_selectdone":
+        selected = BC_SELECTIONS.get(admin_id, set())
+        if not selected:
+            await query.answer("Оберіть хоча б одну людину.", show_alert=True)
+            return
+        BC_PENDING.setdefault(admin_id, {})["target_value"] = ",".join(str(x) for x in selected)
+        await query.edit_message_text("Коли надіслати?", reply_markup=_bc_timing_keyboard())
+        return
+
+    if data == "bc_timing_once":
+        BC_PENDING.setdefault(admin_id, {})["kind"] = "once"
+        await query.edit_message_text("Оберіть дату:", reply_markup=_bc_date_keyboard())
+        return
+
+    if data == "bc_timing_weekly":
+        BC_PENDING.setdefault(admin_id, {})["kind"] = "weekly"
+        await query.edit_message_text("Оберіть день тижня:", reply_markup=_bc_weekday_keyboard())
+        return
+
+    if data.startswith("bc_date:"):
+        _, date_str = data.split(":", 1)
+        BC_PENDING.setdefault(admin_id, {})["date"] = date_str
+        await query.edit_message_text("Оберіть годину:", reply_markup=_bc_hour_keyboard())
+        return
+
+    if data.startswith("bc_weekday:"):
+        _, wd_str = data.split(":", 1)
+        BC_PENDING.setdefault(admin_id, {})["weekday"] = int(wd_str)
+        await query.edit_message_text("Оберіть годину:", reply_markup=_bc_hour_keyboard())
+        return
+
+    if data.startswith("bc_hour:"):
+        _, hh_str = data.split(":", 1)
+        hh = int(hh_str)
+        BC_PENDING.setdefault(admin_id, {})["hour"] = hh
+        await query.edit_message_text("Оберіть хвилини:", reply_markup=_bc_minute_keyboard(hh))
+        return
+
+    if data.startswith("bc_min:"):
+        _, mm_str = data.split(":", 1)
+        pending = BC_PENDING.setdefault(admin_id, {})
+        pending["minute"] = int(mm_str)
+        MENU_PENDING[admin_id] = {"action": "bc_text"}
+        await query.edit_message_text("Напишіть текст повідомлення для цієї розсилки:")
+        return
+
+    if data == "bc_cancellist":
+        conn = db()
+        rows = conn.execute("SELECT * FROM broadcasts WHERE active=1 ORDER BY id DESC").fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("Активних запланованих розсилок немає.", reply_markup=_menu_back_keyboard())
+            return
+        buttons = [
+            [InlineKeyboardButton(
+                f"{_bc_target_label(r['target_type'], r['target_value'])} — {_bc_timing_label(r)}",
+                callback_data=f"bc_cancelpick:{r['id']}",
+            )]
+            for r in rows
+        ]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "Оберіть, яку розсилку скасувати:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("bc_cancelpick:"):
+        _, bid_str = data.split(":", 1)
+        bid = int(bid_str)
+        conn = db()
+        row = conn.execute("SELECT * FROM broadcasts WHERE id=?", (bid,)).fetchone()
+        conn.close()
+        if not row:
+            await query.edit_message_text("Цю розсилку вже не знайдено.", reply_markup=_menu_back_keyboard())
+            return
+        preview = row["message"][:80] + ("..." if len(row["message"]) > 80 else "")
+        buttons = [
+            [InlineKeyboardButton("✅ Так, скасувати", callback_data=f"bc_cancelconfirm:{bid}")],
+            [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
+        ]
+        await query.edit_message_text(
+            f"Скасувати цю розсилку?\n\n"
+            f"Кому: {_bc_target_label(row['target_type'], row['target_value'])}\n"
+            f"Коли: {_bc_timing_label(row)}\n"
+            f"Текст: {preview}",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("bc_cancelconfirm:"):
+        _, bid_str = data.split(":", 1)
+        bid = int(bid_str)
+        conn = db()
+        conn.execute("UPDATE broadcasts SET active=0 WHERE id=?", (bid,))
+        conn.commit()
+        conn.close()
+        for job in context.application.job_queue.get_jobs_by_name(_bc_job_name(bid)):
+            job.schedule_removal()
+        await query.edit_message_text("✅ Розсилку скасовано.", reply_markup=_menu_back_keyboard())
+        return
+
+    if data == "bc_viewlist":
+        conn = db()
+        rows = conn.execute("SELECT * FROM broadcasts WHERE active=1 ORDER BY id DESC").fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("Активних запланованих розсилок немає.", reply_markup=_menu_back_keyboard())
+            return
+        text = "Заплановані розсилки:\n\n"
+        for r in rows:
+            text += (
+                f"📌 Кому: {_bc_target_label(r['target_type'], r['target_value'])}\n"
+                f"   Коли: {_bc_timing_label(r)}\n"
+                f"   Текст: {r['message']}\n\n"
+            )
+        await query.edit_message_text(text, reply_markup=_menu_back_keyboard())
+        return
+
+
 # ---------- Автоматична розсилка по сегменту (виклик за розкладом) ----------
 
 async def send_segment_broadcast(context: ContextTypes.DEFAULT_TYPE):
@@ -839,6 +1223,99 @@ async def load_schedules_on_startup(application: Application):
         logger.info(f"Заплановано розсилку для сегмента {r['segment']}: {WEEKDAYS_UA[r['weekday']]} {r['hhmm']}")
 
 
+# ---------- Заплановані розсилки (майстер: кому / коли / текст) ----------
+
+def _bc_job_name(broadcast_id: int) -> str:
+    return f"bcast_{broadcast_id}"
+
+
+def _bc_target_label(target_type: str, target_value: str) -> str:
+    if target_type == "segment":
+        return f"група «{target_value}»"
+    count = len([x for x in target_value.split(",") if x])
+    return f"обрані ({count} осіб)"
+
+
+def _bc_timing_label(row) -> str:
+    if row["kind"] == "once":
+        dt = datetime.fromisoformat(row["run_at"])
+        return f"одноразово, {dt.strftime('%d.%m.%Y %H:%M')}"
+    return f"щотижня, {WEEKDAYS_UA[row['weekday']]} о {row['hhmm']}"
+
+
+async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
+    broadcast_id = context.job.data["broadcast_id"]
+    conn = db()
+    row = conn.execute("SELECT * FROM broadcasts WHERE id=? AND active=1", (broadcast_id,)).fetchone()
+    if not row:
+        conn.close()
+        return
+
+    if row["target_type"] == "segment":
+        recipients = [
+            r["chat_id"] for r in conn.execute(
+                "SELECT chat_id FROM subscribers WHERE segment=? AND active=1", (row["target_value"],)
+            ).fetchall()
+        ]
+    else:
+        recipients = [int(x) for x in row["target_value"].split(",") if x]
+
+    if row["kind"] == "once":
+        conn.execute("UPDATE broadcasts SET active=0 WHERE id=?", (broadcast_id,))
+        conn.commit()
+    conn.close()
+
+    sent, failed = 0, 0
+    for chat_id in recipients:
+        try:
+            await context.bot.send_message(chat_id, row["message"])
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Не вдалось надіслати {chat_id}: {e}")
+            failed += 1
+
+    if ADMIN_IDS:
+        await notify_admins(
+            context,
+            f"✅ Запланована розсилка ({_bc_target_label(row['target_type'], row['target_value'])}) "
+            f"виконана. Надіслано: {sent}, помилок: {failed}.",
+        )
+
+
+def schedule_broadcast_job(application: Application, row) -> None:
+    name = _bc_job_name(row["id"])
+    for job in application.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+
+    if row["kind"] == "once":
+        run_at = datetime.fromisoformat(row["run_at"])
+        application.job_queue.run_once(
+            send_scheduled_broadcast, when=run_at, name=name, data={"broadcast_id": row["id"]}
+        )
+    else:
+        hh, mm = map(int, row["hhmm"].split(":"))
+        application.job_queue.run_daily(
+            send_scheduled_broadcast,
+            time=time(hour=hh, minute=mm, tzinfo=TZ),
+            days=(row["weekday"],),
+            name=name,
+            data={"broadcast_id": row["id"]},
+        )
+
+
+async def load_broadcasts_on_startup(application: Application):
+    conn = db()
+    rows = conn.execute("SELECT * FROM broadcasts WHERE active=1").fetchall()
+    now = datetime.now(TZ)
+    for r in rows:
+        if r["kind"] == "once" and datetime.fromisoformat(r["run_at"]) <= now:
+            conn.execute("UPDATE broadcasts SET active=0 WHERE id=?", (r["id"],))
+            continue
+        schedule_broadcast_job(application, r)
+    conn.commit()
+    conn.close()
+
+
 async def testsegment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Негайно запускає розсилку для сегмента — для перевірки тексту й доставки без очікування розкладу."""
     if not is_admin(update):
@@ -893,6 +1370,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def load_all_on_startup(application: Application):
+    await load_schedules_on_startup(application)
+    await load_broadcasts_on_startup(application)
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано BOT_TOKEN у .env")
@@ -901,7 +1383,7 @@ def main():
 
     init_db()
 
-    application = Application.builder().token(BOT_TOKEN).post_init(load_schedules_on_startup).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(load_all_on_startup).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
@@ -922,11 +1404,13 @@ def main():
     application.add_handler(CommandHandler("testsegment", testsegment))
     application.add_handler(CommandHandler("sendto", sendto_start))
     application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(MessageHandler(filters.Regex("^📋 Меню$"), menu_command))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
     application.add_handler(CallbackQueryHandler(sendto_cancel_callback, pattern=r"^sendto_cancel$"))
     application.add_handler(CallbackQueryHandler(assign_callback, pattern=r"^assign:"))
     application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu_"))
+    application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^bc_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
     logger.info("Бот запущено")
