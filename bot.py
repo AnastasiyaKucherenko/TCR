@@ -66,6 +66,10 @@ BC_SELECTIONS: dict[int, set[int]] = {}
 QNA_PENDING: dict[int, dict] = {}
 QNA_SELECTIONS: dict[int, set[int]] = {}
 
+# Відстежує, кому з клієнтів адмін відповідає, коли робить Reply на переслане повідомлення
+# Ключ: (admin_chat_id, message_id повідомлення з пересилкою) -> chat_id клієнта
+FORWARD_MAP: dict[tuple[int, int], int] = {}
+
 WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 BC_MINUTES = [0, 15, 30, 45]
@@ -696,11 +700,63 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Розсилка завершена. Надіслано: {sent}, помилок: {failed}")
 
 
+def _resolve_target_admin(client_chat_id: int) -> int | None:
+    conn = db()
+    row = conn.execute("SELECT responsible_admin FROM subscribers WHERE chat_id=?", (client_chat_id,)).fetchone()
+    conn.close()
+    resp = row["responsible_admin"] if row else None
+    return resp or (ADMIN_IDS[0] if ADMIN_IDS else None)
+
+
+async def forward_client_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пересилає текстове повідомлення клієнта його відповідальному адміну (або першому адміну)."""
+    client = update.effective_user
+    chat = update.effective_chat
+    target_admin = _resolve_target_admin(chat.id)
+    if not target_admin:
+        return
+    text = update.message.text or ""
+    try:
+        sent = await context.bot.send_message(
+            target_admin,
+            f"✉️ Повідомлення від {client.full_name} (@{client.username or '—'}, chat_id: {chat.id}):\n\n{text}\n\n"
+            f"Щоб відповісти клієнту — зробіть Reply на це повідомлення.",
+        )
+        FORWARD_MAP[(target_admin, sent.message_id)] = chat.id
+    except Exception as e:
+        logger.warning(f"Не вдалось переслати повідомлення клієнта {chat.id}: {e}")
+
+
+async def forward_client_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пересилає файл від клієнта його відповідальному адміну (або першому адміну)."""
+    client = update.effective_user
+    chat = update.effective_chat
+    document = update.message.document
+    caption = update.message.caption or ""
+    target_admin = _resolve_target_admin(chat.id)
+    if not target_admin or not document:
+        return
+    try:
+        sent = await context.bot.send_document(
+            target_admin,
+            document.file_id,
+            caption=(
+                f"✉️ Файл від {client.full_name} (@{client.username or '—'}, chat_id: {chat.id})"
+                + (f":\n{caption}" if caption else "") +
+                "\n\nЩоб відповісти клієнту — зробіть Reply на це повідомлення."
+            ),
+        )
+        FORWARD_MAP[(target_admin, sent.message_id)] = chat.id
+    except Exception as e:
+        logger.warning(f"Не вдалось переслати файл клієнта {chat.id}: {e}")
+
+
 async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обробляє файл (PDF тощо), надісланий адміном, з урахуванням поточного контексту:
     очікуваних обраних отримувачів (/sendto), розсилки всім через меню, або прямої команди /broadcastfile."""
     admin_id = update.effective_chat.id
     if not is_admin(update):
+        await forward_client_document(update, context)
         return
     document = update.message.document
     if not document:
@@ -915,7 +971,20 @@ async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_chat.id
     if not is_admin(update):
+        await forward_client_text(update, context)
         return
+
+    # 0) Якщо адмін відповідає (Reply) на переслане повідомлення клієнта — надсилаємо відповідь клієнту
+    if update.message.reply_to_message:
+        key = (admin_id, update.message.reply_to_message.message_id)
+        if key in FORWARD_MAP:
+            client_chat_id = FORWARD_MAP.pop(key)
+            try:
+                await context.bot.send_message(client_chat_id, update.message.text)
+                await update.message.reply_text("✅ Надіслано клієнту.")
+            except Exception as e:
+                await update.message.reply_text(f"Не вдалось надіслати клієнту: {e}")
+            return
 
     # 1) Якщо очікуємо текст для розсилки обраним (/sendto)
     if admin_id in SENDTO_AWAITING_TEXT:
