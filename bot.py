@@ -1439,15 +1439,22 @@ ORDER_QUANTITIES = ["1", "2", "3", "4", "5"]
 
 
 def _order_date_keyboard() -> InlineKeyboardMarkup:
-    today = datetime.now(TZ).date()
+    now = datetime.now(TZ)
+    today = now.date()
     buttons, row = [], []
-    for i in range(14):
+    for i in range(21):
         d = today + timedelta(days=i)
+        if d.weekday() >= 5:  # субота(5), неділя(6) — не приймаємо замовлення
+            continue
+        if i == 0 and now.hour >= 10:  # сьогоднішній день доступний тільки до 10:00
+            continue
         label = f"{d.strftime('%d.%m')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
         row.append(InlineKeyboardButton(label, callback_data=f"order_date:{d.isoformat()}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
+        if len(buttons) >= 6:  # досить ~12 доступних робочих днів наперед
+            break
     if row:
         buttons.append(row)
     buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
@@ -1538,6 +1545,24 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
 
 
+async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «📝 Замовити прямо тут» у запитанні так/ні — запускає той самий опитувальник замовлення."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    profile = _get_client_profile(chat_id)
+    if not profile:
+        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
+        await query.edit_message_text(
+            "Перш ніж оформити замовлення, заповніть, будь ласка, картку клієнта (це одноразово) 🙏\n\n"
+            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
+        )
+        return
+    ORDER_PENDING[chat_id] = {"step": "date", "items": []}
+    await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+    await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+
+
 async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     order = ORDER_PENDING.get(chat_id)
@@ -1545,31 +1570,6 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
         return
     step = order.get("step")
     text = update.message.text or ""
-
-    if step == "item_filter":
-        cat_key = order["current_item"]["category"]
-        items = _parse_assortment_items(cat_key)
-        query_text = text.strip().lower()
-        matches = [i for i in items if i.lower().startswith(query_text)]
-        if not matches:
-            matches = [i for i in items if query_text in i.lower()]
-        if not matches:
-            await update.message.reply_text(
-                "Нічого не знайдено 🙈 Спробуйте написати інші літери назви "
-                "(перевірте написання у розділі «☕ Асортимент»):"
-            )
-            return
-        order["current_item_choices"] = matches[:25]
-        buttons = [
-            [InlineKeyboardButton(m, callback_data=f"order_pick_item:{i}")]
-            for i, m in enumerate(order["current_item_choices"])
-        ]
-        buttons.append([InlineKeyboardButton("🔄 Інший пошук", callback_data="order_research")])
-        buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
-        await update.message.reply_text(
-            f"Знайдено {len(matches)} позицій — оберіть потрібну:", reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return
 
     if step == "qty_other":
         order["current_item"]["qty"] = text
@@ -1619,6 +1619,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Яку категорію товару додати до замовлення?", reply_markup=_order_category_keyboard())
         return
 
+    NO_WEIGHT_CATEGORIES = ("drip", "suputni")
+
     if data.startswith("order_cat:"):
         _, cat_key = data.split(":", 1)
         items = _parse_assortment_items(cat_key)
@@ -1630,10 +1632,13 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         order["current_item"] = {"category": cat_key}
-        order["step"] = "item_filter"
-        await query.edit_message_text(
-            f"{label}\n\nНапишіть перші літери назви позиції — покажу відповідні варіанти зі списку:"
-        )
+        order["current_item_choices"] = items[:80]
+        buttons = [
+            [InlineKeyboardButton(m, callback_data=f"order_pick_item:{i}")]
+            for i, m in enumerate(order["current_item_choices"])
+        ]
+        buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+        await query.edit_message_text(f"{label}\n\nОберіть позицію:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if data.startswith("order_pick_item:"):
@@ -1644,15 +1649,18 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Ця позиція вже неактуальна, спробуйте ще раз.", show_alert=True)
             return
         order["current_item"]["item_text"] = choices[idx]
-        order["step"] = "weight"
-        await query.edit_message_text(
-            f"Обрано: {choices[idx]}\n\nОберіть вагу/фасування:", reply_markup=_order_weight_keyboard()
-        )
-        return
-
-    if data == "order_research":
-        order["step"] = "item_filter"
-        await query.edit_message_text("Напишіть перші літери назви позиції ще раз:")
+        cat_key = order["current_item"]["category"]
+        if cat_key in NO_WEIGHT_CATEGORIES:
+            order["current_item"]["weight"] = "шт"
+            order["step"] = "qty"
+            await query.edit_message_text(
+                f"Обрано: {choices[idx]}\n\nЯка кількість?", reply_markup=_order_qty_keyboard()
+            )
+        else:
+            order["step"] = "weight"
+            await query.edit_message_text(
+                f"Обрано: {choices[idx]}\n\nОберіть вагу/фасування:", reply_markup=_order_weight_keyboard()
+            )
         return
 
     if data.startswith("order_weight:"):
@@ -1719,10 +1727,18 @@ def _persistent_menu_keyboard() -> ReplyKeyboardMarkup:
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
-    await update.message.reply_text(
-        "Кнопка «📋 Меню» тепер закріплена внизу — можна відкривати меню одним тапом, без набору команди.",
+    hint_msg = await update.message.reply_text(
+        "👇👇👇\n"
+        "Ось тут, унизу екрана, є кнопка «📋 Меню» — вона залишається там завжди. "
+        "Натискайте на неї в будь-який момент, щоб відкрити меню одним тапом, без набору команди.",
         reply_markup=_persistent_menu_keyboard(),
     )
+    try:
+        await context.bot.pin_chat_message(
+            update.effective_chat.id, hint_msg.message_id, disable_notification=True
+        )
+    except Exception as e:
+        logger.warning(f"Не вдалось закріпити підказку про меню: {e}")
     await update.message.reply_text("Оберіть дію:", reply_markup=_menu_root_keyboard())
 
 
@@ -2594,10 +2610,11 @@ async def qna_send(context: ContextTypes.DEFAULT_TYPE, admin_id: int, question_t
         resp_admin = r["responsible_admin"] or fallback_admin
         yes_button = _admin_link_button(resp_admin, YES_BUTTON_LABEL) if resp_admin else None
         buttons = [
-            [InlineKeyboardButton("❌ Ні", callback_data=f"qna_no:{r['chat_id']}")],
+            [InlineKeyboardButton(ORDER_VIA_BOT_LABEL, callback_data="qna_order")],
         ]
         if yes_button:
             buttons.append([yes_button])
+        buttons.append([InlineKeyboardButton("❌ Ні", callback_data=f"qna_no:{r['chat_id']}")])
         try:
             if file_id:
                 await context.bot.send_document(
@@ -2702,11 +2719,12 @@ def _bc_timing_label(row) -> str:
     return f"щотижня, {WEEKDAYS_UA[row['weekday']]} о {row['hhmm']}"
 
 
-YES_BUTTON_LABEL = "✅ Так, зв'язатися з менеджером 😊"
+YES_BUTTON_LABEL = "💬 Написати менеджеру 😊"
+ORDER_VIA_BOT_LABEL = "📝 Замовити прямо тут, у боті"
 QNA_CLARIFICATION = (
-    "\n\n💬 Щоб домовитись — просто натисніть «Так», і одразу потрапите в особистий чат "
-    "з менеджером, там і поспілкуємось 😊 Відповідати сюди, у бота, не потрібно — тут ми "
-    "лише надсилаємо новини й нагадування."
+    "\n\n💬 Можна одразу оформити замовлення прямо тут, у боті — «📝 Замовити прямо тут», "
+    "або написати менеджеру напряму — «💬 Написати менеджеру». Відповідати текстом сюди "
+    "не обов'язково — тут ми переважно надсилаємо новини й нагадування."
 )
 
 
@@ -2745,9 +2763,10 @@ async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
             if is_question:
                 resp_admin = r["responsible_admin"] or fallback_admin
                 yes_button = _admin_link_button(resp_admin, YES_BUTTON_LABEL) if resp_admin else None
-                buttons = [[InlineKeyboardButton("❌ Ні", callback_data=f"qna_no:{r['chat_id']}")]]
+                buttons = [[InlineKeyboardButton(ORDER_VIA_BOT_LABEL, callback_data="qna_order")]]
                 if yes_button:
                     buttons.append([yes_button])
+                buttons.append([InlineKeyboardButton("❌ Ні", callback_data=f"qna_no:{r['chat_id']}")])
                 question_text = (row["message"] or "") + QNA_CLARIFICATION
                 if file_id:
                     await context.bot.send_document(
@@ -2925,6 +2944,7 @@ def main():
     application.add_handler(CallbackQueryHandler(respme_callback, pattern=r"^respme:"))
     application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu_"))
     application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^(bc_|bcq_)"))
+    application.add_handler(CallbackQueryHandler(qna_order_callback, pattern=r"^qna_order$"))
     application.add_handler(CallbackQueryHandler(qna_router, pattern=r"^qna_"))
     application.add_handler(CallbackQueryHandler(wg_router, pattern=r"^wg_"))
     application.add_handler(CallbackQueryHandler(order_router, pattern=r"^order_"))
