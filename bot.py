@@ -1789,8 +1789,9 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
 
 # ---------- Опитувальник замовлення (клієнт) ----------
 
-ORDER_WEIGHTS = ["1 кг", "0,5 кг", "0,25 кг", "250 г"]
-ORDER_QUANTITIES = ["1", "2", "3", "4", "5"]
+ORDER_WEIGHTS = ["1 кг", "0,5 кг", "0,25 кг"]
+ORDER_QUANTITIES = ["1", "5", "10"]
+COFFEE_CATEGORIES = ("arabika", "palay", "blend")
 
 
 def _order_date_keyboard() -> InlineKeyboardMarkup:
@@ -1847,6 +1848,16 @@ def _order_qty_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _order_grind_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌰 Зерно", callback_data="order_grind:Зерно"),
+            InlineKeyboardButton("⚙️ Молоте", callback_data="order_grind:Молоте"),
+        ],
+        [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")],
+    ])
+
+
 def _order_summary_text(order: dict, profile: dict) -> str:
     lines = [
         "🆕 НОВЕ ЗАМОВЛЕННЯ",
@@ -1864,10 +1875,17 @@ def _order_summary_text(order: dict, profile: dict) -> str:
     ]
     for i, item in enumerate(order.get("items", []), 1):
         cat_label = dict(ORDER_CATEGORIES).get(item.get("category"), item.get("category"))
+        grind_line = ""
+        if item.get("grind"):
+            grind_line = f"    Помел: {item['grind']}"
+            if item.get("grind_type"):
+                grind_line += f" ({item['grind_type']})"
+            grind_line += "\n"
         lines.append(
             f"{i}) {item.get('item_text', '—')}\n"
             f"    Категорія: {cat_label}\n"
             f"    Фасування/вага: {item.get('weight', '—')}   Кількість: {item.get('qty', '—')}\n"
+            f"{grind_line}"
             f"    Примітка: {item.get('note') or '—'}\n"
         )
     lines.append("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬")
@@ -1942,11 +1960,17 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
     step = order.get("step")
     text = update.message.text or ""
 
+    if step == "grind_type":
+        order["current_item"]["grind_type"] = text
+        order["step"] = "qty"
+        await update.message.reply_text("Яка кількість?", reply_markup=_order_qty_keyboard())
+        return
+
     if step == "qty_other":
         order["current_item"]["qty"] = text
         order["step"] = "note"
         await update.message.reply_text(
-            "Примітка до цієї позиції (пакування, помел тощо)? Якщо немає — напишіть «немає»:"
+            "Примітка до цієї позиції (пакування тощо)? Якщо немає — напишіть «немає»:"
         )
         return
 
@@ -1955,12 +1979,12 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
         order["items"].append(order.pop("current_item"))
         order["step"] = "addmore"
         buttons = [
-            [InlineKeyboardButton("➕ Додати ще позицію", callback_data="order_addmore")],
+            [InlineKeyboardButton("➕ Додати ще одну позицію", callback_data="order_addmore")],
             [InlineKeyboardButton("✅ Завершити замовлення", callback_data="order_finish")],
             [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")],
         ]
         await update.message.reply_text(
-            "Додано! Хочете додати ще одну позицію, чи завершити замовлення?",
+            "✅ Позицію додано до замовлення!\n\n🛒 Що далі?",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
@@ -2065,8 +2089,24 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("order_weight:"):
         _, weight = data.split(":", 1)
         order["current_item"]["weight"] = weight
-        order["step"] = "qty"
-        await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard())
+        cat_key = order["current_item"]["category"]
+        if cat_key in COFFEE_CATEGORIES:
+            order["step"] = "grind"
+            await query.edit_message_text("Зерно чи молоте?", reply_markup=_order_grind_keyboard())
+        else:
+            order["step"] = "qty"
+            await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard())
+        return
+
+    if data.startswith("order_grind:"):
+        _, grind = data.split(":", 1)
+        order["current_item"]["grind"] = grind
+        if grind == "Молоте":
+            order["step"] = "grind_type"
+            await query.edit_message_text("На який помел? (наприклад: для турки, для гейзера, для еспресо тощо):")
+        else:
+            order["step"] = "qty"
+            await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard())
         return
 
     if data.startswith("order_qty:"):
@@ -2074,7 +2114,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order["current_item"]["qty"] = qty
         order["step"] = "note"
         await query.edit_message_text(
-            "Примітка до цієї позиції (пакування, помел тощо)? Якщо немає — напишіть «немає»:"
+            "Примітка до цієї позиції (пакування тощо)? Якщо немає — напишіть «немає»:"
         )
         return
 
