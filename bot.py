@@ -84,6 +84,9 @@ PROFILE_PENDING: dict[int, dict] = {}
 # Стан адміна, коли він редагує картку КОГОСЬ ІНШОГО (не своєму chat_id): admin_chat_id -> {дані...}
 ADMIN_EDIT_PROFILE_PENDING: dict[int, dict] = {}
 
+# Стан, коли адмін додає адресу конкретному клієнту: admin_chat_id -> target_chat_id клієнта
+ADMIN_ADD_ADDRESS_PENDING: dict[int, int] = {}
+
 WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 BC_MINUTES = [0, 15, 30, 45]
@@ -1145,6 +1148,10 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await forward_client_text(update, context)
         return
 
+    if admin_id in ADMIN_ADD_ADDRESS_PENDING:
+        await handle_admin_add_address_text(update, context)
+        return
+
     if admin_id in ADMIN_EDIT_PROFILE_PENDING:
         await handle_admin_edit_profile_text_step(update, context)
         return
@@ -1581,6 +1588,67 @@ async def adminprofile_edit_callback(update: Update, context: ContextTypes.DEFAU
     await query.edit_message_text(
         f"Редагуємо картку клієнта (chat_id: {target_chat_id}).\n\n" + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
     )
+
+
+async def adminprofile_addaddr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін додає нову адресу конкретному клієнту."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    _, target_chat_id_str = query.data.split(":", 1)
+    target_chat_id = int(target_chat_id_str)
+    ADMIN_ADD_ADDRESS_PENDING[admin_id] = target_chat_id
+    await query.edit_message_text(
+        f"Напишіть нову адресу для цього клієнта (chat_id: {target_chat_id}):"
+    )
+
+
+async def adminprofile_deladdr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін видаляє одну з адрес клієнта."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    _, target_chat_id_str, addr_id = query.data.split(":", 2)
+    target_chat_id = int(target_chat_id_str)
+    conn = db()
+    conn.execute("DELETE FROM client_addresses WHERE id=? AND chat_id=?", (int(addr_id), target_chat_id))
+    conn.commit()
+    conn.close()
+    profile = _get_client_profile(target_chat_id)
+    addresses = _get_client_addresses(target_chat_id)
+    buttons = [
+        [InlineKeyboardButton("✏️ Редагувати дані", callback_data=f"adminprofile_edit:{target_chat_id}")],
+        [InlineKeyboardButton("➕ Додати адресу", callback_data=f"adminprofile_addaddr:{target_chat_id}")],
+    ]
+    for a in addresses:
+        buttons.append([InlineKeyboardButton(
+            f"🗑 {a['address'][:40]}", callback_data=f"adminprofile_deladdr:{target_chat_id}:{a['id']}"
+        )])
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    text = "✅ Адресу видалено.\n\n" + (_profile_summary_text(profile, addresses) if profile else "(картка ще не заповнена)")
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def handle_admin_add_address_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_chat.id
+    target_chat_id = ADMIN_ADD_ADDRESS_PENDING.pop(admin_id, None)
+    if not target_chat_id:
+        return
+    address_text = update.message.text or ""
+    conn = db()
+    conn.execute(
+        "INSERT INTO client_addresses (chat_id, address, created_at) VALUES (?, ?, ?)",
+        (target_chat_id, address_text, datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    profile = _get_client_profile(target_chat_id)
+    addresses = _get_client_addresses(target_chat_id)
+    text = "✅ Адресу додано клієнту!\n\n" + (_profile_summary_text(profile, addresses) if profile else "(картка ще не заповнена)")
+    await update.message.reply_text(text, reply_markup=_menu_back_keyboard())
 
 
 async def handle_admin_edit_profile_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2192,11 +2260,18 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         addresses = _get_client_addresses(target_chat_id)
         buttons = [
             [InlineKeyboardButton("✏️ Редагувати дані", callback_data=f"adminprofile_edit:{target_chat_id}")],
+            [InlineKeyboardButton("➕ Додати адресу", callback_data=f"adminprofile_addaddr:{target_chat_id}")],
         ]
+        for a in addresses:
+            buttons.append([InlineKeyboardButton(
+                f"🗑 {a['address'][:40]}", callback_data=f"adminprofile_deladdr:{target_chat_id}:{a['id']}"
+            )])
         buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
         if not profile:
             await query.edit_message_text(
-                "Цей клієнт ще не заповнював картку.", reply_markup=InlineKeyboardMarkup(buttons)
+                "Цей клієнт ще не заповнював картку. Можна одразу додати адресу нижче, "
+                "або зачекати, поки клієнт заповнить решту сам.",
+                reply_markup=InlineKeyboardMarkup(buttons),
             )
             return
         await query.edit_message_text(
@@ -3333,6 +3408,8 @@ def main():
     application.add_handler(CallbackQueryHandler(profile_addaddr_callback, pattern=r"^profile_addaddr$"))
     application.add_handler(CallbackQueryHandler(profile_deladdr_callback, pattern=r"^profile_deladdr:"))
     application.add_handler(CallbackQueryHandler(adminprofile_edit_callback, pattern=r"^adminprofile_edit:"))
+    application.add_handler(CallbackQueryHandler(adminprofile_addaddr_callback, pattern=r"^adminprofile_addaddr:"))
+    application.add_handler(CallbackQueryHandler(adminprofile_deladdr_callback, pattern=r"^adminprofile_deladdr:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
