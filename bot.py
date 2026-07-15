@@ -721,15 +721,34 @@ async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Повідомлення для сегмента «{name}» оновлено. Воно надсилатиметься автоматично за розкладом.")
 
 
-def _clients_text() -> str:
+def _client_display_label(chat_id: int, fallback_name: str, fallback_username: str) -> str:
+    """Показує назву точки з картки клієнта, якщо вона вже заповнена;
+    інакше — звичайне ім'я/юзернейм Telegram."""
     conn = db()
-    rows = conn.execute("SELECT * FROM subscribers WHERE active=1 ORDER BY joined_at DESC").fetchall()
+    row = conn.execute("SELECT point_name FROM client_profiles WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    if row and row["point_name"]:
+        return row["point_name"]
+    return f"{fallback_name} (@{fallback_username or '—'})"
+
+
+def _clients_text(admin_id: int | None = None) -> str:
+    conn = db()
+    if admin_id:
+        rows = conn.execute(
+            "SELECT * FROM subscribers WHERE active=1 AND responsible_admin=? ORDER BY joined_at DESC",
+            (admin_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM subscribers WHERE active=1 ORDER BY joined_at DESC").fetchall()
     conn.close()
     if not rows:
-        return "Поки немає активних підписників."
-    text = f"Активних підписників: {len(rows)}\n\n"
+        return "У вас поки немає закріплених клієнтів." if admin_id else "Поки немає активних підписників."
+    label = "Ваших активних клієнтів" if admin_id else "Активних підписників"
+    text = f"{label}: {len(rows)}\n\n"
     for r in rows[:50]:
-        text += f"• {r['name']} (@{r['username'] or '—'}) — сегмент: {r['segment'] or 'немає'}\n"
+        display = _client_display_label(r["chat_id"], r["name"], r["username"])
+        text += f"• {display} — сегмент: {r['segment'] or 'немає'}\n"
     if len(rows) > 50:
         text += f"\n...і ще {len(rows) - 50}"
     return text
@@ -738,7 +757,7 @@ def _clients_text() -> str:
 async def clients_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
-    await update.message.reply_text(_clients_text())
+    await update.message.reply_text(_clients_text(admin_id=update.effective_chat.id))
 
 
 def _clients_with_admin_text() -> str:
@@ -754,8 +773,9 @@ def _clients_with_admin_text() -> str:
     text = f"Клієнти та їхні відповідальні ({len(rows)}):\n\n"
     for r in rows[:80]:
         admin_label = r["admin_name"] if r["admin_name"] else "❓ не призначено"
+        display = _client_display_label(r["chat_id"], r["name"], r["username"])
         text += (
-            f"• {r['name']} (@{r['username'] or '—'}) — chat_id: {r['chat_id']}\n"
+            f"• {display} — chat_id: {r['chat_id']}\n"
             f"   Група: {r['segment'] or 'немає'} | Відповідальний: {admin_label}\n"
         )
     if len(rows) > 80:
@@ -1028,7 +1048,7 @@ def _build_sendto_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup
     buttons = []
     for c in clients:
         mark = "✅" if c["chat_id"] in selected else "⬜"
-        label = f"{mark} {c['name']} (@{c['username'] or '—'})"
+        label = f"{mark} {_client_display_label(c['chat_id'], c['name'], c['username'])}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"sendto_toggle:{c['chat_id']}")])
     buttons.append([
         InlineKeyboardButton("✅ Надіслати обраним", callback_data="sendto_done"),
@@ -2225,7 +2245,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
             return
         buttons = [
-            [InlineKeyboardButton(f"{r['name']} (@{r['username'] or '—'})", callback_data=f"menu_pickclient:{r['chat_id']}")]
+            [InlineKeyboardButton(_client_display_label(r['chat_id'], r['name'], r['username']), callback_data=f"menu_pickclient:{r['chat_id']}")]
             for r in rows
         ]
         buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
@@ -2244,7 +2264,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
             return
         buttons = [
-            [InlineKeyboardButton(f"{r['name']} (@{r['username'] or '—'})", callback_data=f"menu_pickclientprofile:{r['chat_id']}")]
+            [InlineKeyboardButton(_client_display_label(r['chat_id'], r['name'], r['username']), callback_data=f"menu_pickclientprofile:{r['chat_id']}")]
             for r in rows
         ]
         buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
@@ -2289,7 +2309,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
             return
         buttons = [
-            [InlineKeyboardButton(f"{r['name']} (@{r['username'] or '—'})", callback_data=f"menu_pickclientresp:{r['chat_id']}")]
+            [InlineKeyboardButton(_client_display_label(r['chat_id'], r['name'], r['username']), callback_data=f"menu_pickclientresp:{r['chat_id']}")]
             for r in rows
         ]
         buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
@@ -2362,7 +2382,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_viewclients":
-        await query.edit_message_text(_clients_text(), reply_markup=_menu_back_keyboard())
+        await query.edit_message_text(_clients_text(admin_id=admin_id), reply_markup=_menu_back_keyboard())
         return
 
     if data.startswith("menu_pickclient:"):
@@ -2500,7 +2520,7 @@ def _bc_select_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup:
     for c in clients:
         mark = "✅" if c["chat_id"] in selected else "⬜"
         buttons.append([InlineKeyboardButton(
-            f"{mark} {c['name']} (@{c['username'] or '—'})", callback_data=f"bc_toggle:{c['chat_id']}"
+            f"{mark} {_client_display_label(c['chat_id'], c['name'], c['username'])}", callback_data=f"bc_toggle:{c['chat_id']}"
         )])
     buttons.append([
         InlineKeyboardButton("➡️ Далі", callback_data="bc_selectdone"),
@@ -2885,7 +2905,7 @@ def _qna_select_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup:
     for c in clients:
         mark = "✅" if c["chat_id"] in selected else "⬜"
         buttons.append([InlineKeyboardButton(
-            f"{mark} {c['name']} (@{c['username'] or '—'})", callback_data=f"qna_toggle:{c['chat_id']}"
+            f"{mark} {_client_display_label(c['chat_id'], c['name'], c['username'])}", callback_data=f"qna_toggle:{c['chat_id']}"
         )])
     buttons.append([
         InlineKeyboardButton("➡️ Далі", callback_data="qna_selectdone"),
