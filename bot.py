@@ -158,6 +158,8 @@ def init_db():
     existing_cols = [r["name"] for r in conn.execute("PRAGMA table_info(subscribers)").fetchall()]
     if "responsible_admin" not in existing_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN responsible_admin INTEGER")
+    if "needs_packaging" not in existing_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN needs_packaging INTEGER DEFAULT 0")
     bc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
     if "is_question" not in bc_cols:
         conn.execute("ALTER TABLE broadcasts ADD COLUMN is_question INTEGER DEFAULT 0")
@@ -1057,6 +1059,29 @@ def _build_sendto_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(buttons)
 
 
+def _packaging_toggle_keyboard() -> InlineKeyboardMarkup:
+    conn = db()
+    rows = conn.execute(
+        "SELECT chat_id, name, username, needs_packaging FROM subscribers WHERE active=1 "
+        "ORDER BY joined_at DESC LIMIT 60"
+    ).fetchall()
+    conn.close()
+    buttons = []
+    for r in rows:
+        mark = "✅" if r["needs_packaging"] else "⬜"
+        label = f"{mark} {_client_display_label(r['chat_id'], r['name'], r['username'])}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"menu_packagingtoggle:{r['chat_id']}")])
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _client_needs_packaging(chat_id: int) -> bool:
+    conn = db()
+    row = conn.execute("SELECT needs_packaging FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    return bool(row and row["needs_packaging"])
+
+
 def _get_admin_clients(admin_id: int, segment: str | None = None) -> list:
     """Повертає активних клієнтів, закріплених саме за цим адміном (responsible_admin)."""
     conn = db()
@@ -1334,6 +1359,7 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🙋 Відповідальний", callback_data="menu_setresp"),
         ],
         [InlineKeyboardButton("🪪 Редагувати картку клієнта", callback_data="menu_editclientprofile")],
+        [InlineKeyboardButton("📦 Кому показувати вибір пакування", callback_data="menu_packaging")],
         [InlineKeyboardButton("📋 Список клієнтів і відповідальних", callback_data="menu_resplist")],
         [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
         [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
@@ -1848,6 +1874,22 @@ def _order_qty_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+PACKAGING_OPTIONS = ["Крафт", "Бренд", "Білий не бренд", "Чорний"]
+
+
+def _order_packaging_keyboard() -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(p, callback_data=f"order_packaging:{p}")] for p in PACKAGING_OPTIONS]
+    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _next_after_options(chat_id: int):
+    """Визначає наступний крок після ваги/помелу: пакування (якщо клієнта позначено) або одразу кількість."""
+    if _client_needs_packaging(chat_id):
+        return "packaging", "Яке пакування?", _order_packaging_keyboard()
+    return "qty", "Яка кількість?", _order_qty_keyboard()
+
+
 def _order_grind_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -1881,12 +1923,13 @@ def _order_summary_text(order: dict, profile: dict) -> str:
             if item.get("grind_type"):
                 grind_line += f" ({item['grind_type']})"
             grind_line += "\n"
+        packaging_line = f"    Пакування: {item['packaging']}\n" if item.get("packaging") else ""
         lines.append(
             f"{i}) {item.get('item_text', '—')}\n"
             f"    Категорія: {cat_label}\n"
             f"    Фасування/вага: {item.get('weight', '—')}   Кількість: {item.get('qty', '—')}\n"
             f"{grind_line}"
-            f"    Примітка: {item.get('note') or '—'}\n"
+            f"{packaging_line}"
         )
     lines.append("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬")
     return "\n".join(lines)
@@ -1962,20 +2005,13 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
 
     if step == "grind_type":
         order["current_item"]["grind_type"] = text
-        order["step"] = "qty"
-        await update.message.reply_text("Яка кількість?", reply_markup=_order_qty_keyboard())
+        next_step, next_text, next_kb = _next_after_options(chat_id)
+        order["step"] = next_step
+        await update.message.reply_text(next_text, reply_markup=next_kb)
         return
 
     if step == "qty_other":
         order["current_item"]["qty"] = text
-        order["step"] = "note"
-        await update.message.reply_text(
-            "Примітка до цієї позиції (пакування тощо)? Якщо немає — напишіть «немає»:"
-        )
-        return
-
-    if step == "note":
-        order["current_item"]["note"] = text
         order["items"].append(order.pop("current_item"))
         order["step"] = "addmore"
         buttons = [
@@ -2094,8 +2130,9 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order["step"] = "grind"
             await query.edit_message_text("Зерно чи молоте?", reply_markup=_order_grind_keyboard())
         else:
-            order["step"] = "qty"
-            await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard())
+            next_step, next_text, next_kb = _next_after_options(chat_id)
+            order["step"] = next_step
+            await query.edit_message_text(next_text, reply_markup=next_kb)
         return
 
     if data.startswith("order_grind:"):
@@ -2105,16 +2142,31 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order["step"] = "grind_type"
             await query.edit_message_text("На який помел? (наприклад: для турки, для гейзера, для еспресо тощо):")
         else:
-            order["step"] = "qty"
-            await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard())
+            next_step, next_text, next_kb = _next_after_options(chat_id)
+            order["step"] = next_step
+            await query.edit_message_text(next_text, reply_markup=next_kb)
+        return
+
+    if data.startswith("order_packaging:"):
+        _, packaging = data.split(":", 1)
+        order["current_item"]["packaging"] = packaging
+        order["step"] = "qty"
+        await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard())
         return
 
     if data.startswith("order_qty:"):
         _, qty = data.split(":", 1)
         order["current_item"]["qty"] = qty
-        order["step"] = "note"
+        order["items"].append(order.pop("current_item"))
+        order["step"] = "addmore"
+        buttons = [
+            [InlineKeyboardButton("➕ Додати ще одну позицію", callback_data="order_addmore")],
+            [InlineKeyboardButton("✅ Завершити замовлення", callback_data="order_finish")],
+            [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")],
+        ]
         await query.edit_message_text(
-            "Примітка до цієї позиції (пакування тощо)? Якщо немає — напишіть «немає»:"
+            "✅ Позицію додано до замовлення!\n\n🛒 Що далі?",
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
 
@@ -2311,6 +2363,26 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "Картку якого клієнта переглянути/редагувати?", reply_markup=InlineKeyboardMarkup(buttons)
         )
+        return
+
+    if data == "menu_packaging":
+        await query.edit_message_text(
+            "Оберіть клієнтів, яким показувати крок вибору пакування "
+            "(тап додає/прибирає позначку, зберігається одразу):",
+            reply_markup=_packaging_toggle_keyboard(),
+        )
+        return
+
+    if data.startswith("menu_packagingtoggle:"):
+        _, target_chat_id_str = data.split(":", 1)
+        target_chat_id = int(target_chat_id_str)
+        conn = db()
+        row = conn.execute("SELECT needs_packaging FROM subscribers WHERE chat_id=?", (target_chat_id,)).fetchone()
+        new_val = 0 if (row and row["needs_packaging"]) else 1
+        conn.execute("UPDATE subscribers SET needs_packaging=? WHERE chat_id=?", (new_val, target_chat_id))
+        conn.commit()
+        conn.close()
+        await query.edit_message_reply_markup(reply_markup=_packaging_toggle_keyboard())
         return
 
     if data.startswith("menu_pickclientprofile:"):
