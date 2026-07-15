@@ -70,11 +70,19 @@ QNA_SELECTIONS: dict[int, set[int]] = {}
 # Ключ: (admin_chat_id, message_id повідомлення з пересилкою) -> chat_id клієнта
 FORWARD_MAP: dict[tuple[int, int], int] = {}
 
+# Відстежує повідомлення "новий підписник" у кожного адміна окремо,
+# щоб прибрати їх у всіх, щойно хтось один призначив себе відповідальним.
+# Ключ: chat_id клієнта -> {admin_chat_id: message_id}
+NEW_SUB_MESSAGES: dict[int, dict[int, int]] = {}
+
 # Стан опитувальника замовлення клієнта: chat_id клієнта -> {"step":..., "point_name":..., ...}
 ORDER_PENDING: dict[int, dict] = {}
 
 # Стан заповнення "картки клієнта": chat_id клієнта -> {"step":..., дані...}
 PROFILE_PENDING: dict[int, dict] = {}
+
+# Стан адміна, коли він редагує картку КОГОСЬ ІНШОГО (не своєму chat_id): admin_chat_id -> {дані...}
+ADMIN_EDIT_PROFILE_PENDING: dict[int, dict] = {}
 
 WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
@@ -117,6 +125,11 @@ def init_db():
             PRIMARY KEY (segment, weekday, hhmm)
         )
     """)
+    sched_cols = [r["name"] for r in conn.execute("PRAGMA table_info(schedules)").fetchall()]
+    if "kind" not in sched_cols:
+        # 'weekday' зберігає: для kind='weekly'/'biweekly' — день тижня (0-6),
+        # для kind='monthly' — день місяця (1-28)
+        conn.execute("ALTER TABLE schedules ADD COLUMN kind TEXT DEFAULT 'weekly'")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS broadcasts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,6 +186,14 @@ def init_db():
         conn.execute("ALTER TABLE client_profiles ADD COLUMN ipn TEXT")
     if "payment_method" not in profile_cols:
         conn.execute("ALTER TABLE client_profiles ADD COLUMN payment_method TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS client_addresses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            created_at TEXT
+        )
+    """)
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
     # таблицю schedules, щоб не втратити те, що вже було задано раніше.
     old_rows = conn.execute(
@@ -268,21 +289,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
     if ADMIN_IDS:
-        conn = db()
-        segments = [r["name"] for r in conn.execute("SELECT name FROM segments")]
-        conn.close()
-        buttons = [
-            [InlineKeyboardButton(seg, callback_data=f"assign:{chat.id}:{seg}")]
-            for seg in segments
-        ]
-        buttons.append([InlineKeyboardButton("Без сегмента", callback_data=f"assign:{chat.id}:__none__")])
-        buttons.append([InlineKeyboardButton("🙋 Я відповідальний", callback_data=f"respme:{chat.id}")])
-        await notify_admins(
-            context,
+        buttons = [[InlineKeyboardButton("🙋 Я відповідальний", callback_data=f"respme:{chat.id}")]]
+        text = (
             f"🆕 Новий підписник: {user.full_name} (@{user.username or '—'})\n"
-            f"chat_id: {chat.id}\nПризначити сегмент:",
-            reply_markup=InlineKeyboardMarkup(buttons),
+            f"chat_id: {chat.id}\n\nОберіть, хто відповідальний:"
         )
+        sent_ids = {}
+        for admin_id in ADMIN_IDS:
+            try:
+                sent = await context.bot.send_message(
+                    admin_id, text, reply_markup=InlineKeyboardMarkup(buttons)
+                )
+                sent_ids[admin_id] = sent.message_id
+            except Exception as e:
+                logger.warning(f"Не вдалось надіслати адміну {admin_id}: {e}")
+        NEW_SUB_MESSAGES[chat.id] = sent_ids
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -351,7 +372,9 @@ async def assign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def respme_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Адмін одним тапом призначає себе відповідальним за клієнта."""
+    """Адмін одним тапом призначає себе відповідальним за клієнта.
+    Після цього повідомлення про нового підписника зникає в усіх інших адмінів,
+    і з'являється другий крок — вибір групи."""
     query = update.callback_query
     await query.answer()
     if not is_admin(update):
@@ -364,10 +387,29 @@ async def respme_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.execute("UPDATE subscribers SET responsible_admin=? WHERE chat_id=?", (admin_id, chat_id))
     conn.commit()
     admin_row = conn.execute("SELECT name FROM admins WHERE chat_id=?", (admin_id,)).fetchone()
+    segments = [r["name"] for r in conn.execute("SELECT name FROM segments")]
     conn.close()
     name = admin_row["name"] if admin_row else "адмін"
-    current_text = query.message.text or ""
-    await query.edit_message_text(current_text + f"\n\n🙋 Відповідальний: {name}")
+
+    for other_admin_id, msg_id in NEW_SUB_MESSAGES.pop(chat_id, {}).items():
+        if other_admin_id == admin_id:
+            continue
+        try:
+            await context.bot.delete_message(other_admin_id, msg_id)
+        except Exception as e:
+            logger.warning(f"Не вдалось прибрати повідомлення у {other_admin_id}: {e}")
+
+    if not segments:
+        await query.edit_message_text(f"✅ {name} — відповідальний за цього клієнта.")
+        return
+    buttons = [
+        [InlineKeyboardButton(seg, callback_data=f"assign:{chat_id}:{seg}")] for seg in segments
+    ]
+    buttons.append([InlineKeyboardButton("Без групи", callback_data=f"assign:{chat_id}:__none__")])
+    await query.edit_message_text(
+        f"✅ {name} — відповідальний за цього клієнта.\n\nТепер оберіть групу:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def pickresp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -405,6 +447,15 @@ async def addsegment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Сегмент «{name}» створено. Тепер задайте йому розклад і повідомлення.")
 
 
+def _schedule_row_label(s) -> str:
+    kind = s["kind"] if "kind" in s.keys() and s["kind"] else "weekly"
+    if kind == "monthly":
+        return f"раз на місяць, {s['weekday']} числа о {s['hhmm']}"
+    if kind == "biweekly":
+        return f"раз на 2 тижні, {WEEKDAYS_UA[s['weekday']]} о {s['hhmm']}"
+    return f"щотижня, {WEEKDAYS_UA[s['weekday']]} о {s['hhmm']}"
+
+
 def _segments_text() -> str:
     conn = db()
     rows = conn.execute("SELECT * FROM segments").fetchall()
@@ -415,12 +466,10 @@ def _segments_text() -> str:
     for r in rows:
         count = conn.execute("SELECT COUNT(*) c FROM subscribers WHERE segment=? AND active=1", (r["name"],)).fetchone()["c"]
         sched_rows = conn.execute(
-            "SELECT weekday, hhmm FROM schedules WHERE segment=? ORDER BY weekday, hhmm", (r["name"],)
+            "SELECT weekday, hhmm, kind FROM schedules WHERE segment=? ORDER BY weekday, hhmm", (r["name"],)
         ).fetchall()
         if sched_rows:
-            schedule_lines = "\n".join(
-                f"      • {WEEKDAYS_UA[s['weekday']]} о {s['hhmm']}" for s in sched_rows
-            )
+            schedule_lines = "\n".join(f"      • {_schedule_row_label(s)}" for s in sched_rows)
         else:
             schedule_lines = "      (розклад не задано)"
         text += (
@@ -439,14 +488,15 @@ async def segments_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def setschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Повністю ЗАМІНЮЄ розклад сегмента на один запис (видаляє всі попередні)."""
+    """Повністю ЗАМІНЮЄ розклад сегмента на один щотижневий запис (видаляє всі попередні)."""
     if not is_admin(update):
         return
     if len(context.args) < 3:
         await update.message.reply_text(
             "Використання: /setschedule сегмент день ГГ:ХХ\n"
-            "⚠️ Ця команда ЗАМІНЮЄ весь розклад сегмента одним записом.\n"
-            "Якщо потрібно ДОДАТИ ще один час (не видаляючи наявні) — використовуйте /addschedule.\n"
+            "⚠️ Ця команда ЗАМІНЮЄ весь розклад сегмента одним щотижневим записом.\n"
+            "Якщо потрібно ДОДАТИ ще один час — /addschedule. Раз на 2 тижні — /addschedulebiweekly. "
+            "Раз на місяць — /addschedulemonthly.\n"
             "День: mon, tue, wed, thu, fri, sat, sun\n"
             "Приклад: /setschedule wholesale mon 10:00"
         )
@@ -466,30 +516,31 @@ async def setschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.execute("INSERT OR IGNORE INTO segments (name) VALUES (?)", (name,))
     conn.execute("DELETE FROM schedules WHERE segment=?", (name,))
     conn.execute(
-        "INSERT INTO schedules (segment, weekday, hhmm) VALUES (?, ?, ?)",
+        "INSERT INTO schedules (segment, weekday, hhmm, kind) VALUES (?, ?, ?, 'weekly')",
         (name, WEEKDAYS[day_str], time_str),
     )
     conn.commit()
     conn.close()
 
     remove_all_segment_jobs(context.application, name)
-    create_segment_job(context.application, name, WEEKDAYS[day_str], hh, mm)
+    create_segment_job(context.application, name, "weekly", WEEKDAYS[day_str], hh, mm)
     await update.message.reply_text(
         f"Готово. Розклад сегмента «{name}» ЗАМІНЕНО одним записом: "
-        f"{WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str}.\n"
+        f"щотижня, {WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str}.\n"
         f"Щоб додати ще один час без видалення цього — /addschedule {name} день ГГ:ХХ"
     )
 
 
 async def addschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ДОДАЄ ще один час розсилки для сегмента, не видаляючи наявні."""
+    """ДОДАЄ ще один щотижневий час розсилки для сегмента, не видаляючи наявні."""
     if not is_admin(update):
         return
     if len(context.args) < 3:
         await update.message.reply_text(
             "Використання: /addschedule сегмент день ГГ:ХХ\n"
-            "Додає ще один час розсилки для сегмента (наявні розклади лишаються).\n"
-            "Приклад: /addschedule wholesale thu 16:00"
+            "Додає ще один ЩОТИЖНЕВИЙ час розсилки для сегмента (наявні розклади лишаються).\n"
+            "Приклад: /addschedule wholesale thu 16:00\n\n"
+            "Раз на 2 тижні — /addschedulebiweekly. Раз на місяць — /addschedulemonthly."
         )
         return
     name, day_str, time_str = context.args[0], context.args[1].lower(), context.args[2]
@@ -506,29 +557,29 @@ async def addschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     conn.execute("INSERT OR IGNORE INTO segments (name) VALUES (?)", (name,))
     conn.execute(
-        "INSERT OR IGNORE INTO schedules (segment, weekday, hhmm) VALUES (?, ?, ?)",
+        "INSERT OR IGNORE INTO schedules (segment, weekday, hhmm, kind) VALUES (?, ?, ?, 'weekly')",
         (name, WEEKDAYS[day_str], time_str),
     )
     conn.commit()
     count = conn.execute("SELECT COUNT(*) c FROM schedules WHERE segment=?", (name,)).fetchone()["c"]
     conn.close()
 
-    create_segment_job(context.application, name, WEEKDAYS[day_str], hh, mm)
+    create_segment_job(context.application, name, "weekly", WEEKDAYS[day_str], hh, mm)
     await update.message.reply_text(
-        f"Додано. Сегмент «{name}» тепер отримує розсилку у {WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str} "
+        f"Додано. Сегмент «{name}» тепер отримує розсилку щотижня, {WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str} "
         f"(додатково до вже наявних). Всього записів розкладу: {count}."
     )
 
 
-async def removeschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Видаляє один конкретний запис розкладу сегмента."""
+async def addschedulebiweekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Додає розсилку раз на ДВА ТИЖНІ для сегмента."""
     if not is_admin(update):
         return
     if len(context.args) < 3:
         await update.message.reply_text(
-            "Використання: /removeschedule сегмент день ГГ:ХХ\n"
-            "Видаляє один конкретний час розсилки (інші лишаються).\n"
-            "Приклад: /removeschedule wholesale thu 16:00"
+            "Використання: /addschedulebiweekly сегмент день ГГ:ХХ\n"
+            "Розсилка раз на 2 тижні у вказаний день.\n"
+            "Приклад: /addschedulebiweekly vip mon 10:00"
         )
         return
     name, day_str, time_str = context.args[0], context.args[1].lower(), context.args[2]
@@ -543,20 +594,109 @@ async def removeschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     conn = db()
+    conn.execute("INSERT OR IGNORE INTO segments (name) VALUES (?)", (name,))
     conn.execute(
-        "DELETE FROM schedules WHERE segment=? AND weekday=? AND hhmm=?",
+        "INSERT OR IGNORE INTO schedules (segment, weekday, hhmm, kind) VALUES (?, ?, ?, 'biweekly')",
         (name, WEEKDAYS[day_str], time_str),
     )
     conn.commit()
     conn.close()
 
-    job_name = _job_name(name, WEEKDAYS[day_str], hh, mm)
+    create_segment_job(context.application, name, "biweekly", WEEKDAYS[day_str], hh, mm)
+    await update.message.reply_text(
+        f"Додано. Сегмент «{name}» тепер отримує розсилку раз на 2 тижні, "
+        f"{WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str}."
+    )
+
+
+async def addschedulemonthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Додає розсилку раз на МІСЯЦЬ для сегмента (конкретний день місяця, 1-28)."""
+    if not is_admin(update):
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Використання: /addschedulemonthly сегмент день_місяця ГГ:ХХ\n"
+            "День місяця від 1 до 28 (щоб коректно працювало для будь-якого місяця).\n"
+            "Приклад: /addschedulemonthly vip 1 10:00 — першого числа кожного місяця"
+        )
+        return
+    name, day_str, time_str = context.args[0], context.args[1], context.args[2]
+    try:
+        day_of_month = int(day_str)
+        assert 1 <= day_of_month <= 28
+    except Exception:
+        await update.message.reply_text("День місяця має бути числом від 1 до 28.")
+        return
+    try:
+        hh, mm = map(int, time_str.split(":"))
+        assert 0 <= hh < 24 and 0 <= mm < 60
+    except Exception:
+        await update.message.reply_text("Невірний формат часу. Приклад: 10:00")
+        return
+
+    conn = db()
+    conn.execute("INSERT OR IGNORE INTO segments (name) VALUES (?)", (name,))
+    conn.execute(
+        "INSERT OR IGNORE INTO schedules (segment, weekday, hhmm, kind) VALUES (?, ?, ?, 'monthly')",
+        (name, day_of_month, time_str),
+    )
+    conn.commit()
+    conn.close()
+
+    create_segment_job(context.application, name, "monthly", day_of_month, hh, mm)
+    await update.message.reply_text(
+        f"Додано. Сегмент «{name}» тепер отримує розсилку раз на місяць, {day_of_month} числа о {time_str}."
+    )
+
+
+async def removeschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Видаляє один конкретний запис розкладу сегмента (будь-якого типу)."""
+    if not is_admin(update):
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Використання: /removeschedule сегмент день ГГ:ХХ\n"
+            "Видаляє один конкретний час розсилки (інші лишаються). Для щомісячного розкладу "
+            "«день» — це число місяця (1-28).\n"
+            "Приклад: /removeschedule wholesale thu 16:00"
+        )
+        return
+    name, day_str, time_str = context.args[0], context.args[1].lower(), context.args[2]
+    if day_str in WEEKDAYS:
+        weekday_val = WEEKDAYS[day_str]
+    else:
+        try:
+            weekday_val = int(day_str)
+        except ValueError:
+            await update.message.reply_text(
+                "Невірний день. Використовуйте: mon, tue, wed, thu, fri, sat, sun — або число (для щомісячного)."
+            )
+            return
+    try:
+        hh, mm = map(int, time_str.split(":"))
+        assert 0 <= hh < 24 and 0 <= mm < 60
+    except Exception:
+        await update.message.reply_text("Невірний формат часу. Приклад: 10:00")
+        return
+
+    conn = db()
+    row = conn.execute(
+        "SELECT kind FROM schedules WHERE segment=? AND weekday=? AND hhmm=?",
+        (name, weekday_val, time_str),
+    ).fetchone()
+    kind = row["kind"] if row else "weekly"
+    conn.execute(
+        "DELETE FROM schedules WHERE segment=? AND weekday=? AND hhmm=?",
+        (name, weekday_val, time_str),
+    )
+    conn.commit()
+    conn.close()
+
+    job_name = _job_name(name, kind, weekday_val, hh, mm)
     for job in context.application.job_queue.get_jobs_by_name(job_name):
         job.schedule_removal()
 
-    await update.message.reply_text(
-        f"Видалено запис розкладу для «{name}»: {WEEKDAYS_UA[WEEKDAYS[day_str]]} о {time_str}."
-    )
+    await update.message.reply_text(f"Видалено запис розкладу для «{name}» ({kind}, {day_str} {time_str}).")
 
 
 async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1005,6 +1145,10 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await forward_client_text(update, context)
         return
 
+    if admin_id in ADMIN_EDIT_PROFILE_PENDING:
+        await handle_admin_edit_profile_text_step(update, context)
+        return
+
     # 0) Якщо адмін відповідає (Reply) на переслане повідомлення клієнта — надсилаємо відповідь клієнту
     if update.message.reply_to_message:
         key = (admin_id, update.message.reply_to_message.message_id)
@@ -1162,6 +1306,7 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("👥 Змінити групу", callback_data="menu_changeseg"),
             InlineKeyboardButton("🙋 Відповідальний", callback_data="menu_setresp"),
         ],
+        [InlineKeyboardButton("🪪 Редагувати картку клієнта", callback_data="menu_editclientprofile")],
         [InlineKeyboardButton("📋 Список клієнтів і відповідальних", callback_data="menu_resplist")],
         [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
         [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
@@ -1314,17 +1459,26 @@ def _get_client_profile(chat_id: int):
     return dict(row) if row else None
 
 
-def _profile_summary_text(profile: dict) -> str:
+def _profile_summary_text(profile: dict, addresses: list) -> str:
+    addr_lines = "\n".join(f"   {i+1}. {a['address']}" for i, a in enumerate(addresses)) if addresses else "   (адрес ще немає)"
     return (
         f"🪪 Ваша картка:\n\n"
         f"Ім'я: {profile.get('full_name') or '—'}\n"
         f"Назва точки: {profile.get('point_name') or '—'}\n"
-        f"Адреса: {profile.get('address') or '—'}\n"
         f"Контактний номер: {profile.get('phone') or '—'}\n"
         f"ФОП: {profile.get('fop') or '—'}\n"
-        f"ІПН: {profile.get('ipn') or '—'}"
+        f"ІПН: {profile.get('ipn') or '—'}\n\n"
+        f"Адреси:\n{addr_lines}"
     )
 
+
+def _get_client_addresses(chat_id: int) -> list:
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, address FROM client_addresses WHERE chat_id=? ORDER BY id", (chat_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def _is_valid_phone(text: str) -> bool:
@@ -1341,11 +1495,10 @@ def _normalize_phone(text: str) -> str:
     return "+" + digits if not text.strip().startswith("+") else text.strip()
 
 
-PROFILE_STEPS = ["full_name", "point_name", "address", "phone", "fop", "ipn"]
+PROFILE_STEPS = ["full_name", "point_name", "phone", "fop", "ipn"]
 PROFILE_STEP_PROMPTS = {
     "full_name": "Напишіть, будь ласка, ваше ім'я:",
     "point_name": "Назва точки (кав'ярні/закладу):",
-    "address": "Адреса:",
     "phone": "Контактний номер телефону (наприклад: +380671234567):",
     "fop": "ФОП (назва/номер, або «немає», якщо не застосовується):",
     "ipn": "ІПН (або «немає», якщо не застосовується):",
@@ -1355,6 +1508,14 @@ PROFILE_STEP_PROMPTS = {
 def _order_payment_keyboard() -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(m, callback_data=f"order_payment:{m}")] for m in PAYMENT_METHODS]
     buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _profile_manage_keyboard(addresses: list) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton("✏️ Редагувати дані", callback_data="profile_edit")]]
+    buttons.append([InlineKeyboardButton("➕ Додати адресу", callback_data="profile_addaddr")])
+    for a in addresses:
+        buttons.append([InlineKeyboardButton(f"🗑 {a['address'][:40]}", callback_data=f"profile_deladdr:{a['id']}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1368,8 +1529,10 @@ async def profile_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
         )
         return
-    buttons = [[InlineKeyboardButton("✏️ Редагувати картку", callback_data="profile_edit")]]
-    await update.message.reply_text(_profile_summary_text(profile), reply_markup=InlineKeyboardMarkup(buttons))
+    addresses = _get_client_addresses(chat_id)
+    await update.message.reply_text(
+        _profile_summary_text(profile, addresses), reply_markup=_profile_manage_keyboard(addresses)
+    )
 
 
 async def profile_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1380,11 +1543,115 @@ async def profile_edit_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]])
 
 
+async def profile_addaddr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}, "adding_address": True}
+    await query.edit_message_text("Напишіть нову адресу:")
+
+
+async def profile_deladdr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    _, addr_id = query.data.split(":", 1)
+    conn = db()
+    conn.execute("DELETE FROM client_addresses WHERE id=? AND chat_id=?", (int(addr_id), chat_id))
+    conn.commit()
+    conn.close()
+    profile = _get_client_profile(chat_id) or {}
+    addresses = _get_client_addresses(chat_id)
+    await query.edit_message_text(
+        "✅ Адресу видалено.\n\n" + _profile_summary_text(profile, addresses),
+        reply_markup=_profile_manage_keyboard(addresses),
+    )
+
+
+async def adminprofile_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін починає редагувати картку конкретного клієнта замість нього."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    _, target_chat_id_str = query.data.split(":", 1)
+    target_chat_id = int(target_chat_id_str)
+    ADMIN_EDIT_PROFILE_PENDING[admin_id] = {"target_chat_id": target_chat_id, "step_idx": 0, "data": {}}
+    await query.edit_message_text(
+        f"Редагуємо картку клієнта (chat_id: {target_chat_id}).\n\n" + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
+    )
+
+
+async def handle_admin_edit_profile_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_chat.id
+    pending = ADMIN_EDIT_PROFILE_PENDING.get(admin_id)
+    if not pending:
+        return
+    target_chat_id = pending["target_chat_id"]
+    step_idx = pending["step_idx"]
+    field = PROFILE_STEPS[step_idx]
+    text = update.message.text or ""
+
+    if field == "phone":
+        if not _is_valid_phone(text):
+            await update.message.reply_text(
+                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+            )
+            return
+        text = _normalize_phone(text)
+
+    pending["data"][field] = text
+
+    if step_idx + 1 < len(PROFILE_STEPS):
+        pending["step_idx"] += 1
+        await update.message.reply_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[pending["step_idx"]]])
+        return
+
+    data = ADMIN_EDIT_PROFILE_PENDING.pop(admin_id)["data"]
+    conn = db()
+    conn.execute(
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, ipn, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
+        "phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, "
+        "updated_at=excluded.updated_at",
+        (target_chat_id, data["full_name"], data["point_name"], data["phone"], data["fop"],
+         data["ipn"], datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    addresses = _get_client_addresses(target_chat_id)
+    await update.message.reply_text(
+        f"✅ Картку клієнта оновлено!\n\n" + _profile_summary_text(data, addresses),
+        reply_markup=_menu_back_keyboard(),
+    )
+
+
 async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     pending = PROFILE_PENDING.get(chat_id)
     if not pending:
         return
+
+    if pending.get("adding_address"):
+        address_text = update.message.text or ""
+        PROFILE_PENDING.pop(chat_id, None)
+        conn = db()
+        conn.execute(
+            "INSERT INTO client_addresses (chat_id, address, created_at) VALUES (?, ?, ?)",
+            (chat_id, address_text, datetime.now(TZ).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        profile = _get_client_profile(chat_id) or {}
+        addresses = _get_client_addresses(chat_id)
+        await update.message.reply_text(
+            "✅ Адресу додано!\n\n" + _profile_summary_text(profile, addresses),
+            reply_markup=_profile_manage_keyboard(addresses),
+        )
+        return
+
     step_idx = pending["step_idx"]
     field = PROFILE_STEPS[step_idx]
     text = update.message.text or ""
@@ -1407,26 +1674,34 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
     data = PROFILE_PENDING.pop(chat_id)["data"]
     conn = db()
     conn.execute(
-        "INSERT INTO client_profiles (chat_id, full_name, point_name, address, phone, fop, ipn, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, ipn, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
-        "address=excluded.address, phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, "
+        "phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, "
         "updated_at=excluded.updated_at",
-        (chat_id, data["full_name"], data["point_name"], data["address"], data["phone"], data["fop"],
+        (chat_id, data["full_name"], data["point_name"], data["phone"], data["fop"],
          data["ipn"], datetime.now(TZ).isoformat()),
     )
     conn.commit()
     conn.close()
+    addresses = _get_client_addresses(chat_id)
+    if not addresses:
+        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}, "adding_address": True}
+        await update.message.reply_text(
+            "✅ Дані збережено! Залишилось додати хоча б одну адресу доставки.\n\nНапишіть адресу:"
+        )
+        return
     await update.message.reply_text(
         "✅ Картку збережено! Тепер можна оформлювати замовлення — натисніть «📝 Замовити».\n\n"
-        + _profile_summary_text(data)
+        + _profile_summary_text(data, addresses),
+        reply_markup=_profile_manage_keyboard(addresses),
     )
 
 
 
 # ---------- Опитувальник замовлення (клієнт) ----------
 
-ORDER_WEIGHTS = ["1 кг", "0,5 кг", "0,25 кг", "250 г", "40 г"]
+ORDER_WEIGHTS = ["1 кг", "0,5 кг", "0,25 кг", "250 г"]
 ORDER_QUANTITIES = ["1", "2", "3", "4", "5"]
 
 
@@ -1486,25 +1761,28 @@ def _order_qty_keyboard() -> InlineKeyboardMarkup:
 
 def _order_summary_text(order: dict, profile: dict) -> str:
     lines = [
-        "📝 Нове замовлення",
-        f"Ім'я: {profile.get('full_name') or '—'}",
-        f"Точка: {profile.get('point_name') or '—'}",
-        f"Адреса: {profile.get('address') or '—'}",
-        f"Телефон: {profile.get('phone') or '—'}",
-        f"ФОП: {profile.get('fop') or '—'}",
-        f"ІПН: {profile.get('ipn') or '—'}",
-        f"Спосіб оплати: {order.get('payment_method') or '—'}",
-        f"Дата: {order.get('date', '—')}",
+        "🆕 НОВЕ ЗАМОВЛЕННЯ",
+        f"📅 Дата виконання: {order.get('date', '—')}",
+        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
+        f"👤 Клієнт: {profile.get('full_name') or '—'}",
+        f"🏪 Точка: {profile.get('point_name') or '—'}",
+        f"📍 Адреса: {order.get('address') or '—'}",
+        f"📞 Телефон: {profile.get('phone') or '—'}",
+        f"🏢 ФОП: {profile.get('fop') or '—'}  |  ІПН: {profile.get('ipn') or '—'}",
+        f"💳 Оплата: {order.get('payment_method') or '—'}",
+        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
+        "📦 ПОЗИЦІЇ ДЛЯ СКЛАДУ:",
         "",
-        "Позиції:",
     ]
     for i, item in enumerate(order.get("items", []), 1):
         cat_label = dict(ORDER_CATEGORIES).get(item.get("category"), item.get("category"))
         lines.append(
-            f"{i}. {cat_label} — {item.get('item_text', '—')} — {item.get('weight', '—')} "
-            f"× {item.get('qty', '—')}\n"
-            f"   Примітка: {item.get('note') or '—'}"
+            f"{i}) {item.get('item_text', '—')}\n"
+            f"    Категорія: {cat_label}\n"
+            f"    Фасування/вага: {item.get('weight', '—')}   Кількість: {item.get('qty', '—')}\n"
+            f"    Примітка: {item.get('note') or '—'}\n"
         )
+    lines.append("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬")
     return "\n".join(lines)
 
 
@@ -1533,6 +1811,13 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
         )
         return
+    addresses = _get_client_addresses(chat_id)
+    if not addresses:
+        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}, "adding_address": True}
+        await update.message.reply_text(
+            "Перш ніж оформити замовлення, додайте хоча б одну адресу доставки 🙏\n\nНапишіть адресу:"
+        )
+        return
     ORDER_PENDING[chat_id] = {"step": "date", "items": []}
     await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
 
@@ -1550,9 +1835,15 @@ async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
         )
         return
+    addresses = _get_client_addresses(chat_id)
+    if not addresses:
+        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}, "adding_address": True}
+        await query.edit_message_text(
+            "Перш ніж оформити замовлення, додайте хоча б одну адресу доставки 🙏\n\nНапишіть адресу:"
+        )
+        return
     ORDER_PENDING[chat_id] = {"step": "date", "items": []}
     await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
-    await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
 
 
 async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1607,8 +1898,32 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, date_str = data.split(":", 1)
         d = datetime.fromisoformat(date_str).date()
         order["date"] = f"{d.strftime('%d.%m.%Y')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
+        addresses = _get_client_addresses(chat_id)
+        if len(addresses) == 1:
+            order["address"] = addresses[0]["address"]
+            order["step"] = "category"
+            await query.edit_message_text(
+                "Яку категорію товару додати до замовлення?", reply_markup=_order_category_keyboard()
+            )
+            return
+        buttons = [
+            [InlineKeyboardButton(a["address"][:60], callback_data=f"order_addr:{a['id']}")] for a in addresses
+        ]
+        buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+        await query.edit_message_text(
+            "На яку адресу оформити це замовлення?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("order_addr:"):
+        _, addr_id = data.split(":", 1)
+        addresses = _get_client_addresses(chat_id)
+        chosen = next((a for a in addresses if str(a["id"]) == addr_id), None)
+        order["address"] = chosen["address"] if chosen else "—"
         order["step"] = "category"
-        await query.edit_message_text("Яку категорію товару додати до замовлення?", reply_markup=_order_category_keyboard())
+        await query.edit_message_text(
+            "Яку категорію товару додати до замовлення?", reply_markup=_order_category_keyboard()
+        )
         return
 
     NO_WEIGHT_CATEGORIES = ("drip", "suputni")
@@ -1848,6 +2163,44 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
         await query.edit_message_text(
             "Оберіть клієнта, якому хочете змінити групу:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data == "menu_editclientprofile":
+        conn = db()
+        rows = conn.execute(
+            "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
+            return
+        buttons = [
+            [InlineKeyboardButton(f"{r['name']} (@{r['username'] or '—'})", callback_data=f"menu_pickclientprofile:{r['chat_id']}")]
+            for r in rows
+        ]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "Картку якого клієнта переглянути/редагувати?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("menu_pickclientprofile:"):
+        _, target_chat_id_str = data.split(":", 1)
+        target_chat_id = int(target_chat_id_str)
+        profile = _get_client_profile(target_chat_id)
+        addresses = _get_client_addresses(target_chat_id)
+        buttons = [
+            [InlineKeyboardButton("✏️ Редагувати дані", callback_data=f"adminprofile_edit:{target_chat_id}")],
+        ]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        if not profile:
+            await query.edit_message_text(
+                "Цей клієнт ще не заповнював картку.", reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            return
+        await query.edit_message_text(
+            _profile_summary_text(profile, addresses), reply_markup=InlineKeyboardMarkup(buttons)
         )
         return
 
@@ -2671,25 +3024,50 @@ async def send_segment_broadcast(context: ContextTypes.DEFAULT_TYPE):
         await notify_admins(context, f"✅ Автоматична розсилка сегменту «{segment}» виконана. Надіслано: {sent}, помилок: {failed}")
 
 
-def _job_name(segment: str, weekday: int, hh: int, mm: int) -> str:
-    return f"segment_{segment}_{weekday}_{hh:02d}{mm:02d}"
+def _job_name(segment: str, kind: str, weekday: int, hh: int, mm: int) -> str:
+    return f"segment_{segment}_{kind}_{weekday}_{hh:02d}{mm:02d}"
 
 
-def create_segment_job(application: Application, segment: str, weekday: int, hh: int, mm: int):
-    """Створює (або перестворює) ОДНЕ конкретне завдання розсилки, не чіпаючи інші розклади цього сегмента."""
-    name = _job_name(segment, weekday, hh, mm)
+def create_segment_job(application: Application, segment: str, kind: str, weekday: int, hh: int, mm: int):
+    """Створює (або перестворює) ОДНЕ конкретне завдання розсилки для сегмента.
+    kind: 'weekly' (щотижня, weekday=0-6), 'biweekly' (раз на 2 тижні, weekday=0-6),
+    'monthly' (раз на місяць, weekday тут означає день місяця 1-28)."""
+    name = _job_name(segment, kind, weekday, hh, mm)
     for job in application.job_queue.get_jobs_by_name(name):
         job.schedule_removal()
-    new_job = application.job_queue.run_daily(
-        send_segment_broadcast,
-        time=time(hour=hh, minute=mm, tzinfo=TZ),
-        days=(weekday,),
-        name=name,
-        data={"segment": segment},
-    )
+
+    if kind == "monthly":
+        new_job = application.job_queue.run_monthly(
+            send_segment_broadcast,
+            when=time(hour=hh, minute=mm, tzinfo=TZ),
+            day=weekday,
+            name=name,
+            data={"segment": segment},
+        )
+    elif kind == "biweekly":
+        now = datetime.now(TZ)
+        days_ahead = (weekday - now.weekday()) % 7
+        first_run = (now + timedelta(days=days_ahead)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if first_run <= now:
+            first_run += timedelta(days=7)
+        new_job = application.job_queue.run_repeating(
+            send_segment_broadcast,
+            interval=timedelta(weeks=2),
+            first=first_run,
+            name=name,
+            data={"segment": segment},
+        )
+    else:  # weekly
+        new_job = application.job_queue.run_daily(
+            send_segment_broadcast,
+            time=time(hour=hh, minute=mm, tzinfo=TZ),
+            days=(weekday,),
+            name=name,
+            data={"segment": segment},
+        )
     logger.info(
-        f"[SCHEDULE] Створено завдання {name}: weekday={weekday}, "
-        f"time={hh:02d}:{mm:02d} TZ={TZ}. Наступний запуск: {new_job.next_t}"
+        f"[SCHEDULE] Створено завдання {name}: kind={kind}, weekday/day={weekday}, "
+        f"time={hh:02d}:{mm:02d} TZ={TZ}. Наступний запуск: {getattr(new_job, 'next_t', '—')}"
     )
 
 
@@ -2704,12 +3082,13 @@ def remove_all_segment_jobs(application: Application, segment: str) -> int:
 
 async def load_schedules_on_startup(application: Application):
     conn = db()
-    rows = conn.execute("SELECT segment, weekday, hhmm FROM schedules").fetchall()
+    rows = conn.execute("SELECT segment, weekday, hhmm, kind FROM schedules").fetchall()
     conn.close()
     for r in rows:
         hh, mm = map(int, r["hhmm"].split(":"))
-        create_segment_job(application, r["segment"], r["weekday"], hh, mm)
-        logger.info(f"Заплановано розсилку для сегмента {r['segment']}: {WEEKDAYS_UA[r['weekday']]} {r['hhmm']}")
+        kind = r["kind"] or "weekly"
+        create_segment_job(application, r["segment"], kind, r["weekday"], hh, mm)
+        logger.info(f"Заплановано розсилку для сегмента {r['segment']}: {kind} {r['weekday']} {r['hhmm']}")
 
 
 # ---------- Заплановані розсилки (майстер: кому / коли / текст) ----------
@@ -2886,7 +3265,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команди адміністратора:\n\n"
         "/addsegment назва — створити сегмент клієнтів\n"
         "/setschedule сегмент день ГГ:ХХ — ЗАМІНИТИ весь розклад сегмента одним записом (mon..sun)\n"
-        "/addschedule сегмент день ГГ:ХХ — ДОДАТИ ще один час розсилки, не видаляючи наявні (для 2+ разів на тиждень)\n"
+        "/addschedule сегмент день ГГ:ХХ — ДОДАТИ ще один щотижневий час розсилки, не видаляючи наявні\n"
+        "/addschedulebiweekly сегмент день ГГ:ХХ — розсилка раз на 2 тижні\n"
+        "/addschedulemonthly сегмент день_місяця ГГ:ХХ — розсилка раз на місяць (день 1-28)\n"
         "/removeschedule сегмент день ГГ:ХХ — видалити один конкретний запис розкладу\n"
         "/setmsg сегмент текст — задати повідомлення для автоматичної розсилки сегмента\n"
         "/segments — список сегментів, усіх їхніх розкладів і повідомлень\n"
@@ -2926,6 +3307,8 @@ def main():
     application.add_handler(CommandHandler("segments", segments_list))
     application.add_handler(CommandHandler("setschedule", setschedule))
     application.add_handler(CommandHandler("addschedule", addschedule))
+    application.add_handler(CommandHandler("addschedulebiweekly", addschedulebiweekly))
+    application.add_handler(CommandHandler("addschedulemonthly", addschedulemonthly))
     application.add_handler(CommandHandler("removeschedule", removeschedule))
     application.add_handler(CommandHandler("setmsg", setmsg))
     application.add_handler(CommandHandler("clients", clients_list))
@@ -2947,6 +3330,9 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER)}$"), order_start))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_PROFILE)}$"), profile_show))
     application.add_handler(CallbackQueryHandler(profile_edit_callback, pattern=r"^profile_edit$"))
+    application.add_handler(CallbackQueryHandler(profile_addaddr_callback, pattern=r"^profile_addaddr$"))
+    application.add_handler(CallbackQueryHandler(profile_deladdr_callback, pattern=r"^profile_deladdr:"))
+    application.add_handler(CallbackQueryHandler(adminprofile_edit_callback, pattern=r"^adminprofile_edit:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
