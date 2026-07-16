@@ -280,7 +280,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Тут ви отримуватимете нагадування, інформацію про кавові новинки, акції та зміни в асортименті😉\n\n"
         "👇👇👇 Кнопки внизу екрана — вони завжди тут: асортимент, доставка, замовлення, картка, менеджер.\n\n"
         "Якщо захочете відписатись — просто напишіть /stop.",
-        reply_markup=_client_persistent_keyboard(),
+        reply_markup=_keyboard_for_recipient(chat.id),
     )
     try:
         await context.bot.pin_chat_message(chat.id, welcome_msg.message_id, disable_notification=True)
@@ -880,7 +880,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent, failed = 0, 0
     for r in rows:
         try:
-            await context.bot.send_message(r["chat_id"], text, reply_markup=_client_persistent_keyboard())
+            await context.bot.send_message(r["chat_id"], text, reply_markup=_keyboard_for_recipient(r["chat_id"]))
             sent += 1
         except Exception as e:
             logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
@@ -958,7 +958,7 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
         for chat_id in recipients:
             try:
                 await context.bot.send_document(
-                    chat_id, document.file_id, caption=caption or None, reply_markup=_client_persistent_keyboard()
+                    chat_id, document.file_id, caption=caption or None, reply_markup=_keyboard_for_recipient(chat_id)
                 )
                 sent += 1
             except Exception as e:
@@ -978,7 +978,7 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
         for r in rows:
             try:
                 await context.bot.send_document(
-                    r["chat_id"], document.file_id, caption=caption or None, reply_markup=_client_persistent_keyboard()
+                    r["chat_id"], document.file_id, caption=caption or None, reply_markup=_keyboard_for_recipient(r["chat_id"])
                 )
                 sent += 1
             except Exception as e:
@@ -1038,7 +1038,7 @@ async def broadcast_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         try:
             await context.bot.send_document(
-                r["chat_id"], document.file_id, caption=text or None, reply_markup=_client_persistent_keyboard()
+                r["chat_id"], document.file_id, caption=text or None, reply_markup=_keyboard_for_recipient(r["chat_id"])
             )
             sent += 1
         except Exception as e:
@@ -1225,7 +1225,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent, failed = 0, 0
         for chat_id in recipients:
             try:
-                await context.bot.send_message(chat_id, text, reply_markup=_client_persistent_keyboard())
+                await context.bot.send_message(chat_id, text, reply_markup=_keyboard_for_recipient(chat_id))
                 sent += 1
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати {chat_id}: {e}")
@@ -1248,7 +1248,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent, failed = 0, 0
         for r in rows:
             try:
-                await context.bot.send_message(r["chat_id"], text, reply_markup=_client_persistent_keyboard())
+                await context.bot.send_message(r["chat_id"], text, reply_markup=_keyboard_for_recipient(r["chat_id"]))
                 sent += 1
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
@@ -1436,6 +1436,14 @@ def _client_persistent_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+def _keyboard_for_recipient(chat_id: int) -> ReplyKeyboardMarkup:
+    """Якщо отримувач — адмін (навіть якщо він же й підписаний як клієнт),
+    показуємо йому кнопку «📋 Меню», а не клієнтську клавіатуру."""
+    if chat_id in ADMIN_IDS:
+        return _persistent_menu_keyboard()
+    return _client_persistent_keyboard()
 
 
 ASSORTMENT_CATEGORIES = [
@@ -2325,7 +2333,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id,
             "Дякуємо! Ваше замовлення передано менеджеру, скоро з вами зв'яжуться 🙌\n\n"
             "👇 Кнопки внизу завжди тут, якщо треба щось інше.",
-            reply_markup=_client_persistent_keyboard(),
+            reply_markup=_keyboard_for_recipient(chat_id),
         )
         if target_admin:
             try:
@@ -3356,7 +3364,7 @@ async def send_segment_broadcast(context: ContextTypes.DEFAULT_TYPE):
     sent, failed = 0, 0
     for r in rows:
         try:
-            await context.bot.send_message(r["chat_id"], seg_row["message"], reply_markup=_client_persistent_keyboard())
+            await context.bot.send_message(r["chat_id"], seg_row["message"], reply_markup=_keyboard_for_recipient(r["chat_id"]))
             sent += 1
         except Exception as e:
             logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
@@ -3513,11 +3521,11 @@ async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
             else:
                 if file_id:
                     await context.bot.send_document(
-                        r["chat_id"], file_id, caption=row["message"] or None, reply_markup=_client_persistent_keyboard()
+                        r["chat_id"], file_id, caption=row["message"] or None, reply_markup=_keyboard_for_recipient(r["chat_id"])
                     )
                 else:
                     await context.bot.send_message(
-                        r["chat_id"], row["message"], reply_markup=_client_persistent_keyboard()
+                        r["chat_id"], row["message"], reply_markup=_keyboard_for_recipient(r["chat_id"])
                     )
             sent += 1
         except Exception as e:
