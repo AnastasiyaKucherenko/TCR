@@ -8,6 +8,7 @@ Telegram-бот для ростерії: збір клієнтів через /s
 
 import logging
 import os
+import html
 import re
 import sqlite3
 from datetime import datetime, time, timedelta
@@ -1597,7 +1598,8 @@ async def profile_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
         await update.message.reply_text(
             "Картка ще не заповнена. Заповнімо її зараз — це знадобиться для замовлень.\n\n"
-            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
+            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
+            reply_markup=_profile_cancel_keyboard(),
         )
         return
     addresses = _get_client_addresses(chat_id)
@@ -1611,7 +1613,42 @@ async def profile_edit_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     chat_id = update.effective_chat.id
     PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
-    await query.edit_message_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]])
+    await query.edit_message_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]], reply_markup=_profile_cancel_keyboard())
+
+
+def _profile_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="profile_cancelstep")]])
+
+
+def _adminprofile_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="adminprofile_cancelstep")]])
+
+
+async def profile_cancelstep_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    PROFILE_PENDING.pop(chat_id, None)
+    profile = _get_client_profile(chat_id)
+    addresses = _get_client_addresses(chat_id)
+    if profile:
+        await query.edit_message_text(
+            "Скасовано.\n\n" + _profile_summary_text(profile, addresses),
+            reply_markup=_profile_manage_keyboard(addresses),
+        )
+    else:
+        await query.edit_message_text("Скасовано. Натисніть «🪪 Моя картка», щоб почати заново.")
+
+
+async def adminprofile_cancelstep_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    ADMIN_EDIT_PROFILE_PENDING.pop(admin_id, None)
+    ADMIN_ADD_ADDRESS_PENDING.pop(admin_id, None)
+    await query.edit_message_text("Скасовано.", reply_markup=_menu_back_keyboard())
 
 
 async def profile_addaddr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1619,7 +1656,7 @@ async def profile_addaddr_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     chat_id = update.effective_chat.id
     PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
-    await query.edit_message_text("Напишіть нову адресу:")
+    await query.edit_message_text("Напишіть нову адресу:", reply_markup=_profile_cancel_keyboard())
 
 
 async def profile_editaddr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1631,7 +1668,7 @@ async def profile_editaddr_callback(update: Update, context: ContextTypes.DEFAUL
         "adding_address": True, "editing_address_id": int(addr_id),
         "address_step": "text", "address_data": {},
     }
-    await query.edit_message_text("Напишіть нову адресу (замінить стару):")
+    await query.edit_message_text("Напишіть нову адресу (замінить стару):", reply_markup=_profile_cancel_keyboard())
 
 
 async def profile_deladdr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1662,7 +1699,8 @@ async def adminprofile_edit_callback(update: Update, context: ContextTypes.DEFAU
     target_chat_id = int(target_chat_id_str)
     ADMIN_EDIT_PROFILE_PENDING[admin_id] = {"target_chat_id": target_chat_id, "step_idx": 0, "data": {}}
     await query.edit_message_text(
-        f"Редагуємо картку клієнта (chat_id: {target_chat_id}).\n\n" + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
+        f"Редагуємо картку клієнта (chat_id: {target_chat_id}).\n\n" + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
+        reply_markup=_adminprofile_cancel_keyboard(),
     )
 
 
@@ -1677,7 +1715,8 @@ async def adminprofile_addaddr_callback(update: Update, context: ContextTypes.DE
     target_chat_id = int(target_chat_id_str)
     ADMIN_ADD_ADDRESS_PENDING[admin_id] = {"target_chat_id": target_chat_id, "step": "text", "data": {}}
     await query.edit_message_text(
-        f"Напишіть нову адресу для цього клієнта (chat_id: {target_chat_id}):"
+        f"Напишіть нову адресу для цього клієнта (chat_id: {target_chat_id}):",
+        reply_markup=_adminprofile_cancel_keyboard(),
     )
 
 
@@ -1693,7 +1732,9 @@ async def adminprofile_editaddr_callback(update: Update, context: ContextTypes.D
     ADMIN_ADD_ADDRESS_PENDING[admin_id] = {
         "target_chat_id": target_chat_id, "editing_address_id": int(addr_id), "step": "text", "data": {},
     }
-    await query.edit_message_text("Напишіть нову адресу (замінить стару):")
+    await query.edit_message_text(
+        "Напишіть нову адресу (замінить стару):", reply_markup=_adminprofile_cancel_keyboard()
+    )
 
 
 async def adminprofile_deladdr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1735,7 +1776,10 @@ async def handle_admin_add_address_text(update: Update, context: ContextTypes.DE
     if pending["step"] == "text":
         pending["data"]["address"] = text
         pending["step"] = "phone"
-        await update.message.reply_text("Тепер напишіть номер телефону для зв'язку по цій адресі:")
+        await update.message.reply_text(
+            "Тепер напишіть номер телефону для зв'язку по цій адресі:",
+            reply_markup=_adminprofile_cancel_keyboard(),
+        )
         return
 
     if not _is_valid_phone(text):
@@ -1789,7 +1833,10 @@ async def handle_admin_edit_profile_text_step(update: Update, context: ContextTy
 
     if step_idx + 1 < len(PROFILE_STEPS):
         pending["step_idx"] += 1
-        await update.message.reply_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[pending["step_idx"]]])
+        await update.message.reply_text(
+            PROFILE_STEP_PROMPTS[PROFILE_STEPS[pending["step_idx"]]],
+            reply_markup=_adminprofile_cancel_keyboard(),
+        )
         return
 
     data = ADMIN_EDIT_PROFILE_PENDING.pop(admin_id)["data"]
@@ -1825,7 +1872,8 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
             pending["address_step"] = "phone"
             await update.message.reply_text(
                 "Тепер напишіть номер телефону для зв'язку по цій адресі "
-                "(наприклад: +380671234567):"
+                "(наприклад: +380671234567):",
+                reply_markup=_profile_cancel_keyboard(),
             )
             return
 
@@ -1877,7 +1925,10 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
 
     if step_idx + 1 < len(PROFILE_STEPS):
         pending["step_idx"] += 1
-        await update.message.reply_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[pending["step_idx"]]])
+        await update.message.reply_text(
+            PROFILE_STEP_PROMPTS[PROFILE_STEPS[pending["step_idx"]]],
+            reply_markup=_profile_cancel_keyboard(),
+        )
         return
 
     data = PROFILE_PENDING.pop(chat_id)["data"]
@@ -2021,39 +2072,42 @@ def _order_grind_type_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def _esc(value) -> str:
+    return html.escape(str(value)) if value is not None else "—"
+
+
 def _order_summary_text(order: dict, profile: dict) -> str:
     lines = [
-        "🆕 НОВЕ ЗАМОВЛЕННЯ",
-        f"📅 Дата виконання: {order.get('date', '—')}",
-        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
-        f"👤 Клієнт: {profile.get('full_name') or '—'}",
-        f"🏪 Точка: {profile.get('point_name') or '—'}",
-        f"📍 Адреса: {order.get('address') or '—'}",
-        f"📞 Телефон для доставки: {order.get('contact_phone') or '—'}",
-        f"📞 Телефон: {profile.get('phone') or '—'}",
-        f"🏢 ФОП: {profile.get('fop') or '—'}  |  ІПН: {profile.get('ipn') or '—'}",
-        f"💳 Оплата: {order.get('payment_method') or '—'}",
-        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
-        "📦 ПОЗИЦІЇ ДЛЯ СКЛАДУ:",
+        "🆕 <b>НОВЕ ЗАМОВЛЕННЯ</b>",
+        f"📅 Дата виконання: {_esc(order.get('date') or '—')}",
+        "",
+        f"👤 Клієнт: {_esc(profile.get('full_name') or '—')}",
+        f"🏪 Точка: {_esc(profile.get('point_name') or '—')}",
+        f"📍 Адреса: {_esc(order.get('address') or '—')}",
+        f"📞 Телефон для доставки: {_esc(order.get('contact_phone') or '—')}",
+        f"📞 Телефон: {_esc(profile.get('phone') or '—')}",
+        f"🏢 ФОП: {_esc(profile.get('fop') or '—')}  |  ІПН: {_esc(profile.get('ipn') or '—')}",
+        f"💳 Оплата: {_esc(order.get('payment_method') or '—')}",
+        "",
+        "📦 <b>Позиції для складу:</b>",
         "",
     ]
     for i, item in enumerate(order.get("items", []), 1):
         cat_label = dict(ORDER_CATEGORIES).get(item.get("category"), item.get("category"))
         grind_line = ""
         if item.get("grind"):
-            grind_line = f"    Помел: {item['grind']}"
+            grind_line = f"    Помел: {_esc(item['grind'])}"
             if item.get("grind_type"):
-                grind_line += f" ({item['grind_type']})"
+                grind_line += f" ({_esc(item['grind_type'])})"
             grind_line += "\n"
-        packaging_line = f"    Пакування: {item['packaging']}\n" if item.get("packaging") else ""
+        packaging_line = f"    Пакування: {_esc(item['packaging'])}\n" if item.get("packaging") else ""
         lines.append(
-            f"{i}) {item.get('item_text', '—')}\n"
-            f"    Категорія: {cat_label}\n"
-            f"    Фасування/вага: {item.get('weight', '—')}   Кількість: {item.get('qty', '—')}\n"
+            f"<b>{i}) {_esc(item.get('item_text') or '—')} — {_esc(item.get('weight') or '—')} "
+            f"× {_esc(item.get('qty') or '—')}</b>\n"
+            f"    Категорія: {_esc(cat_label)}\n"
             f"{grind_line}"
             f"{packaging_line}"
         )
-    lines.append("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬")
     return "\n".join(lines)
 
 
@@ -2079,14 +2133,16 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
         await update.message.reply_text(
             "Перш ніж оформити замовлення, заповніть, будь ласка, картку клієнта (це одноразово) 🙏\n\n"
-            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
+            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
+            reply_markup=_profile_cancel_keyboard(),
         )
         return
     addresses = _get_client_addresses(chat_id)
     if not addresses:
         PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
         await update.message.reply_text(
-            "Перш ніж оформити замовлення, додайте хоча б одну адресу доставки 🙏\n\nНапишіть адресу:"
+            "Перш ніж оформити замовлення, додайте хоча б одну адресу доставки 🙏\n\nНапишіть адресу:",
+            reply_markup=_profile_cancel_keyboard(),
         )
         return
     ORDER_PENDING[chat_id] = {"step": "date", "items": []}
@@ -2103,14 +2159,16 @@ async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
         await query.edit_message_text(
             "Перш ніж оформити замовлення, заповніть, будь ласка, картку клієнта (це одноразово) 🙏\n\n"
-            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]]
+            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
+            reply_markup=_profile_cancel_keyboard(),
         )
         return
     addresses = _get_client_addresses(chat_id)
     if not addresses:
         PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
         await query.edit_message_text(
-            "Перш ніж оформити замовлення, додайте хоча б одну адресу доставки 🙏\n\nНапишіть адресу:"
+            "Перш ніж оформити замовлення, додайте хоча б одну адресу доставки 🙏\n\nНапишіть адресу:",
+            reply_markup=_profile_cancel_keyboard(),
         )
         return
     ORDER_PENDING[chat_id] = {"step": "date", "items": []}
@@ -2298,7 +2356,10 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "order_qty_other":
         order["step"] = "qty_other"
-        await query.edit_message_text("Напишіть потрібну кількість:")
+        await query.edit_message_text(
+            "Напишіть потрібну кількість:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")]]),
+        )
         return
 
     if data == "order_addmore":
@@ -2339,8 +2400,9 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 sent = await context.bot.send_message(
                     target_admin,
-                    f"{summary}\n\nВід: {client.full_name} (@{client.username or '—'}, chat_id: {chat_id})\n\n"
+                    f"{summary}\n\nВід: {_esc(client.full_name)} (@{_esc(client.username or '—')}, chat_id: {chat_id})\n\n"
                     f"Щоб відповісти клієнту — зробіть Reply на це повідомлення.",
+                    parse_mode="HTML",
                 )
                 FORWARD_MAP[(target_admin, sent.message_id)] = chat_id
             except Exception as e:
@@ -3683,6 +3745,8 @@ def main():
     application.add_handler(CallbackQueryHandler(profile_addaddr_callback, pattern=r"^profile_addaddr$"))
     application.add_handler(CallbackQueryHandler(profile_deladdr_callback, pattern=r"^profile_deladdr:"))
     application.add_handler(CallbackQueryHandler(profile_editaddr_callback, pattern=r"^profile_editaddr:"))
+    application.add_handler(CallbackQueryHandler(profile_cancelstep_callback, pattern=r"^profile_cancelstep$"))
+    application.add_handler(CallbackQueryHandler(adminprofile_cancelstep_callback, pattern=r"^adminprofile_cancelstep$"))
     application.add_handler(CallbackQueryHandler(adminprofile_edit_callback, pattern=r"^adminprofile_edit:"))
     application.add_handler(CallbackQueryHandler(adminprofile_addaddr_callback, pattern=r"^adminprofile_addaddr:"))
     application.add_handler(CallbackQueryHandler(adminprofile_deladdr_callback, pattern=r"^adminprofile_deladdr:"))
