@@ -85,7 +85,7 @@ PROFILE_PENDING: dict[int, dict] = {}
 ADMIN_EDIT_PROFILE_PENDING: dict[int, dict] = {}
 
 # Стан, коли адмін додає адресу конкретному клієнту: admin_chat_id -> target_chat_id клієнта
-ADMIN_ADD_ADDRESS_PENDING: dict[int, int] = {}
+ADMIN_ADD_ADDRESS_PENDING: dict[int, dict] = {}
 
 WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
@@ -196,9 +196,13 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL,
             address TEXT NOT NULL,
+            phone TEXT,
             created_at TEXT
         )
     """)
+    addr_cols = [r["name"] for r in conn.execute("PRAGMA table_info(client_addresses)").fetchall()]
+    if "phone" not in addr_cols:
+        conn.execute("ALTER TABLE client_addresses ADD COLUMN phone TEXT")
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
     # таблицю schedules, щоб не втратити те, що вже було задано раніше.
     old_rows = conn.execute(
@@ -1513,7 +1517,9 @@ def _get_client_profile(chat_id: int):
 
 
 def _profile_summary_text(profile: dict, addresses: list) -> str:
-    addr_lines = "\n".join(f"   {i+1}. {a['address']}" for i, a in enumerate(addresses)) if addresses else "   (адрес ще немає)"
+    addr_lines = "\n".join(
+        f"   {i+1}. {a['address']} — 📞 {a.get('phone') or '—'}" for i, a in enumerate(addresses)
+    ) if addresses else "   (адрес ще немає)"
     return (
         f"🪪 Ваша картка:\n\n"
         f"Ім'я: {profile.get('full_name') or '—'}\n"
@@ -1600,7 +1606,7 @@ async def profile_addaddr_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
-    PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}, "adding_address": True}
+    PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
     await query.edit_message_text("Напишіть нову адресу:")
 
 
@@ -1645,7 +1651,7 @@ async def adminprofile_addaddr_callback(update: Update, context: ContextTypes.DE
     admin_id = update.effective_chat.id
     _, target_chat_id_str = query.data.split(":", 1)
     target_chat_id = int(target_chat_id_str)
-    ADMIN_ADD_ADDRESS_PENDING[admin_id] = target_chat_id
+    ADMIN_ADD_ADDRESS_PENDING[admin_id] = {"target_chat_id": target_chat_id, "step": "text", "data": {}}
     await query.edit_message_text(
         f"Напишіть нову адресу для цього клієнта (chat_id: {target_chat_id}):"
     )
@@ -1680,21 +1686,37 @@ async def adminprofile_deladdr_callback(update: Update, context: ContextTypes.DE
 
 async def handle_admin_add_address_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_chat.id
-    target_chat_id = ADMIN_ADD_ADDRESS_PENDING.pop(admin_id, None)
-    if not target_chat_id:
+    pending = ADMIN_ADD_ADDRESS_PENDING.get(admin_id)
+    if not pending:
         return
-    address_text = update.message.text or ""
+    target_chat_id = pending["target_chat_id"]
+    text = update.message.text or ""
+
+    if pending["step"] == "text":
+        pending["data"]["address"] = text
+        pending["step"] = "phone"
+        await update.message.reply_text("Тепер напишіть номер телефону для зв'язку по цій адресі:")
+        return
+
+    if not _is_valid_phone(text):
+        await update.message.reply_text(
+            "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+        )
+        return
+    phone = _normalize_phone(text)
+    address_text = pending["data"]["address"]
+    ADMIN_ADD_ADDRESS_PENDING.pop(admin_id, None)
     conn = db()
     conn.execute(
-        "INSERT INTO client_addresses (chat_id, address, created_at) VALUES (?, ?, ?)",
-        (target_chat_id, address_text, datetime.now(TZ).isoformat()),
+        "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
+        (target_chat_id, address_text, phone, datetime.now(TZ).isoformat()),
     )
     conn.commit()
     conn.close()
     profile = _get_client_profile(target_chat_id)
     addresses = _get_client_addresses(target_chat_id)
-    text = "✅ Адресу додано клієнту!\n\n" + (_profile_summary_text(profile, addresses) if profile else "(картка ще не заповнена)")
-    await update.message.reply_text(text, reply_markup=_menu_back_keyboard())
+    text_out = "✅ Адресу додано клієнту!\n\n" + (_profile_summary_text(profile, addresses) if profile else "(картка ще не заповнена)")
+    await update.message.reply_text(text_out, reply_markup=_menu_back_keyboard())
 
 
 async def handle_admin_edit_profile_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1749,12 +1771,29 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
         return
 
     if pending.get("adding_address"):
-        address_text = update.message.text or ""
+        text = update.message.text or ""
+        if pending["address_step"] == "text":
+            pending["address_data"]["address"] = text
+            pending["address_step"] = "phone"
+            await update.message.reply_text(
+                "Тепер напишіть номер телефону для зв'язку по цій адресі "
+                "(наприклад: +380671234567):"
+            )
+            return
+
+        # address_step == "phone"
+        if not _is_valid_phone(text):
+            await update.message.reply_text(
+                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+            )
+            return
+        phone = _normalize_phone(text)
+        address_text = pending["address_data"]["address"]
         PROFILE_PENDING.pop(chat_id, None)
         conn = db()
         conn.execute(
-            "INSERT INTO client_addresses (chat_id, address, created_at) VALUES (?, ?, ?)",
-            (chat_id, address_text, datetime.now(TZ).isoformat()),
+            "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, address_text, phone, datetime.now(TZ).isoformat()),
         )
         conn.commit()
         conn.close()
@@ -1800,7 +1839,7 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
     conn.close()
     addresses = _get_client_addresses(chat_id)
     if not addresses:
-        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}, "adding_address": True}
+        PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
         await update.message.reply_text(
             "✅ Дані збережено! Залишилось додати хоча б одну адресу доставки.\n\nНапишіть адресу:"
         )
@@ -1900,6 +1939,32 @@ def _order_grind_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+GRIND_TYPE_OPTIONS = [
+    "Турка",
+    "Еспресо",
+    "Чашка",
+    "Офісна кавоварка",
+    "Гейзер",
+    "Френч прес",
+    "V60 на 01 фільтр",
+    "V60 на 02 фільтр",
+    "Фільтр кава",
+]
+
+
+def _order_grind_type_keyboard() -> InlineKeyboardMarkup:
+    buttons, row = [], []
+    for i, g in enumerate(GRIND_TYPE_OPTIONS):
+        row.append(InlineKeyboardButton(g, callback_data=f"order_grindtype:{i}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def _order_summary_text(order: dict, profile: dict) -> str:
     lines = [
         "🆕 НОВЕ ЗАМОВЛЕННЯ",
@@ -1908,6 +1973,7 @@ def _order_summary_text(order: dict, profile: dict) -> str:
         f"👤 Клієнт: {profile.get('full_name') or '—'}",
         f"🏪 Точка: {profile.get('point_name') or '—'}",
         f"📍 Адреса: {order.get('address') or '—'}",
+        f"📞 Телефон для доставки: {order.get('contact_phone') or '—'}",
         f"📞 Телефон: {profile.get('phone') or '—'}",
         f"🏢 ФОП: {profile.get('fop') or '—'}  |  ІПН: {profile.get('ipn') or '—'}",
         f"💳 Оплата: {order.get('payment_method') or '—'}",
@@ -1962,7 +2028,7 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     addresses = _get_client_addresses(chat_id)
     if not addresses:
-        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}, "adding_address": True}
+        PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
         await update.message.reply_text(
             "Перш ніж оформити замовлення, додайте хоча б одну адресу доставки 🙏\n\nНапишіть адресу:"
         )
@@ -1986,7 +2052,7 @@ async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     addresses = _get_client_addresses(chat_id)
     if not addresses:
-        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}, "adding_address": True}
+        PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
         await query.edit_message_text(
             "Перш ніж оформити замовлення, додайте хоча б одну адресу доставки 🙏\n\nНапишіть адресу:"
         )
@@ -2002,13 +2068,6 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
         return
     step = order.get("step")
     text = update.message.text or ""
-
-    if step == "grind_type":
-        order["current_item"]["grind_type"] = text
-        next_step, next_text, next_kb = _next_after_options(chat_id)
-        order["step"] = next_step
-        await update.message.reply_text(next_text, reply_markup=next_kb)
-        return
 
     if step == "qty_other":
         order["current_item"]["qty"] = text
@@ -2049,13 +2108,15 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         addresses = _get_client_addresses(chat_id)
         if len(addresses) == 1:
             order["address"] = addresses[0]["address"]
+            order["contact_phone"] = addresses[0].get("phone") or "—"
             order["step"] = "category"
             await query.edit_message_text(
                 "Яку категорію товару додати до замовлення?", reply_markup=_order_category_keyboard()
             )
             return
         buttons = [
-            [InlineKeyboardButton(a["address"][:60], callback_data=f"order_addr:{a['id']}")] for a in addresses
+            [InlineKeyboardButton(f"{a['address'][:45]} ({a.get('phone') or '—'})", callback_data=f"order_addr:{a['id']}")]
+            for a in addresses
         ]
         buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
         await query.edit_message_text(
@@ -2068,6 +2129,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         addresses = _get_client_addresses(chat_id)
         chosen = next((a for a in addresses if str(a["id"]) == addr_id), None)
         order["address"] = chosen["address"] if chosen else "—"
+        order["contact_phone"] = (chosen.get("phone") if chosen else None) or "—"
         order["step"] = "category"
         await query.edit_message_text(
             "Яку категорію товару додати до замовлення?", reply_markup=_order_category_keyboard()
@@ -2139,12 +2201,20 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, grind = data.split(":", 1)
         order["current_item"]["grind"] = grind
         if grind == "Молоте":
-            order["step"] = "grind_type"
-            await query.edit_message_text("На який помел? (наприклад: для турки, для гейзера, для еспресо тощо):")
+            await query.edit_message_text("На який помел?", reply_markup=_order_grind_type_keyboard())
         else:
             next_step, next_text, next_kb = _next_after_options(chat_id)
             order["step"] = next_step
             await query.edit_message_text(next_text, reply_markup=next_kb)
+        return
+
+    if data.startswith("order_grindtype:"):
+        _, idx_str = data.split(":", 1)
+        idx = int(idx_str)
+        order["current_item"]["grind_type"] = GRIND_TYPE_OPTIONS[idx]
+        next_step, next_text, next_kb = _next_after_options(chat_id)
+        order["step"] = next_step
+        await query.edit_message_text(next_text, reply_markup=next_kb)
         return
 
     if data.startswith("order_packaging:"):
