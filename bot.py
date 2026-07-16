@@ -1679,7 +1679,7 @@ async def adminprofile_deladdr_callback(update: Update, context: ContextTypes.DE
         buttons.append([InlineKeyboardButton(
             f"🗑 {a['address'][:40]}", callback_data=f"adminprofile_deladdr:{target_chat_id}:{a['id']}"
         )])
-    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    buttons.append([InlineKeyboardButton("✅ Готово / До меню", callback_data="menu_back")])
     text = "✅ Адресу видалено.\n\n" + (_profile_summary_text(profile, addresses) if profile else "(картка ще не заповнена)")
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -2468,7 +2468,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons.append([InlineKeyboardButton(
                 f"🗑 {a['address'][:40]}", callback_data=f"adminprofile_deladdr:{target_chat_id}:{a['id']}"
             )])
-        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        buttons.append([InlineKeyboardButton("✅ Готово / До меню", callback_data="menu_back")])
         if not profile:
             await query.edit_message_text(
                 "Цей клієнт ще не заповнював картку. Можна одразу додати адресу нижче, "
