@@ -1060,6 +1060,7 @@ def _build_sendto_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup
         InlineKeyboardButton("✅ Надіслати обраним", callback_data="sendto_done"),
         InlineKeyboardButton("❌ Скасувати", callback_data="sendto_cancel"),
     ])
+    buttons.append([InlineKeyboardButton("⬅️ Назад до меню", callback_data="menu_back")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -2753,9 +2754,10 @@ def _bc_select_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup:
             f"{mark} {_client_display_label(c['chat_id'], c['name'], c['username'])}", callback_data=f"bc_toggle:{c['chat_id']}"
         )])
     buttons.append([
+        InlineKeyboardButton("⬅️ Назад", callback_data="bc_backtotarget"),
         InlineKeyboardButton("➡️ Далі", callback_data="bc_selectdone"),
-        InlineKeyboardButton("❌ Скасувати", callback_data="menu_back"),
     ])
+    buttons.append([InlineKeyboardButton("❌ Скасувати", callback_data="menu_back")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -2885,6 +2887,14 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         BC_PENDING[admin_id] = {}
         BC_SELECTIONS.pop(admin_id, None)
         await query.edit_message_text("Кому запланувати розсилку?", reply_markup=_bc_target_keyboard())
+        return
+
+    if data == "bc_backtotarget":
+        is_q = BC_PENDING.get(admin_id, {}).get("is_question", False)
+        BC_PENDING[admin_id] = {"is_question": True} if is_q else {}
+        BC_SELECTIONS.pop(admin_id, None)
+        prompt = "Кому запланувати запитання так/ні?" if is_q else "Кому запланувати розсилку?"
+        await query.edit_message_text(prompt, reply_markup=_bc_target_keyboard())
         return
 
     if data == "bcq_start":
@@ -3138,9 +3148,10 @@ def _qna_select_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup:
             f"{mark} {_client_display_label(c['chat_id'], c['name'], c['username'])}", callback_data=f"qna_toggle:{c['chat_id']}"
         )])
     buttons.append([
+        InlineKeyboardButton("⬅️ Назад", callback_data="qna_backtotarget"),
         InlineKeyboardButton("➡️ Далі", callback_data="qna_selectdone"),
-        InlineKeyboardButton("❌ Скасувати", callback_data="menu_back"),
     ])
+    buttons.append([InlineKeyboardButton("❌ Скасувати", callback_data="menu_back")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -3153,6 +3164,12 @@ async def qna_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "qna_start":
+        QNA_PENDING[admin_id] = {}
+        QNA_SELECTIONS.pop(admin_id, None)
+        await query.edit_message_text("Кому поставити запитання?", reply_markup=_qna_target_keyboard())
+        return
+
+    if data == "qna_backtotarget":
         QNA_PENDING[admin_id] = {}
         QNA_SELECTIONS.pop(admin_id, None)
         await query.edit_message_text("Кому поставити запитання?", reply_markup=_qna_target_keyboard())
