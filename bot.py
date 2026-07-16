@@ -192,6 +192,8 @@ def init_db():
         conn.execute("ALTER TABLE client_profiles ADD COLUMN ipn TEXT")
     if "payment_method" not in profile_cols:
         conn.execute("ALTER TABLE client_profiles ADD COLUMN payment_method TEXT")
+    if "delivery_zone" not in profile_cols:
+        conn.execute("ALTER TABLE client_profiles ADD COLUMN delivery_zone TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS client_addresses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1526,12 +1528,21 @@ def _get_client_profile(chat_id: int):
     return dict(row) if row else None
 
 
+DELIVERY_ZONE_OPTIONS = ["Київ лівий берег", "Київ правий берег", "Самовивіз", "НП (Нова Пошта)"]
+
+
+def _delivery_zone_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(z, callback_data=f"{callback_prefix}:{z}")] for z in DELIVERY_ZONE_OPTIONS]
+    return InlineKeyboardMarkup(buttons)
+
+
 def _profile_summary_text(profile: dict, addresses: list) -> str:
     addr_lines = "\n".join(
         f"   {i+1}. {a['address']} — 📞 {a.get('phone') or '—'}" for i, a in enumerate(addresses)
     ) if addresses else "   (адрес ще немає)"
     return (
         f"🪪 Ваша картка:\n\n"
+        f"Зона доставки: {profile.get('delivery_zone') or '—'}\n"
         f"Ім'я: {profile.get('full_name') or '—'}\n"
         f"Назва точки: {profile.get('point_name') or '—'}\n"
         f"Контактний номер: {profile.get('phone') or '—'}\n"
@@ -1595,11 +1606,11 @@ async def profile_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     profile = _get_client_profile(chat_id)
     if not profile:
-        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
+        PROFILE_PENDING[chat_id] = {"awaiting_zone": True, "data": {}}
         await update.message.reply_text(
             "Картка ще не заповнена. Заповнімо її зараз — це знадобиться для замовлень.\n\n"
-            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
-            reply_markup=_profile_cancel_keyboard(),
+            "Спочатку — оберіть зону доставки:",
+            reply_markup=_delivery_zone_keyboard("profile_zone"),
         )
         return
     addresses = _get_client_addresses(chat_id)
@@ -1612,8 +1623,23 @@ async def profile_edit_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
-    PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
-    await query.edit_message_text(PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]], reply_markup=_profile_cancel_keyboard())
+    PROFILE_PENDING[chat_id] = {"awaiting_zone": True, "data": {}}
+    await query.edit_message_text("Оберіть зону доставки:", reply_markup=_delivery_zone_keyboard("profile_zone"))
+
+
+async def profile_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    _, zone = query.data.split(":", 1)
+    pending = PROFILE_PENDING.setdefault(chat_id, {"data": {}})
+    pending["data"]["delivery_zone"] = zone
+    pending.pop("awaiting_zone", None)
+    pending["step_idx"] = 0
+    await query.edit_message_text(
+        f"Зона доставки: {zone}\n\n" + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
+        reply_markup=_profile_cancel_keyboard(),
+    )
 
 
 def _profile_cancel_keyboard() -> InlineKeyboardMarkup:
@@ -1697,9 +1723,29 @@ async def adminprofile_edit_callback(update: Update, context: ContextTypes.DEFAU
     admin_id = update.effective_chat.id
     _, target_chat_id_str = query.data.split(":", 1)
     target_chat_id = int(target_chat_id_str)
-    ADMIN_EDIT_PROFILE_PENDING[admin_id] = {"target_chat_id": target_chat_id, "step_idx": 0, "data": {}}
+    ADMIN_EDIT_PROFILE_PENDING[admin_id] = {"target_chat_id": target_chat_id, "awaiting_zone": True, "data": {}}
     await query.edit_message_text(
-        f"Редагуємо картку клієнта (chat_id: {target_chat_id}).\n\n" + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
+        f"Редагуємо картку клієнта (chat_id: {target_chat_id}).\n\nОберіть зону доставки:",
+        reply_markup=_delivery_zone_keyboard("adminprofile_zone"),
+    )
+
+
+async def adminprofile_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    _, zone = query.data.split(":", 1)
+    pending = ADMIN_EDIT_PROFILE_PENDING.get(admin_id)
+    if not pending:
+        await query.edit_message_text("Це вже неактуально.", reply_markup=_menu_back_keyboard())
+        return
+    pending["data"]["delivery_zone"] = zone
+    pending.pop("awaiting_zone", None)
+    pending["step_idx"] = 0
+    await query.edit_message_text(
+        f"Зона доставки: {zone}\n\n" + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
         reply_markup=_adminprofile_cancel_keyboard(),
     )
 
@@ -1816,6 +1862,14 @@ async def handle_admin_edit_profile_text_step(update: Update, context: ContextTy
     pending = ADMIN_EDIT_PROFILE_PENDING.get(admin_id)
     if not pending:
         return
+
+    if pending.get("awaiting_zone"):
+        await update.message.reply_text(
+            "Будь ласка, оберіть зону доставки кнопкою вище 👆",
+            reply_markup=_delivery_zone_keyboard("adminprofile_zone"),
+        )
+        return
+
     target_chat_id = pending["target_chat_id"]
     step_idx = pending["step_idx"]
     field = PROFILE_STEPS[step_idx]
@@ -1842,13 +1896,13 @@ async def handle_admin_edit_profile_text_step(update: Update, context: ContextTy
     data = ADMIN_EDIT_PROFILE_PENDING.pop(admin_id)["data"]
     conn = db()
     conn.execute(
-        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, ipn, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, ipn, delivery_zone, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
-        "phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, "
+        "phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, delivery_zone=excluded.delivery_zone, "
         "updated_at=excluded.updated_at",
         (target_chat_id, data["full_name"], data["point_name"], data["phone"], data["fop"],
-         data["ipn"], datetime.now(TZ).isoformat()),
+         data["ipn"], data.get("delivery_zone"), datetime.now(TZ).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -1863,6 +1917,13 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
     chat_id = update.effective_chat.id
     pending = PROFILE_PENDING.get(chat_id)
     if not pending:
+        return
+
+    if pending.get("awaiting_zone"):
+        await update.message.reply_text(
+            "Будь ласка, оберіть зону доставки кнопкою вище 👆",
+            reply_markup=_delivery_zone_keyboard("profile_zone"),
+        )
         return
 
     if pending.get("adding_address"):
@@ -1934,13 +1995,13 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
     data = PROFILE_PENDING.pop(chat_id)["data"]
     conn = db()
     conn.execute(
-        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, ipn, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, ipn, delivery_zone, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
-        "phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, "
+        "phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, delivery_zone=excluded.delivery_zone, "
         "updated_at=excluded.updated_at",
         (chat_id, data["full_name"], data["point_name"], data["phone"], data["fop"],
-         data["ipn"], datetime.now(TZ).isoformat()),
+         data["ipn"], data.get("delivery_zone"), datetime.now(TZ).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -2083,6 +2144,7 @@ def _order_summary_text(order: dict, profile: dict) -> str:
         "",
         f"👤 Клієнт: {_esc(profile.get('full_name') or '—')}",
         f"🏪 Точка: {_esc(profile.get('point_name') or '—')}",
+        f"🗺 Зона доставки: {_esc(profile.get('delivery_zone') or '—')}",
         f"📍 Адреса: {_esc(order.get('address') or '—')}",
         f"📞 Телефон для доставки: {_esc(order.get('contact_phone') or '—')}",
         f"📞 Телефон: {_esc(profile.get('phone') or '—')}",
@@ -2130,11 +2192,11 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     profile = _get_client_profile(chat_id)
     if not profile:
-        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
+        PROFILE_PENDING[chat_id] = {"awaiting_zone": True, "data": {}}
         await update.message.reply_text(
             "Перш ніж оформити замовлення, заповніть, будь ласка, картку клієнта (це одноразово) 🙏\n\n"
-            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
-            reply_markup=_profile_cancel_keyboard(),
+            "Спочатку — оберіть зону доставки:",
+            reply_markup=_delivery_zone_keyboard("profile_zone"),
         )
         return
     addresses = _get_client_addresses(chat_id)
@@ -2156,11 +2218,11 @@ async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = update.effective_chat.id
     profile = _get_client_profile(chat_id)
     if not profile:
-        PROFILE_PENDING[chat_id] = {"step_idx": 0, "data": {}}
+        PROFILE_PENDING[chat_id] = {"awaiting_zone": True, "data": {}}
         await query.edit_message_text(
             "Перш ніж оформити замовлення, заповніть, будь ласка, картку клієнта (це одноразово) 🙏\n\n"
-            + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
-            reply_markup=_profile_cancel_keyboard(),
+            "Спочатку — оберіть зону доставки:",
+            reply_markup=_delivery_zone_keyboard("profile_zone"),
         )
         return
     addresses = _get_client_addresses(chat_id)
@@ -3742,12 +3804,14 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER)}$"), order_start))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_PROFILE)}$"), profile_show))
     application.add_handler(CallbackQueryHandler(profile_edit_callback, pattern=r"^profile_edit$"))
+    application.add_handler(CallbackQueryHandler(profile_zone_callback, pattern=r"^profile_zone:"))
     application.add_handler(CallbackQueryHandler(profile_addaddr_callback, pattern=r"^profile_addaddr$"))
     application.add_handler(CallbackQueryHandler(profile_deladdr_callback, pattern=r"^profile_deladdr:"))
     application.add_handler(CallbackQueryHandler(profile_editaddr_callback, pattern=r"^profile_editaddr:"))
     application.add_handler(CallbackQueryHandler(profile_cancelstep_callback, pattern=r"^profile_cancelstep$"))
     application.add_handler(CallbackQueryHandler(adminprofile_cancelstep_callback, pattern=r"^adminprofile_cancelstep$"))
     application.add_handler(CallbackQueryHandler(adminprofile_edit_callback, pattern=r"^adminprofile_edit:"))
+    application.add_handler(CallbackQueryHandler(adminprofile_zone_callback, pattern=r"^adminprofile_zone:"))
     application.add_handler(CallbackQueryHandler(adminprofile_addaddr_callback, pattern=r"^adminprofile_addaddr:"))
     application.add_handler(CallbackQueryHandler(adminprofile_deladdr_callback, pattern=r"^adminprofile_deladdr:"))
     application.add_handler(CallbackQueryHandler(adminprofile_editaddr_callback, pattern=r"^adminprofile_editaddr:"))
