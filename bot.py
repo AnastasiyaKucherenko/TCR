@@ -1574,7 +1574,10 @@ def _profile_manage_keyboard(addresses: list) -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton("✏️ Редагувати дані", callback_data="profile_edit")]]
     buttons.append([InlineKeyboardButton("➕ Додати адресу", callback_data="profile_addaddr")])
     for a in addresses:
-        buttons.append([InlineKeyboardButton(f"🗑 {a['address'][:40]}", callback_data=f"profile_deladdr:{a['id']}")])
+        buttons.append([
+            InlineKeyboardButton(f"✏️ {a['address'][:30]}", callback_data=f"profile_editaddr:{a['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"profile_deladdr:{a['id']}"),
+        ])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1608,6 +1611,18 @@ async def profile_addaddr_callback(update: Update, context: ContextTypes.DEFAULT
     chat_id = update.effective_chat.id
     PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
     await query.edit_message_text("Напишіть нову адресу:")
+
+
+async def profile_editaddr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    _, addr_id = query.data.split(":", 1)
+    PROFILE_PENDING[chat_id] = {
+        "adding_address": True, "editing_address_id": int(addr_id),
+        "address_step": "text", "address_data": {},
+    }
+    await query.edit_message_text("Напишіть нову адресу (замінить стару):")
 
 
 async def profile_deladdr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1657,6 +1672,21 @@ async def adminprofile_addaddr_callback(update: Update, context: ContextTypes.DE
     )
 
 
+async def adminprofile_editaddr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін редагує наявну адресу клієнта."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    _, target_chat_id_str, addr_id = query.data.split(":", 2)
+    target_chat_id = int(target_chat_id_str)
+    ADMIN_ADD_ADDRESS_PENDING[admin_id] = {
+        "target_chat_id": target_chat_id, "editing_address_id": int(addr_id), "step": "text", "data": {},
+    }
+    await query.edit_message_text("Напишіть нову адресу (замінить стару):")
+
+
 async def adminprofile_deladdr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Адмін видаляє одну з адрес клієнта."""
     query = update.callback_query
@@ -1676,9 +1706,10 @@ async def adminprofile_deladdr_callback(update: Update, context: ContextTypes.DE
         [InlineKeyboardButton("➕ Додати адресу", callback_data=f"adminprofile_addaddr:{target_chat_id}")],
     ]
     for a in addresses:
-        buttons.append([InlineKeyboardButton(
-            f"🗑 {a['address'][:40]}", callback_data=f"adminprofile_deladdr:{target_chat_id}:{a['id']}"
-        )])
+        buttons.append([
+            InlineKeyboardButton(f"✏️ {a['address'][:25]}", callback_data=f"adminprofile_editaddr:{target_chat_id}:{a['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"adminprofile_deladdr:{target_chat_id}:{a['id']}"),
+        ])
     buttons.append([InlineKeyboardButton("✅ Готово / До меню", callback_data="menu_back")])
     text = "✅ Адресу видалено.\n\n" + (_profile_summary_text(profile, addresses) if profile else "(картка ще не заповнена)")
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -1705,17 +1736,25 @@ async def handle_admin_add_address_text(update: Update, context: ContextTypes.DE
         return
     phone = _normalize_phone(text)
     address_text = pending["data"]["address"]
+    editing_id = pending.get("editing_address_id")
     ADMIN_ADD_ADDRESS_PENDING.pop(admin_id, None)
     conn = db()
-    conn.execute(
-        "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
-        (target_chat_id, address_text, phone, datetime.now(TZ).isoformat()),
-    )
+    if editing_id:
+        conn.execute(
+            "UPDATE client_addresses SET address=?, phone=? WHERE id=? AND chat_id=?",
+            (address_text, phone, editing_id, target_chat_id),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
+            (target_chat_id, address_text, phone, datetime.now(TZ).isoformat()),
+        )
     conn.commit()
     conn.close()
     profile = _get_client_profile(target_chat_id)
     addresses = _get_client_addresses(target_chat_id)
-    text_out = "✅ Адресу додано клієнту!\n\n" + (_profile_summary_text(profile, addresses) if profile else "(картка ще не заповнена)")
+    done_label = "оновлено" if editing_id else "додано клієнту"
+    text_out = f"✅ Адресу {done_label}!\n\n" + (_profile_summary_text(profile, addresses) if profile else "(картка ще не заповнена)")
     await update.message.reply_text(text_out, reply_markup=_menu_back_keyboard())
 
 
@@ -1789,18 +1828,26 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
             return
         phone = _normalize_phone(text)
         address_text = pending["address_data"]["address"]
+        editing_id = pending.get("editing_address_id")
         PROFILE_PENDING.pop(chat_id, None)
         conn = db()
-        conn.execute(
-            "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, address_text, phone, datetime.now(TZ).isoformat()),
-        )
+        if editing_id:
+            conn.execute(
+                "UPDATE client_addresses SET address=?, phone=? WHERE id=? AND chat_id=?",
+                (address_text, phone, editing_id, chat_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
+                (chat_id, address_text, phone, datetime.now(TZ).isoformat()),
+            )
         conn.commit()
         conn.close()
         profile = _get_client_profile(chat_id) or {}
         addresses = _get_client_addresses(chat_id)
+        done_label = "оновлено" if editing_id else "додано"
         await update.message.reply_text(
-            "✅ Адресу додано!\n\n" + _profile_summary_text(profile, addresses),
+            f"✅ Адресу {done_label}!\n\n" + _profile_summary_text(profile, addresses),
             reply_markup=_profile_manage_keyboard(addresses),
         )
         return
@@ -2465,9 +2512,10 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➕ Додати адресу", callback_data=f"adminprofile_addaddr:{target_chat_id}")],
         ]
         for a in addresses:
-            buttons.append([InlineKeyboardButton(
-                f"🗑 {a['address'][:40]}", callback_data=f"adminprofile_deladdr:{target_chat_id}:{a['id']}"
-            )])
+            buttons.append([
+                InlineKeyboardButton(f"✏️ {a['address'][:25]}", callback_data=f"adminprofile_editaddr:{target_chat_id}:{a['id']}"),
+                InlineKeyboardButton("🗑", callback_data=f"adminprofile_deladdr:{target_chat_id}:{a['id']}"),
+            ])
         buttons.append([InlineKeyboardButton("✅ Готово / До меню", callback_data="menu_back")])
         if not profile:
             await query.edit_message_text(
@@ -3609,9 +3657,11 @@ def main():
     application.add_handler(CallbackQueryHandler(profile_edit_callback, pattern=r"^profile_edit$"))
     application.add_handler(CallbackQueryHandler(profile_addaddr_callback, pattern=r"^profile_addaddr$"))
     application.add_handler(CallbackQueryHandler(profile_deladdr_callback, pattern=r"^profile_deladdr:"))
+    application.add_handler(CallbackQueryHandler(profile_editaddr_callback, pattern=r"^profile_editaddr:"))
     application.add_handler(CallbackQueryHandler(adminprofile_edit_callback, pattern=r"^adminprofile_edit:"))
     application.add_handler(CallbackQueryHandler(adminprofile_addaddr_callback, pattern=r"^adminprofile_addaddr:"))
     application.add_handler(CallbackQueryHandler(adminprofile_deladdr_callback, pattern=r"^adminprofile_deladdr:"))
+    application.add_handler(CallbackQueryHandler(adminprofile_editaddr_callback, pattern=r"^adminprofile_editaddr:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
