@@ -1583,6 +1583,42 @@ PROFILE_STEP_PROMPTS = {
     "fop": "ФОП (назва/номер, або «немає», якщо не застосовується):",
     "ipn": "ІПН (або «немає», якщо не застосовується):",
 }
+PROFILE_FIELD_LABELS = {
+    "delivery_zone": "🗺 Зона доставки",
+    "full_name": "👤 Ім'я",
+    "point_name": "🏪 Назва точки",
+    "phone": "📞 Телефон",
+    "fop": "🏢 ФОП",
+    "ipn": "🧾 ІПН",
+}
+PROFILE_EDITABLE_FIELDS = ["delivery_zone", "full_name", "point_name", "phone", "fop", "ipn"]
+PROFILE_FIELD_LABELS = {
+    "delivery_zone": "🗺 Зона доставки",
+    "full_name": "Ім'я",
+    "point_name": "Назва точки",
+    "phone": "Телефон",
+    "fop": "ФОП",
+    "ipn": "ІПН",
+}
+PROFILE_EDITABLE_FIELDS = ["delivery_zone", "full_name", "point_name", "phone", "fop", "ipn"]
+
+
+def _profile_field_picker_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(PROFILE_FIELD_LABELS[f], callback_data=f"profile_editfield:{f}")]
+        for f in PROFILE_EDITABLE_FIELDS
+    ]
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _adminprofile_field_picker_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(PROFILE_FIELD_LABELS[f], callback_data=f"adminprofile_editfield:{target_chat_id}:{f}")]
+        for f in PROFILE_EDITABLE_FIELDS
+    ]
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def _order_payment_keyboard() -> InlineKeyboardMarkup:
@@ -1619,12 +1655,58 @@ async def profile_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _profile_field_picker_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"{prefix}:{key}")]
+        for key, label in PROFILE_FIELD_LABELS.items()
+    ]
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def profile_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await query.edit_message_text(
+        "Що саме хочете змінити?", reply_markup=_profile_field_picker_keyboard("profile_editfield")
+    )
+
+
+async def profile_editfield_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     chat_id = update.effective_chat.id
-    PROFILE_PENDING[chat_id] = {"awaiting_zone": True, "data": {}}
-    await query.edit_message_text("Оберіть зону доставки:", reply_markup=_delivery_zone_keyboard("profile_zone"))
+    _, field = query.data.split(":", 1)
+    if field == "delivery_zone":
+        PROFILE_PENDING[chat_id] = {"single_field": "delivery_zone"}
+        await query.edit_message_text(
+            "Оберіть нову зону доставки:", reply_markup=_delivery_zone_keyboard("profile_zonefield")
+        )
+        return
+    PROFILE_PENDING[chat_id] = {"single_field": field}
+    await query.edit_message_text(PROFILE_STEP_PROMPTS[field], reply_markup=_profile_cancel_keyboard())
+
+
+async def profile_zonefield_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    _, zone = query.data.split(":", 1)
+    PROFILE_PENDING.pop(chat_id, None)
+    conn = db()
+    conn.execute(
+        "INSERT INTO client_profiles (chat_id, delivery_zone, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET delivery_zone=excluded.delivery_zone, updated_at=excluded.updated_at",
+        (chat_id, zone, datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    profile = _get_client_profile(chat_id) or {}
+    addresses = _get_client_addresses(chat_id)
+    await query.edit_message_text(
+        f"✅ Зону доставки оновлено: {zone}\n\n" + _profile_summary_text(profile, addresses),
+        reply_markup=_profile_manage_keyboard(addresses),
+    )
 
 
 async def profile_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1919,6 +2001,33 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
     if not pending:
         return
 
+    if pending.get("single_field"):
+        field = pending["single_field"]
+        text = update.message.text or ""
+        if field == "phone":
+            if not _is_valid_phone(text):
+                await update.message.reply_text(
+                    "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+                )
+                return
+            text = _normalize_phone(text)
+        PROFILE_PENDING.pop(chat_id, None)
+        conn = db()
+        conn.execute(
+            f"INSERT INTO client_profiles (chat_id, {field}, updated_at) VALUES (?, ?, ?) "
+            f"ON CONFLICT(chat_id) DO UPDATE SET {field}=excluded.{field}, updated_at=excluded.updated_at",
+            (chat_id, text, datetime.now(TZ).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        profile = _get_client_profile(chat_id) or {}
+        addresses = _get_client_addresses(chat_id)
+        await update.message.reply_text(
+            f"✅ {PROFILE_FIELD_LABELS.get(field, field)} оновлено!\n\n" + _profile_summary_text(profile, addresses),
+            reply_markup=_profile_manage_keyboard(addresses),
+        )
+        return
+
     if pending.get("awaiting_zone"):
         await update.message.reply_text(
             "Будь ласка, оберіть зону доставки кнопкою вище 👆",
@@ -2027,6 +2136,14 @@ ORDER_QUANTITIES = ["1", "5", "10"]
 COFFEE_CATEGORIES = ("arabika", "palay", "blend")
 
 
+def _order_cancel_row(back_callback: str | None = None) -> list:
+    row = []
+    if back_callback:
+        row.append(InlineKeyboardButton("⬅️ Назад", callback_data=back_callback))
+    row.append(InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel"))
+    return row
+
+
 def _order_date_keyboard() -> InlineKeyboardMarkup:
     now = datetime.now(TZ)
     today = now.date()
@@ -2046,16 +2163,16 @@ def _order_date_keyboard() -> InlineKeyboardMarkup:
             break
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    buttons.append(_order_cancel_row())
     return InlineKeyboardMarkup(buttons)
 
 
-def _order_category_keyboard() -> InlineKeyboardMarkup:
+def _order_category_keyboard(back_callback: str | None = None) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(label, callback_data=f"order_cat:{key}")]
         for key, label in ORDER_CATEGORIES
     ]
-    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    buttons.append(_order_cancel_row(back_callback))
     return InlineKeyboardMarkup(buttons)
 
 
@@ -2068,33 +2185,33 @@ def _order_weight_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    buttons.append(_order_cancel_row("order_back_to_cat"))
     return InlineKeyboardMarkup(buttons)
 
 
-def _order_qty_keyboard() -> InlineKeyboardMarkup:
+def _order_qty_keyboard(back_callback: str = "order_back_to_weight") -> InlineKeyboardMarkup:
     row = [InlineKeyboardButton(q, callback_data=f"order_qty:{q}") for q in ORDER_QUANTITIES]
     return InlineKeyboardMarkup([
         row,
         [InlineKeyboardButton("✏️ Інша кількість", callback_data="order_qty_other")],
-        [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")],
+        _order_cancel_row(back_callback),
     ])
 
 
 PACKAGING_OPTIONS = ["Крафт", "Бренд", "Білий не бренд", "Чорний"]
 
 
-def _order_packaging_keyboard() -> InlineKeyboardMarkup:
+def _order_packaging_keyboard(back_callback: str = "order_back_to_weight") -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(p, callback_data=f"order_packaging:{p}")] for p in PACKAGING_OPTIONS]
-    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    buttons.append(_order_cancel_row(back_callback))
     return InlineKeyboardMarkup(buttons)
 
 
-def _next_after_options(chat_id: int):
+def _next_after_options(chat_id: int, back_callback: str = "order_back_to_weight"):
     """Визначає наступний крок після ваги/помелу: пакування (якщо клієнта позначено) або одразу кількість."""
     if _client_needs_packaging(chat_id):
-        return "packaging", "Яке пакування?", _order_packaging_keyboard()
-    return "qty", "Яка кількість?", _order_qty_keyboard()
+        return "packaging", "Яке пакування?", _order_packaging_keyboard(back_callback)
+    return "qty", "Яка кількість?", _order_qty_keyboard(back_callback)
 
 
 def _order_grind_keyboard() -> InlineKeyboardMarkup:
@@ -2103,7 +2220,7 @@ def _order_grind_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🌰 Зерно", callback_data="order_grind:Зерно"),
             InlineKeyboardButton("⚙️ Молоте", callback_data="order_grind:Молоте"),
         ],
-        [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")],
+        _order_cancel_row("order_back_to_weight"),
     ])
 
 
@@ -2129,7 +2246,7 @@ def _order_grind_type_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    buttons.append(_order_cancel_row("order_back_to_grind"))
     return InlineKeyboardMarkup(buttons)
 
 
@@ -2287,17 +2404,23 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order["contact_phone"] = addresses[0].get("phone") or "—"
             order["step"] = "category"
             await query.edit_message_text(
-                "Яку категорію товару додати до замовлення?", reply_markup=_order_category_keyboard()
+                "Яку категорію товару додати до замовлення?",
+                reply_markup=_order_category_keyboard("order_back_to_date"),
             )
             return
         buttons = [
             [InlineKeyboardButton(f"{a['address'][:45]} ({a.get('phone') or '—'})", callback_data=f"order_addr:{a['id']}")]
             for a in addresses
         ]
-        buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+        buttons.append(_order_cancel_row("order_back_to_date"))
         await query.edit_message_text(
             "На яку адресу оформити це замовлення?", reply_markup=InlineKeyboardMarkup(buttons)
         )
+        return
+
+    if data == "order_back_to_date":
+        order["step"] = "date"
+        await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
         return
 
     if data.startswith("order_addr:"):
@@ -2308,7 +2431,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order["contact_phone"] = (chosen.get("phone") if chosen else None) or "—"
         order["step"] = "category"
         await query.edit_message_text(
-            "Яку категорію товару додати до замовлення?", reply_markup=_order_category_keyboard()
+            "Яку категорію товару додати до замовлення?",
+            reply_markup=_order_category_keyboard("order_back_to_date"),
         )
         return
 
@@ -2321,7 +2445,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not items:
             await query.edit_message_text(
                 f"{label}\n\nЦя категорія ще порожня — зверніться до менеджера, або оберіть іншу категорію.",
-                reply_markup=_order_category_keyboard(),
+                reply_markup=_order_category_keyboard("order_back_to_date"),
             )
             return
         order["current_item"] = {"category": cat_key}
@@ -2334,8 +2458,17 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row = []
         if row:
             buttons.append(row)
-        buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+        buttons.append(_order_cancel_row("order_back_to_cat"))
         await query.edit_message_text(f"{label}\n\nОберіть позицію:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "order_back_to_cat":
+        order["step"] = "category"
+        order.pop("current_item", None)
+        await query.edit_message_text(
+            "Яку категорію товару додати до замовлення?",
+            reply_markup=_order_category_keyboard("order_back_to_date"),
+        )
         return
 
     if data.startswith("order_pick_item:"):
@@ -2351,7 +2484,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order["current_item"]["weight"] = "шт"
             order["step"] = "qty"
             await query.edit_message_text(
-                f"Обрано: {choices[idx]}\n\nЯка кількість?", reply_markup=_order_qty_keyboard()
+                f"Обрано: {choices[idx]}\n\nЯка кількість?",
+                reply_markup=_order_qty_keyboard("order_back_to_cat"),
             )
         else:
             order["step"] = "weight"
@@ -2368,9 +2502,14 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order["step"] = "grind"
             await query.edit_message_text("Зерно чи молоте?", reply_markup=_order_grind_keyboard())
         else:
-            next_step, next_text, next_kb = _next_after_options(chat_id)
+            next_step, next_text, next_kb = _next_after_options(chat_id, "order_back_to_weight")
             order["step"] = next_step
             await query.edit_message_text(next_text, reply_markup=next_kb)
+        return
+
+    if data == "order_back_to_weight":
+        order["step"] = "weight"
+        await query.edit_message_text("Оберіть вагу/фасування:", reply_markup=_order_weight_keyboard())
         return
 
     if data.startswith("order_grind:"):
@@ -2379,16 +2518,20 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if grind == "Молоте":
             await query.edit_message_text("На який помел?", reply_markup=_order_grind_type_keyboard())
         else:
-            next_step, next_text, next_kb = _next_after_options(chat_id)
+            next_step, next_text, next_kb = _next_after_options(chat_id, "order_back_to_weight")
             order["step"] = next_step
             await query.edit_message_text(next_text, reply_markup=next_kb)
+        return
+
+    if data == "order_back_to_grind":
+        await query.edit_message_text("Зерно чи молоте?", reply_markup=_order_grind_keyboard())
         return
 
     if data.startswith("order_grindtype:"):
         _, idx_str = data.split(":", 1)
         idx = int(idx_str)
         order["current_item"]["grind_type"] = GRIND_TYPE_OPTIONS[idx]
-        next_step, next_text, next_kb = _next_after_options(chat_id)
+        next_step, next_text, next_kb = _next_after_options(chat_id, "order_back_to_grind")
         order["step"] = next_step
         await query.edit_message_text(next_text, reply_markup=next_kb)
         return
@@ -2397,7 +2540,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, packaging = data.split(":", 1)
         order["current_item"]["packaging"] = packaging
         order["step"] = "qty"
-        await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard())
+        back_to = "order_back_to_grind" if order["current_item"].get("grind") else "order_back_to_weight"
+        await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard(back_to))
         return
 
     if data.startswith("order_qty:"):
