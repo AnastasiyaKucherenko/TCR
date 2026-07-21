@@ -1543,7 +1543,19 @@ async def client_delivery_category_callback(update: Update, context: ContextType
     _, cat_key = query.data.split(":", 1)
     label = dict(DELIVERY_CATEGORIES).get(cat_key, cat_key)
     text = _get_setting(f"delivery_{cat_key}", _default_delivery_text(cat_key)).strip()
-    await query.edit_message_text(f"🚚 {text}")
+    await query.edit_message_text(
+        f"🚚 {text}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="clientdelivery_back")]]),
+    )
+
+
+async def client_delivery_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "🚚 Які умови доставки вас цікавлять?",
+        reply_markup=_delivery_category_keyboard("clientdelivery"),
+    )
 
 
 async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4140,6 +4152,7 @@ def main():
     application.add_handler(CallbackQueryHandler(adminprofile_editaddr_callback, pattern=r"^adminprofile_editaddr:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(client_delivery_category_callback, pattern=r"^clientdelivery:"))
+    application.add_handler(CallbackQueryHandler(client_delivery_back_callback, pattern=r"^clientdelivery_back$"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
     application.add_handler(CallbackQueryHandler(sendto_cancel_callback, pattern=r"^sendto_cancel$"))
