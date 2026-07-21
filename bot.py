@@ -9,6 +9,7 @@ Telegram-бот для ростерії: збір клієнтів через /s
 import logging
 import os
 import html
+import json
 import re
 import sqlite3
 from datetime import datetime, time, timedelta
@@ -206,6 +207,17 @@ def init_db():
     addr_cols = [r["name"] for r in conn.execute("PRAGMA table_info(client_addresses)").fetchall()]
     if "phone" not in addr_cols:
         conn.execute("ALTER TABLE client_addresses ADD COLUMN phone TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            address TEXT,
+            contact_phone TEXT,
+            payment_method TEXT,
+            items_json TEXT,
+            created_at TEXT
+        )
+    """)
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
     # таблицю schedules, щоб не втратити те, що вже було задано раніше.
     old_rows = conn.execute(
@@ -1556,10 +1568,36 @@ def _profile_summary_text(profile: dict, addresses: list, for_admin: bool = Fals
 def _get_client_addresses(chat_id: int) -> list:
     conn = db()
     rows = conn.execute(
-        "SELECT id, address FROM client_addresses WHERE chat_id=? ORDER BY id", (chat_id,)
+        "SELECT id, address, phone FROM client_addresses WHERE chat_id=? ORDER BY id", (chat_id,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def _save_completed_order(chat_id: int, order: dict) -> None:
+    conn = db()
+    conn.execute(
+        "INSERT INTO orders (chat_id, address, contact_phone, payment_method, items_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, order.get("address"), order.get("contact_phone"), order.get("payment_method"),
+         json.dumps(order.get("items", []), ensure_ascii=False), datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _get_last_order_items(chat_id: int) -> list:
+    conn = db()
+    row = conn.execute(
+        "SELECT items_json FROM orders WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,)
+    ).fetchone()
+    conn.close()
+    if not row or not row["items_json"]:
+        return []
+    try:
+        return json.loads(row["items_json"])
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 
 def _is_valid_phone(text: str) -> bool:
@@ -2195,7 +2233,34 @@ def _order_packaging_keyboard(back_callback: str = "order_back_to_weight") -> In
     return InlineKeyboardMarkup(buttons)
 
 
-def _next_after_options(chat_id: int, back_callback: str = "order_back_to_weight"):
+def _after_address_screen(order: dict):
+    """Після вибору адреси: якщо позиції вже скопійовані (повторне замовлення) — на перегляд,
+    інакше — як завжди, на вибір категорії."""
+    if order.get("items"):
+        return _order_review_screen(order)
+    return "Яку категорію товару додати до замовлення?", _order_category_keyboard("order_back_to_date")
+
+
+def _order_review_screen(order: dict):
+    items = order.get("items", [])
+    if not items:
+        return "Позицій поки немає.", _order_category_keyboard("order_back_to_date")
+    lines = ["📋 Ваші позиції (з попереднього замовлення) — можна змінити кількість чи прибрати зайве:\n"]
+    buttons = []
+    for i, item in enumerate(items):
+        cat_label = dict(ORDER_CATEGORIES).get(item.get("category"), item.get("category"))
+        lines.append(f"{i+1}) {item.get('item_text', '—')} — {item.get('weight', '—')} × {item.get('qty', '—')} ({cat_label})")
+        buttons.append([
+            InlineKeyboardButton(f"✏️ {i+1}", callback_data=f"order_reviewqty:{i}"),
+            InlineKeyboardButton(f"🗑 {i+1}", callback_data=f"order_reviewdel:{i}"),
+        ])
+    buttons.append([InlineKeyboardButton("➕ Додати нову позицію", callback_data="order_addmore")])
+    buttons.append([InlineKeyboardButton("✅ Все ок, продовжити", callback_data="order_finish")])
+    buttons.append([InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+
     """Визначає наступний крок після ваги/помелу: пакування (якщо клієнта позначено) або одразу кількість."""
     if _client_needs_packaging(chat_id):
         return "packaging", "Яке пакування?", _order_packaging_keyboard(back_callback)
@@ -2312,6 +2377,18 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_profile_cancel_keyboard(),
         )
         return
+    last_items = _get_last_order_items(chat_id)
+    if last_items:
+        await update.message.reply_text(
+            "У вас є попереднє замовлення. Повторити його (можна буде змінити кількість чи додати щось), "
+            "чи оформити нове з нуля?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔁 Повторити попереднє", callback_data="order_repeat")],
+                [InlineKeyboardButton("🆕 Нове замовлення", callback_data="order_new")],
+                [InlineKeyboardButton("❌ Скасувати", callback_data="order_cancel")],
+            ]),
+        )
+        return
     ORDER_PENDING[chat_id] = {"step": "date", "items": []}
     await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
 
@@ -2336,6 +2413,18 @@ async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(
             "Перш ніж оформити замовлення, додайте хоча б одну адресу доставки 🙏\n\nНапишіть адресу:",
             reply_markup=_profile_cancel_keyboard(),
+        )
+        return
+    last_items = _get_last_order_items(chat_id)
+    if last_items:
+        await query.edit_message_text(
+            "У вас є попереднє замовлення. Повторити його (можна буде змінити кількість чи додати щось), "
+            "чи оформити нове з нуля?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔁 Повторити попереднє", callback_data="order_repeat")],
+                [InlineKeyboardButton("🆕 Нове замовлення", callback_data="order_new")],
+                [InlineKeyboardButton("❌ Скасувати", callback_data="order_cancel")],
+            ]),
         )
         return
     ORDER_PENDING[chat_id] = {"step": "date", "items": []}
@@ -2378,6 +2467,17 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Замовлення скасовано. Якщо передумаєте — просто натисніть «📝 Замовити» ще раз.")
         return
 
+    if data == "order_new":
+        ORDER_PENDING[chat_id] = {"step": "date", "items": []}
+        await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+        return
+
+    if data == "order_repeat":
+        last_items = _get_last_order_items(chat_id)
+        ORDER_PENDING[chat_id] = {"step": "date", "items": last_items}
+        await query.edit_message_text("На яку дату потрібне це замовлення?", reply_markup=_order_date_keyboard())
+        return
+
     if not order:
         await query.edit_message_text("Це замовлення вже неактуальне. Натисніть «📝 Замовити», щоб почати заново.")
         return
@@ -2390,11 +2490,9 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(addresses) == 1:
             order["address"] = addresses[0]["address"]
             order["contact_phone"] = addresses[0].get("phone") or "—"
-            order["step"] = "category"
-            await query.edit_message_text(
-                "Яку категорію товару додати до замовлення?",
-                reply_markup=_order_category_keyboard("order_back_to_date"),
-            )
+            text, kb = _after_address_screen(order)
+            order["step"] = "review" if order.get("items") else "category"
+            await query.edit_message_text(text, reply_markup=kb)
             return
         buttons = [
             [InlineKeyboardButton(f"{a['address'][:45]} ({a.get('phone') or '—'})", callback_data=f"order_addr:{a['id']}")]
@@ -2417,11 +2515,30 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chosen = next((a for a in addresses if str(a["id"]) == addr_id), None)
         order["address"] = chosen["address"] if chosen else "—"
         order["contact_phone"] = (chosen.get("phone") if chosen else None) or "—"
-        order["step"] = "category"
-        await query.edit_message_text(
-            "Яку категорію товару додати до замовлення?",
-            reply_markup=_order_category_keyboard("order_back_to_date"),
-        )
+        text, kb = _after_address_screen(order)
+        order["step"] = "review" if order.get("items") else "category"
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if data == "order_review":
+        text, kb = _order_review_screen(order)
+        order["step"] = "review"
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if data.startswith("order_reviewqty:"):
+        _, idx_str = data.split(":", 1)
+        order["review_edit_idx"] = int(idx_str)
+        await query.edit_message_text("Яка нова кількість для цієї позиції?", reply_markup=_order_qty_keyboard("order_review"))
+        return
+
+    if data.startswith("order_reviewdel:"):
+        _, idx_str = data.split(":", 1)
+        idx = int(idx_str)
+        if 0 <= idx < len(order.get("items", [])):
+            order["items"].pop(idx)
+        text, kb = _order_review_screen(order)
+        await query.edit_message_text(text, reply_markup=kb)
         return
 
     NO_WEIGHT_CATEGORIES = ("drip", "suputni")
@@ -2534,6 +2651,13 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_qty:"):
         _, qty = data.split(":", 1)
+        if "review_edit_idx" in order:
+            idx = order.pop("review_edit_idx")
+            if 0 <= idx < len(order.get("items", [])):
+                order["items"][idx]["qty"] = qty
+            text, kb = _order_review_screen(order)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
         order["current_item"]["qty"] = qty
         order["items"].append(order.pop("current_item"))
         order["step"] = "addmore"
@@ -2579,6 +2703,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Це замовлення вже неактуальне.")
             return
         order["payment_method"] = method
+        _save_completed_order(chat_id, order)
         profile = _get_client_profile(chat_id) or {}
         summary = _order_summary_text(order, profile)
         client = update.effective_user
