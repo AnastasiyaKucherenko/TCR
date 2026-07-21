@@ -2291,7 +2291,43 @@ def _after_address_screen(order: dict):
     return "Яку категорію товару додати до замовлення?", _order_category_keyboard("order_back_to_date")
 
 
-def _order_review_screen(order: dict):
+def _order_review_step_screen(order: dict):
+    """Показує позиції замовлення ПО ЧЕРЗІ, одну за раз — з кнопками
+    «змінити кількість» / «прибрати» / «далі». Коли всі позиції переглянуто —
+    показує підсумковий список з опціями додати/продовжити/скасувати."""
+    items = order.get("items", [])
+    if not items:
+        return "Позицій поки немає.", _order_category_keyboard("order_back_to_date")
+
+    idx = order.get("review_idx", 0)
+
+    if idx >= len(items):
+        lines = ["📋 Ось усі позиції вашого замовлення:\n"]
+        for i, item in enumerate(items):
+            cat_label = dict(ORDER_CATEGORIES).get(item.get("category"), item.get("category"))
+            lines.append(f"{i+1}) {item.get('item_text', '—')} — {item.get('weight', '—')} × {item.get('qty', '—')} ({cat_label})")
+        buttons = [
+            [InlineKeyboardButton("➕ Додати нову позицію", callback_data="order_addmore")],
+            [InlineKeyboardButton("✅ Все ок, продовжити", callback_data="order_finish")],
+            [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")],
+        ]
+        return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+    item = items[idx]
+    cat_label = dict(ORDER_CATEGORIES).get(item.get("category"), item.get("category"))
+    text = (
+        f"📋 Позиція {idx + 1} з {len(items)}:\n\n"
+        f"{item.get('item_text', '—')} — {item.get('weight', '—')} × {item.get('qty', '—')} ({cat_label})"
+    )
+    buttons = [
+        [
+            InlineKeyboardButton("✏️ Змінити кількість", callback_data=f"order_reviewqty:{idx}"),
+            InlineKeyboardButton("🗑 Прибрати", callback_data=f"order_reviewdel:{idx}"),
+        ],
+        [InlineKeyboardButton("➡️ Далі", callback_data="order_reviewnext")],
+        [InlineKeyboardButton("❌ Скасувати замовлення", callback_data="order_cancel")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
     items = order.get("items", [])
     if not items:
         return "Позицій поки немає.", _order_category_keyboard("order_back_to_date")
@@ -2524,8 +2560,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "order_repeat":
         last_items = _get_last_order_items(chat_id)
-        order = ORDER_PENDING[chat_id] = {"step": "review", "items": last_items}
-        text, kb = _order_review_screen(order)
+        order = ORDER_PENDING[chat_id] = {"step": "review", "items": last_items, "review_idx": 0}
+        text, kb = _order_review_step_screen(order)
         await query.edit_message_text(text, reply_markup=kb)
         return
 
@@ -2572,15 +2608,26 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "order_review":
-        text, kb = _order_review_screen(order)
+        text, kb = _order_review_step_screen(order)
         order["step"] = "review"
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if data == "order_reviewnext":
+        order["review_idx"] = order.get("review_idx", 0) + 1
+        text, kb = _order_review_step_screen(order)
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if data == "order_reviewcurrent":
+        text, kb = _order_review_step_screen(order)
         await query.edit_message_text(text, reply_markup=kb)
         return
 
     if data.startswith("order_reviewqty:"):
         _, idx_str = data.split(":", 1)
         order["review_edit_idx"] = int(idx_str)
-        await query.edit_message_text("Яка нова кількість для цієї позиції?", reply_markup=_order_qty_keyboard("order_review"))
+        await query.edit_message_text("Яка нова кількість для цієї позиції?", reply_markup=_order_qty_keyboard("order_reviewcurrent"))
         return
 
     if data.startswith("order_reviewdel:"):
@@ -2588,7 +2635,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(idx_str)
         if 0 <= idx < len(order.get("items", [])):
             order["items"].pop(idx)
-        text, kb = _order_review_screen(order)
+        order["review_idx"] = idx
+        text, kb = _order_review_step_screen(order)
         await query.edit_message_text(text, reply_markup=kb)
         return
 
@@ -2706,7 +2754,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = order.pop("review_edit_idx")
             if 0 <= idx < len(order.get("items", [])):
                 order["items"][idx]["qty"] = qty
-            text, kb = _order_review_screen(order)
+            order["review_idx"] = idx + 1
+            text, kb = _order_review_step_screen(order)
             await query.edit_message_text(text, reply_markup=kb)
             return
         order["current_item"]["qty"] = qty
