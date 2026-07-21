@@ -3973,6 +3973,34 @@ async def jobs_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def diag_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Діагностика: показує останні збережені замовлення в базі (для перевірки функції «Повторити»)."""
+    if not is_admin(update):
+        return
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, chat_id, address, payment_method, items_json, created_at FROM orders ORDER BY id DESC LIMIT 10"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text(
+            "У таблиці orders поки що НЕМАЄ жодного запису. Це означає, що новий код "
+            "ще не задеплоївся на Railway, або жодне замовлення ще не пройшло крок оплати."
+        )
+        return
+    text = f"Останні {len(rows)} замовлень у базі:\n\n"
+    for r in rows:
+        try:
+            item_count = len(json.loads(r["items_json"] or "[]"))
+        except (json.JSONDecodeError, TypeError):
+            item_count = "?"
+        text += (
+            f"#{r['id']} — chat_id: {r['chat_id']} — {item_count} позицій — "
+            f"{r['payment_method'] or '—'} — {r['created_at']}\n"
+        )
+    await update.message.reply_text(text)
+
+
 # ---------- Довідка ----------
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4038,6 +4066,7 @@ def main():
         MessageHandler(filters.Document.ALL, handle_admin_document)
     )
     application.add_handler(CommandHandler("jobs", jobs_list))
+    application.add_handler(CommandHandler("diagorders", diag_orders))
     application.add_handler(CommandHandler("testsegment", testsegment))
     application.add_handler(CommandHandler("sendto", sendto_start))
     application.add_handler(CommandHandler("menu", menu_command))
