@@ -2260,7 +2260,7 @@ def _order_review_screen(order: dict):
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
-
+def _next_after_options(chat_id, back_callback):
     """Визначає наступний крок після ваги/помелу: пакування (якщо клієнта позначено) або одразу кількість."""
     if _client_needs_packaging(chat_id):
         return "packaging", "Яке пакування?", _order_packaging_keyboard(back_callback)
@@ -4112,4 +4112,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
