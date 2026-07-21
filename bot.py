@@ -2796,6 +2796,19 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard("order_finaldate")
             )
             return
+        if order.get("payment_method"):
+            profile = _get_client_profile(chat_id) or {}
+            summary = _order_summary_text(order, profile)
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Змінити", callback_data="order_editagain")],
+                [InlineKeyboardButton("✅ Підтвердити замовлення", callback_data="order_confirm")],
+            ])
+            await query.edit_message_text(
+                "Перевірте, будь ласка, ваше замовлення:\n\n" + summary,
+                reply_markup=buttons,
+                parse_mode="HTML",
+            )
+            return
         order["step"] = "payment"
         await query.edit_message_text(
             "Останній крок — оберіть спосіб оплати:", reply_markup=_order_payment_keyboard()
@@ -2839,11 +2852,32 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_payment:"):
         _, method = data.split(":", 1)
+        order["payment_method"] = method
+        profile = _get_client_profile(chat_id) or {}
+        summary = _order_summary_text(order, profile)
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Змінити", callback_data="order_editagain")],
+            [InlineKeyboardButton("✅ Підтвердити замовлення", callback_data="order_confirm")],
+        ])
+        await query.edit_message_text(
+            "Перевірте, будь ласка, ваше замовлення:\n\n" + summary,
+            reply_markup=buttons,
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "order_editagain":
+        order["review_idx"] = 0
+        order["step"] = "review"
+        text, kb = _order_review_step_screen(order)
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if data == "order_confirm":
         order = ORDER_PENDING.pop(chat_id, None)
         if not order:
             await query.edit_message_text("Це замовлення вже неактуальне.")
             return
-        order["payment_method"] = method
         _save_completed_order(chat_id, order)
         profile = _get_client_profile(chat_id) or {}
         summary = _order_summary_text(order, profile)
