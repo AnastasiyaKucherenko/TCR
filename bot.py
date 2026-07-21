@@ -2220,7 +2220,7 @@ def _order_cancel_row(back_callback: str | None = None) -> list:
     return row
 
 
-def _order_date_keyboard() -> InlineKeyboardMarkup:
+def _order_date_keyboard(callback_prefix: str = "order_date") -> InlineKeyboardMarkup:
     now = datetime.now(TZ)
     today = now.date()
     buttons, row = [], []
@@ -2231,7 +2231,7 @@ def _order_date_keyboard() -> InlineKeyboardMarkup:
         if i == 0 and now.hour >= 10:  # сьогоднішній день доступний тільки до 10:00
             continue
         label = f"{d.strftime('%d.%m')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
-        row.append(InlineKeyboardButton(label, callback_data=f"order_date:{d.isoformat()}"))
+        row.append(InlineKeyboardButton(label, callback_data=f"{callback_prefix}:{d.isoformat()}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -2524,8 +2524,9 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "order_repeat":
         last_items = _get_last_order_items(chat_id)
-        ORDER_PENDING[chat_id] = {"step": "date", "items": last_items}
-        await query.edit_message_text("На яку дату потрібне це замовлення?", reply_markup=_order_date_keyboard())
+        order = ORDER_PENDING[chat_id] = {"step": "review", "items": last_items}
+        text, kb = _order_review_screen(order)
+        await query.edit_message_text(text, reply_markup=kb)
         return
 
     if not order:
@@ -2740,6 +2741,47 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ORDER_PENDING.pop(chat_id, None)
             await query.edit_message_text("Замовлення порожнє, скасовано.")
             return
+        if not order.get("date"):
+            order["step"] = "finaldate"
+            await query.edit_message_text(
+                "На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard("order_finaldate")
+            )
+            return
+        order["step"] = "payment"
+        await query.edit_message_text(
+            "Останній крок — оберіть спосіб оплати:", reply_markup=_order_payment_keyboard()
+        )
+        return
+
+    if data.startswith("order_finaldate:"):
+        _, date_str = data.split(":", 1)
+        d = datetime.fromisoformat(date_str).date()
+        order["date"] = f"{d.strftime('%d.%m.%Y')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
+        addresses = _get_client_addresses(chat_id)
+        if len(addresses) == 1:
+            order["address"] = addresses[0]["address"]
+            order["contact_phone"] = addresses[0].get("phone") or "—"
+            order["step"] = "payment"
+            await query.edit_message_text(
+                "Останній крок — оберіть спосіб оплати:", reply_markup=_order_payment_keyboard()
+            )
+            return
+        buttons = [
+            [InlineKeyboardButton(f"{a['address'][:45]} ({a.get('phone') or '—'})", callback_data=f"order_finaladdr:{a['id']}")]
+            for a in addresses
+        ]
+        order["step"] = "finaladdr"
+        await query.edit_message_text(
+            "На яку адресу оформити це замовлення?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("order_finaladdr:"):
+        _, addr_id = data.split(":", 1)
+        addresses = _get_client_addresses(chat_id)
+        chosen = next((a for a in addresses if str(a["id"]) == addr_id), None)
+        order["address"] = chosen["address"] if chosen else "—"
+        order["contact_phone"] = (chosen.get("phone") if chosen else None) or "—"
         order["step"] = "payment"
         await query.edit_message_text(
             "Останній крок — оберіть спосіб оплати:", reply_markup=_order_payment_keyboard()
