@@ -2393,6 +2393,29 @@ def _esc(value) -> str:
     return html.escape(str(value)) if value is not None else "—"
 
 
+def _order_client_summary_text(order: dict, profile: dict) -> str:
+    """Коротка версія підсумку — тільки те, що потрібно клієнту перед підтвердженням:
+    назва кав'ярні, дата, самі позиції (з помелом/зерном) та спосіб оплати."""
+    lines = [
+        f"🏪 <b>{_esc(profile.get('point_name') or '—')}</b>",
+        f"📅 Дата: {_esc(order.get('date') or '—')}",
+        "",
+    ]
+    for i, item in enumerate(order.get("items", []), 1):
+        grind_part = ""
+        if item.get("grind"):
+            grind_part = f", {_esc(item['grind'])}"
+            if item.get("grind_type"):
+                grind_part += f" ({_esc(item['grind_type'])})"
+        lines.append(
+            f"{i}) {_esc(item.get('item_text') or '—')} — {_esc(item.get('weight') or '—')} "
+            f"× {_esc(item.get('qty') or '—')}{grind_part}"
+        )
+    lines.append("")
+    lines.append(f"💳 Оплата: {_esc(order.get('payment_method') or '—')}")
+    return "\n".join(lines)
+
+
 def _order_summary_text(order: dict, profile: dict) -> str:
     lines = [
         "🆕 <b>НОВЕ ЗАМОВЛЕННЯ</b> 🆕",
@@ -2798,13 +2821,13 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if order.get("payment_method"):
             profile = _get_client_profile(chat_id) or {}
-            summary = _order_summary_text(order, profile)
+            summary = _order_client_summary_text(order, profile)
             buttons = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✏️ Змінити", callback_data="order_editagain")],
                 [InlineKeyboardButton("✅ Підтвердити замовлення", callback_data="order_confirm")],
             ])
             await query.edit_message_text(
-                "Перевірте, будь ласка, ваше замовлення:\n\n" + summary,
+                summary,
                 reply_markup=buttons,
                 parse_mode="HTML",
             )
@@ -2854,13 +2877,13 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, method = data.split(":", 1)
         order["payment_method"] = method
         profile = _get_client_profile(chat_id) or {}
-        summary = _order_summary_text(order, profile)
+        summary = _order_client_summary_text(order, profile)
         buttons = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Змінити", callback_data="order_editagain")],
             [InlineKeyboardButton("✅ Підтвердити замовлення", callback_data="order_confirm")],
         ])
         await query.edit_message_text(
-            "Перевірте, будь ласка, ваше замовлення:\n\n" + summary,
+            summary,
             reply_markup=buttons,
             parse_mode="HTML",
         )
