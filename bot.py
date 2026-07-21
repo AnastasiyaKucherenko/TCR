@@ -1344,6 +1344,7 @@ def _menu_root_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📅 Заплановано (на потім)", callback_data="menu_scheduled")],
         [InlineKeyboardButton("👥 Клієнти", callback_data="menu_clients")],
         [InlineKeyboardButton("⚙️ Налаштування", callback_data="menu_settings")],
+        [InlineKeyboardButton("⏳ Незавершені замовлення", callback_data="menu_pendingorders")],
     ])
 
 
@@ -2467,6 +2468,70 @@ def _parse_assortment_items(cat_key: str) -> list:
     return items
 
 
+ORDER_CONFIRM_REMINDER_MINUTES = 10
+
+
+def _order_confirm_job_name(chat_id: int) -> str:
+    return f"orderconfirm_{chat_id}"
+
+
+def schedule_order_confirm_reminder(application: Application, chat_id: int) -> None:
+    name = _order_confirm_job_name(chat_id)
+    for job in application.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    application.job_queue.run_once(
+        send_order_confirm_reminder,
+        when=timedelta(minutes=ORDER_CONFIRM_REMINDER_MINUTES),
+        name=name,
+        data={"chat_id": chat_id},
+    )
+
+
+def cancel_order_confirm_reminder(application: Application, chat_id: int) -> None:
+    name = _order_confirm_job_name(chat_id)
+    for job in application.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+
+
+async def send_order_confirm_reminder(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    order = ORDER_PENDING.get(chat_id)
+    if not order or not order.get("awaiting_confirm"):
+        return
+    profile = _get_client_profile(chat_id) or {}
+    summary = _order_client_summary_text(order, profile)
+    target_admin = _resolve_target_admin(chat_id)
+    if target_admin:
+        try:
+            await context.bot.send_message(
+                target_admin,
+                f"⏰ Клієнт досі не підтвердив замовлення (очікує вже {ORDER_CONFIRM_REMINDER_MINUTES}+ хв):\n\n"
+                f"{summary}\n\nchat_id: {chat_id}. Можливо, варто написати клієнту особисто.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning(f"Не вдалось надіслати нагадування адміну про непідтверджене замовлення: {e}")
+
+
+def _pending_orders_text() -> str:
+    pending = [(cid, o) for cid, o in ORDER_PENDING.items() if o.get("awaiting_confirm")]
+    if not pending:
+        return "Немає замовлень, що зараз очікують підтвердження клієнтом."
+    text = f"Замовлення, що очікують підтвердження ({len(pending)}):\n\n"
+    for cid, o in pending:
+        profile = _get_client_profile(cid) or {}
+        label = profile.get("point_name") or str(cid)
+        text += f"• {label} (chat_id: {cid}) — дата: {o.get('date') or '—'}, оплата: {o.get('payment_method') or '—'}\n"
+    return text
+
+
+async def pending_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показує адміну всі замовлення, що зараз очікують підтвердження клієнтом (ще не натиснули «Підтвердити»)."""
+    if not is_admin(update):
+        return
+    await update.message.reply_text(_pending_orders_text())
+
+
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     profile = _get_client_profile(chat_id)
@@ -2573,6 +2638,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "order_cancel":
         ORDER_PENDING.pop(chat_id, None)
+        cancel_order_confirm_reminder(context.application, chat_id)
         await query.edit_message_text("Замовлення скасовано. Якщо передумаєте — просто натисніть «📝 Замовити» ще раз.")
         return
 
@@ -2820,6 +2886,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         if order.get("payment_method"):
+            order["awaiting_confirm"] = True
+            schedule_order_confirm_reminder(context.application, chat_id)
             profile = _get_client_profile(chat_id) or {}
             summary = _order_client_summary_text(order, profile)
             buttons = InlineKeyboardMarkup([
@@ -2876,6 +2944,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("order_payment:"):
         _, method = data.split(":", 1)
         order["payment_method"] = method
+        order["awaiting_confirm"] = True
+        schedule_order_confirm_reminder(context.application, chat_id)
         profile = _get_client_profile(chat_id) or {}
         summary = _order_client_summary_text(order, profile)
         buttons = InlineKeyboardMarkup([
@@ -2890,6 +2960,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "order_editagain":
+        order["awaiting_confirm"] = False
+        cancel_order_confirm_reminder(context.application, chat_id)
         order["review_idx"] = 0
         order["step"] = "review"
         text, kb = _order_review_step_screen(order)
@@ -2901,6 +2973,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not order:
             await query.edit_message_text("Це замовлення вже неактуальне.")
             return
+        cancel_order_confirm_reminder(context.application, chat_id)
         _save_completed_order(chat_id, order)
         profile = _get_client_profile(chat_id) or {}
         summary = _order_summary_text(order, profile)
@@ -2970,6 +3043,10 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_settings":
         await query.edit_message_text("⚙️ Налаштування:", reply_markup=_menu_settings_keyboard())
+        return
+
+    if data == "menu_pendingorders":
+        await query.edit_message_text(_pending_orders_text(), reply_markup=_menu_back_keyboard())
         return
 
     if data == "menu_now":
@@ -4230,6 +4307,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/broadcastfile — надішліть PDF (або інший файл) боту з підписом, що починається на "
         "«/broadcastfile ваш текст», і він одразу розійде цей файл усім підписникам\n"
         "/jobs — перевірити заплановані розсилки і час наступного запуску (діагностика)\n"
+        "/pendingorders — замовлення, що клієнти почали оформлювати, але ще не підтвердили\n"
         "/testsegment сегмент — надіслати розсилку сегмента ПРЯМО ЗАРАЗ, без очікування розкладу (для перевірки)\n"
         "/sendto — обрати конкретних людей зі списку (кнопками) і надіслати їм окреме повідомлення\n"
         "/menu — відкрити меню з кнопками українською (усі дії без потреби набирати команди)\n"
@@ -4274,6 +4352,7 @@ def main():
     )
     application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CommandHandler("diagorders", diag_orders))
+    application.add_handler(CommandHandler("pendingorders", pending_orders_command))
     application.add_handler(CommandHandler("testsegment", testsegment))
     application.add_handler(CommandHandler("sendto", sendto_start))
     application.add_handler(CommandHandler("menu", menu_command))
