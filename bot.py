@@ -1315,11 +1315,12 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "delivery_text":
+        cat_key = pending.get("category", "retail")
+        label = dict(DELIVERY_CATEGORIES).get(cat_key, cat_key)
         MENU_PENDING.pop(admin_id, None)
-        _set_setting("delivery", text)
+        _set_setting(f"delivery_{cat_key}", text)
         await update.message.reply_text(
-            "✅ Умови доставки оновлено! Клієнти одразу побачать нову версію, "
-            "коли натиснуть «🚚 Умови доставки».",
+            f"✅ Умови доставки для категорії «{label}» оновлено! Клієнти одразу побачать нову версію.",
             reply_markup=_menu_back_keyboard(),
         )
         return
@@ -1424,21 +1425,47 @@ CLIENT_BTN_DELIVERY = "🚚 Умови доставки"
 CLIENT_BTN_ORDER = "📝 Замовити"
 CLIENT_BTN_PROFILE = "🪪 Моя картка"
 
-DEFAULT_DELIVERY_TEXT = (
-    "Умови доставки:\n\n"
-    "Доставка роздрібних замовлень від 2000грн безкоштовно, менше за тарифами перевізника "
-    "або 190 грн по Києву.\n\n"
-    "Доставка гуртових замовлень від 10 кг будь-якої кави - безкоштовно. "
-    "До 10-ти кг - 190 грн. по Києву, або за тарифами нової пошти.\n\n"
-    "Ви можете обрати по одному кілограму різних сортів, та отримати знижку в залежності "
-    "від загального об'єму замовлення.\n\n"
-    "Замовлення прийняті до 09:00 - можуть бути доставлені КУР'ЄРОМ в той самий день.\n\n"
+DELIVERY_COMMON_TAIL = (
+    "\n\nЗамовлення прийняті до 09:00 - можуть бути доставлені КУР'ЄРОМ в той самий день.\n\n"
     "Замовлення новою поштою прийняті до 11:00 - відправляються у той самий день.\n\n"
     "Доставка на наступний після замовлення день з понеділка по п'ятницю, з 10 до 16.\n\n"
     "Доставка замовлень відбувається за умови повної передплати на рахунок, або по факту "
     "отримання кави.\n\n"
     "Кава обсмажується на професійному ростері COGEN C15"
 )
+
+DEFAULT_DELIVERY_RETAIL_TEXT = (
+    "Умови доставки (роздріб):\n\n"
+    "Доставка роздрібних замовлень від 2000грн безкоштовно, менше за тарифами перевізника "
+    "або 190 грн по Києву." + DELIVERY_COMMON_TAIL
+)
+
+DEFAULT_DELIVERY_WHOLESALE_TEXT = (
+    "Умови доставки (гурт):\n\n"
+    "Доставка гуртових замовлень від 10 кг будь-якої кави - безкоштовно. "
+    "До 10-ти кг - 190 грн. по Києву, або за тарифами нової пошти.\n\n"
+    "Ви можете обрати по одному кілограму різних сортів, та отримати знижку в залежності "
+    "від загального об'єму замовлення." + DELIVERY_COMMON_TAIL
+)
+
+DELIVERY_CATEGORIES = [
+    ("retail", "🛍 Роздріб"),
+    ("wholesale", "📦 Гурт"),
+]
+
+
+def _delivery_category_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"{prefix}:{key}")]
+        for key, label in DELIVERY_CATEGORIES
+    ]
+    if prefix == "menu_deliverycat":
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _default_delivery_text(cat_key: str) -> str:
+    return DEFAULT_DELIVERY_RETAIL_TEXT if cat_key == "retail" else DEFAULT_DELIVERY_WHOLESALE_TEXT
 
 
 def _client_persistent_keyboard() -> ReplyKeyboardMarkup:
@@ -1504,8 +1531,19 @@ async def client_assortment_category_callback(update: Update, context: ContextTy
 
 
 async def client_show_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = _get_setting("delivery", DEFAULT_DELIVERY_TEXT).strip()
-    await update.message.reply_text(f"🚚 {text}")
+    await update.message.reply_text(
+        "🚚 Які умови доставки вас цікавлять?",
+        reply_markup=_delivery_category_keyboard("clientdelivery"),
+    )
+
+
+async def client_delivery_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, cat_key = query.data.split(":", 1)
+    label = dict(DELIVERY_CATEGORIES).get(cat_key, cat_key)
+    text = _get_setting(f"delivery_{cat_key}", _default_delivery_text(cat_key)).strip()
+    await query.edit_message_text(f"🚚 {text}")
 
 
 async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2826,11 +2864,20 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_editdelivery":
-        current = _get_setting("delivery", DEFAULT_DELIVERY_TEXT).strip()
-        MENU_PENDING[admin_id] = {"action": "delivery_text"}
         await query.edit_message_text(
-            "Напишіть новий текст умов доставки — саме це побачать клієнти, коли натиснуть "
-            "свою кнопку «🚚 Умови доставки».\n\nЗараз там написано:\n" + current
+            "🚚 Умови доставки для якої категорії редагувати?",
+            reply_markup=_delivery_category_keyboard("menu_deliverycat"),
+        )
+        return
+
+    if data.startswith("menu_deliverycat:"):
+        _, cat_key = data.split(":", 1)
+        label = dict(DELIVERY_CATEGORIES).get(cat_key, cat_key)
+        current = _get_setting(f"delivery_{cat_key}", _default_delivery_text(cat_key)).strip()
+        MENU_PENDING[admin_id] = {"action": "delivery_text", "category": cat_key}
+        await query.edit_message_text(
+            f"Напишіть новий текст умов доставки для категорії «{label}» — саме це побачать клієнти, "
+            f"коли оберуть цю категорію.\n\nЗараз там написано:\n" + current
         )
         return
 
@@ -4092,6 +4139,7 @@ def main():
     application.add_handler(CallbackQueryHandler(adminprofile_deladdr_callback, pattern=r"^adminprofile_deladdr:"))
     application.add_handler(CallbackQueryHandler(adminprofile_editaddr_callback, pattern=r"^adminprofile_editaddr:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
+    application.add_handler(CallbackQueryHandler(client_delivery_category_callback, pattern=r"^clientdelivery:"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
     application.add_handler(CallbackQueryHandler(sendto_cancel_callback, pattern=r"^sendto_cancel$"))
