@@ -108,6 +108,8 @@ BC_MINUTES = [0, 15, 30, 45]
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -250,6 +252,11 @@ def init_db():
             "INSERT OR IGNORE INTO schedules (segment, weekday, hhmm) VALUES (?, ?, ?)",
             (r["name"], r["schedule_day"], r["schedule_time"]),
         )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_subscribers_segment ON subscribers(segment)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_subscribers_responsible ON subscribers(responsible_admin)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_message_log_chat ON message_log(chat_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_chat ON orders(chat_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_broadcasts_created_by ON broadcasts(created_by)")
     conn.commit()
     conn.close()
 
@@ -3449,6 +3456,17 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 FORWARD_MAP[(target_admin, sent.message_id)] = chat_id
             except Exception as e:
                 logger.warning(f"Не вдалось переслати замовлення адміну: {e}")
+
+        orders_group_id = _get_orders_group_id()
+        if orders_group_id:
+            try:
+                await context.bot.send_message(
+                    orders_group_id,
+                    f"{summary}\n\nВід: {_esc(client.full_name)} (@{_esc(client.username or '—')}, chat_id: {chat_id})",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.warning(f"Не вдалось надіслати замовлення в групу замовлень: {e}")
         return
 
 
@@ -4740,6 +4758,41 @@ async def jobs_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+def _get_orders_group_id() -> int | None:
+    value = _get_setting("orders_group_chat_id", "")
+    try:
+        return int(value) if value else None
+    except ValueError:
+        return None
+
+
+async def setordersgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Прив'язує поточний чат (запускати ВСЕРЕДИНІ групи з замовленнями) як місце,
+    куди дублюватимуться всі підтверджені замовлення клієнтів."""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(
+            "Цю команду треба надіслати ВСЕРЕДИНІ групи з замовленнями (не в особистому чаті з ботом). "
+            "Додайте бота в групу і напишіть /setordersgroup там."
+        )
+        return
+    _set_setting("orders_group_chat_id", str(chat.id))
+    await update.message.reply_text(
+        "✅ Готово! Тепер усі підтверджені замовлення клієнтів дублюватимуться в цю групу.\n\n"
+        "Щоб відв'язати групу — команда /clearordersgroup."
+    )
+
+
+async def clearordersgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    _set_setting("orders_group_chat_id", "")
+    await update.message.reply_text("✅ Групу для замовлень відв'язано. Замовлення більше не дублюватимуться туди.")
+
+
 async def diag_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Діагностика: показує останні збережені замовлення в базі (для перевірки функції «Повторити»)."""
     if not is_admin(update):
@@ -4791,6 +4844,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«/broadcastfile ваш текст», і він одразу розійде цей файл усім підписникам\n"
         "/jobs — перевірити заплановані розсилки і час наступного запуску (діагностика)\n"
         "/pendingorders — замовлення, що клієнти почали оформлювати, але ще не підтвердили\n"
+        "/setordersgroup — прив'язати ГРУПУ (написати цю команду всередині групи), щоб усі "
+        "підтверджені замовлення клієнтів автоматично дублювались туди\n"
+        "/clearordersgroup — відв'язати групу замовлень\n"
         "/testsegment сегмент — надіслати розсилку сегмента ПРЯМО ЗАРАЗ, без очікування розкладу (для перевірки)\n"
         "/sendto — обрати конкретних людей зі списку (кнопками) і надіслати їм окреме повідомлення\n"
         "/menu — відкрити меню з кнопками українською (усі дії без потреби набирати команди)\n"
@@ -4838,6 +4894,8 @@ def main():
     )
     application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CommandHandler("diagorders", diag_orders))
+    application.add_handler(CommandHandler("setordersgroup", setordersgroup_command))
+    application.add_handler(CommandHandler("clearordersgroup", clearordersgroup_command))
     application.add_handler(CommandHandler("pendingorders", pending_orders_command))
     application.add_handler(CommandHandler("testsegment", testsegment))
     application.add_handler(CommandHandler("sendto", sendto_start))
