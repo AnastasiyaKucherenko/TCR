@@ -2061,6 +2061,7 @@ async def adminprofile_editaddr_callback(update: Update, context: ContextTypes.D
 
 def _adminprofile_manage_keyboard(target_chat_id: int, addresses: list) -> InlineKeyboardMarkup:
     buttons = [
+        [InlineKeyboardButton("🧾 Заповнити всі дані одразу", callback_data=f"adminprofile_newwizard:{target_chat_id}")],
         [InlineKeyboardButton("✏️ Редагувати дані", callback_data=f"adminprofile_edit:{target_chat_id}")],
         [InlineKeyboardButton("➕ Додати адресу", callback_data=f"adminprofile_addaddr:{target_chat_id}")],
         [InlineKeyboardButton("💬 Історія повідомлень", callback_data=f"adminmsglog:{target_chat_id}")],
@@ -2208,6 +2209,15 @@ async def handle_admin_new_profile_text_step(update: Update, context: ContextTyp
     )
     conn.commit()
     conn.close()
+    existing_addresses = _get_client_addresses(target_chat_id)
+    if existing_addresses:
+        ADMIN_NEW_PROFILE_PENDING.pop(admin_id, None)
+        profile = _get_client_profile(target_chat_id)
+        await update.message.reply_text(
+            "✅ Картку клієнта оновлено!\n\n" + _profile_summary_text(profile, existing_addresses, for_admin=True),
+            reply_markup=_adminprofile_manage_keyboard(target_chat_id, existing_addresses),
+        )
+        return
     pending["awaiting_address"] = True
     pending["address_step"] = "text"
     await update.message.reply_text(
