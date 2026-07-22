@@ -1894,12 +1894,122 @@ async def profile_zone_callback(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+def _address_phone_keyboard(same_phone: str | None, cancel_callback: str) -> InlineKeyboardMarkup:
+    buttons = []
+    if same_phone:
+        buttons.append([InlineKeyboardButton(f"📞 Такий самий: {same_phone}", callback_data="addraddr_samephone")])
+    buttons.append([InlineKeyboardButton("❌ Скасувати", callback_data=cancel_callback)])
+    return InlineKeyboardMarkup(buttons)
+
+
 def _profile_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="profile_cancelstep")]])
 
 
 def _adminprofile_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="adminprofile_cancelstep")]])
+
+
+async def addraddr_samephone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Завершує додавання адреси, підставивши основний контактний номер профілю
+    замість повторного ручного введення того самого номера."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+
+    if chat_id in PROFILE_PENDING and PROFILE_PENDING[chat_id].get("adding_address"):
+        pending = PROFILE_PENDING[chat_id]
+        profile = _get_client_profile(chat_id) or {}
+        phone = profile.get("phone")
+        if not phone:
+            await query.answer("У профілі ще немає основного номера.", show_alert=True)
+            return
+        address_text = pending["address_data"]["address"]
+        editing_id = pending.get("editing_address_id")
+        PROFILE_PENDING.pop(chat_id, None)
+        conn = db()
+        if editing_id:
+            conn.execute(
+                "UPDATE client_addresses SET address=?, phone=? WHERE id=? AND chat_id=?",
+                (address_text, phone, editing_id, chat_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
+                (chat_id, address_text, phone, datetime.now(TZ).isoformat()),
+            )
+        conn.commit()
+        conn.close()
+        profile2 = _get_client_profile(chat_id) or {}
+        addresses = _get_client_addresses(chat_id)
+        done_label = "оновлено" if editing_id else "додано"
+        await query.edit_message_text(
+            f"✅ Адресу {done_label} (номер: {phone})!\n\n" + _profile_summary_text(profile2, addresses),
+            reply_markup=_profile_manage_keyboard(addresses),
+        )
+        return
+
+    if chat_id in ADMIN_ADD_ADDRESS_PENDING:
+        pending = ADMIN_ADD_ADDRESS_PENDING[chat_id]
+        target_chat_id = pending["target_chat_id"]
+        profile = _get_client_profile(target_chat_id) or {}
+        phone = profile.get("phone")
+        if not phone:
+            await query.answer("У картці клієнта ще немає основного номера.", show_alert=True)
+            return
+        address_text = pending["data"]["address"]
+        editing_id = pending.get("editing_address_id")
+        ADMIN_ADD_ADDRESS_PENDING.pop(chat_id, None)
+        conn = db()
+        if editing_id:
+            conn.execute(
+                "UPDATE client_addresses SET address=?, phone=? WHERE id=? AND chat_id=?",
+                (address_text, phone, editing_id, target_chat_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
+                (target_chat_id, address_text, phone, datetime.now(TZ).isoformat()),
+            )
+        conn.commit()
+        conn.close()
+        profile2 = _get_client_profile(target_chat_id)
+        addresses = _get_client_addresses(target_chat_id)
+        done_label = "оновлено" if editing_id else "додано клієнту"
+        await query.edit_message_text(
+            f"✅ Адресу {done_label} (номер: {phone})!\n\n"
+            + _profile_summary_text(profile2, addresses, for_admin=True),
+            reply_markup=_adminprofile_manage_keyboard(target_chat_id, addresses),
+        )
+        return
+
+    if chat_id in ADMIN_NEW_PROFILE_PENDING:
+        pending = ADMIN_NEW_PROFILE_PENDING[chat_id]
+        target_chat_id = pending["target_chat_id"]
+        profile = _get_client_profile(target_chat_id) or {}
+        phone = profile.get("phone")
+        if not phone:
+            await query.answer("У картці клієнта ще немає основного номера.", show_alert=True)
+            return
+        address_text = pending["address_data"]["address"]
+        ADMIN_NEW_PROFILE_PENDING.pop(chat_id, None)
+        conn = db()
+        conn.execute(
+            "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
+            (target_chat_id, address_text, phone, datetime.now(TZ).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        profile2 = _get_client_profile(target_chat_id)
+        addresses = _get_client_addresses(target_chat_id)
+        await query.edit_message_text(
+            f"✅ Картку клієнта заповнено (номер адреси: {phone})!\n\n"
+            + _profile_summary_text(profile2, addresses, for_admin=True),
+            reply_markup=_adminprofile_manage_keyboard(target_chat_id, addresses),
+        )
+        return
+
+    await query.edit_message_text("Це вже неактуально.")
 
 
 async def profile_cancelstep_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2147,9 +2257,10 @@ async def handle_admin_new_profile_text_step(update: Update, context: ContextTyp
         if pending.get("address_step") == "text":
             pending["address_data"] = {"address": text}
             pending["address_step"] = "phone"
+            profile = _get_client_profile(target_chat_id) or {}
             await update.message.reply_text(
                 "Тепер напишіть номер телефону для зв'язку по цій адресі:",
-                reply_markup=_adminprofile_cancel_keyboard(),
+                reply_markup=_address_phone_keyboard(profile.get("phone"), "adminprofile_cancelstep"),
             )
             return
         if not _is_valid_phone(text):
@@ -2331,9 +2442,10 @@ async def handle_admin_add_address_text(update: Update, context: ContextTypes.DE
     if pending["step"] == "text":
         pending["data"]["address"] = text
         pending["step"] = "phone"
+        profile = _get_client_profile(target_chat_id) or {}
         await update.message.reply_text(
             "Тепер напишіть номер телефону для зв'язку по цій адресі:",
-            reply_markup=_adminprofile_cancel_keyboard(),
+            reply_markup=_address_phone_keyboard(profile.get("phone"), "adminprofile_cancelstep"),
         )
         return
 
@@ -2446,10 +2558,11 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
         if pending["address_step"] == "text":
             pending["address_data"]["address"] = text
             pending["address_step"] = "phone"
+            profile = _get_client_profile(chat_id) or {}
             await update.message.reply_text(
                 "Тепер напишіть номер телефону для зв'язку по цій адресі "
                 "(наприклад: +380671234567):",
-                reply_markup=_profile_cancel_keyboard(),
+                reply_markup=_address_phone_keyboard(profile.get("phone"), "profile_cancelstep"),
             )
             return
 
@@ -4727,6 +4840,7 @@ def main():
     application.add_handler(CallbackQueryHandler(profile_editaddr_callback, pattern=r"^profile_editaddr:"))
     application.add_handler(CallbackQueryHandler(profile_cancelstep_callback, pattern=r"^profile_cancelstep$"))
     application.add_handler(CallbackQueryHandler(adminprofile_cancelstep_callback, pattern=r"^adminprofile_cancelstep$"))
+    application.add_handler(CallbackQueryHandler(addraddr_samephone_callback, pattern=r"^addraddr_samephone$"))
     application.add_handler(CallbackQueryHandler(adminprofile_edit_callback, pattern=r"^adminprofile_edit:"))
     application.add_handler(CallbackQueryHandler(adminprofile_editfield_callback, pattern=r"^adminprofile_editfield:"))
     application.add_handler(CallbackQueryHandler(adminprofile_zonefield_callback, pattern=r"^adminprofile_zonefield:"))
