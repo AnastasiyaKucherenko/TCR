@@ -178,6 +178,8 @@ def init_db():
         conn.execute("ALTER TABLE broadcasts ADD COLUMN file_id TEXT")
     if "created_by" not in bc_cols:
         conn.execute("ALTER TABLE broadcasts ADD COLUMN created_by INTEGER")
+    if "name" not in bc_cols:
+        conn.execute("ALTER TABLE broadcasts ADD COLUMN name TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -1119,6 +1121,7 @@ def _build_sendto_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup
         mark = "✅" if c["chat_id"] in selected else "⬜"
         label = f"{mark} {_client_display_label(c['chat_id'], c['name'], c['username'])}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"sendto_toggle:{c['chat_id']}")])
+    buttons.append([InlineKeyboardButton("➕ Додати ще людину (всі клієнти)", callback_data="sendto_showall")])
     buttons.append([
         InlineKeyboardButton("✅ Надіслати обраним", callback_data="sendto_done"),
         InlineKeyboardButton("❌ Скасувати", callback_data="sendto_cancel"),
@@ -1211,6 +1214,21 @@ async def sendto_toggle_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     clients = context.chat_data.get("sendto_clients", [])
     await query.edit_message_reply_markup(reply_markup=_build_sendto_keyboard(admin_id, clients))
+
+
+async def sendto_showall_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    conn = db()
+    rows = conn.execute(
+        "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 200"
+    ).fetchall()
+    conn.close()
+    context.chat_data["sendto_clients"] = [dict(r) for r in rows]
+    await query.edit_message_reply_markup(reply_markup=_build_sendto_keyboard(admin_id, context.chat_data["sendto_clients"]))
 
 
 async def sendto_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1380,6 +1398,19 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Умови доставки для категорії «{label}» оновлено! Клієнти одразу побачать нову версію.",
             reply_markup=_menu_back_keyboard(),
         )
+        return
+
+    if action == "bc_name":
+        MENU_PENDING.pop(admin_id, None)
+        pending = BC_PENDING.setdefault(admin_id, {})
+        pending["name"] = text.strip()
+        MENU_PENDING[admin_id] = {"action": "bc_text"}
+        if pending.get("is_question"):
+            await update.message.reply_text(
+                "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?») — або надішліть файл із підписом:"
+            )
+        else:
+            await update.message.reply_text("Напишіть текст повідомлення для цієї розсилки — або надішліть файл із підписом:")
         return
 
     if action == "qna_text":
@@ -1580,12 +1611,22 @@ async def client_assortment_category_callback(update: Update, context: ContextTy
     _, cat_key = query.data.split(":", 1)
     label = dict(ASSORTMENT_CATEGORIES).get(cat_key, cat_key)
     text = _get_setting(f"assortment_{cat_key}", "").strip()
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="clientassort_back")]])
     if not text:
         await query.edit_message_text(
-            f"{label}\n\nНаразі ще не додано 🙈 Скоро оновимо — зазирніть трохи пізніше!"
+            f"{label}\n\nНаразі ще не додано 🙈 Скоро оновимо — зазирніть трохи пізніше!",
+            reply_markup=back_kb,
         )
         return
-    await query.edit_message_text(f"{label}\n\n{text}")
+    await query.edit_message_text(f"{label}\n\n{text}", reply_markup=back_kb)
+
+
+async def client_assortment_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "☕ Оберіть категорію:", reply_markup=_assortment_category_keyboard("clientassort")
+    )
 
 
 async def client_show_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3695,6 +3736,7 @@ def _bc_select_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(
             f"{mark} {_client_display_label(c['chat_id'], c['name'], c['username'])}", callback_data=f"bc_toggle:{c['chat_id']}"
         )])
+    buttons.append([InlineKeyboardButton("➕ Додати ще людину (всі клієнти)", callback_data="bc_showall")])
     buttons.append([
         InlineKeyboardButton("⬅️ Назад", callback_data="bc_backtotarget"),
         InlineKeyboardButton("➡️ Далі", callback_data="bc_selectdone"),
@@ -3708,7 +3750,7 @@ def _bc_cancel_keyboard(admin_id: int, rows: list) -> InlineKeyboardMarkup:
     buttons = []
     for r in rows:
         mark = "✅" if r["id"] in selected else "⬜"
-        label = f"{mark} {'❓ ' if r['is_question'] else ''}{_bc_target_label(r['target_type'], r['target_value'])} — {_bc_timing_label(r)}"
+        label = f"{mark} {_bc_name_prefix(r)}{'❓ ' if r['is_question'] else ''}{_bc_target_label(r['target_type'], r['target_value'])} — {_bc_timing_label(r)}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"bc_canceltoggle:{r['id']}")])
     buttons.append([
         InlineKeyboardButton("🗑 Скасувати обрані", callback_data="bc_cancelconfirmall"),
@@ -3795,23 +3837,24 @@ async def _finalize_scheduled_broadcast(
         return
 
     conn = db()
+    bc_name = bc.get("name")
     if kind == "once":
         date_str = bc.get("date")
         run_at = datetime.combine(
             datetime.fromisoformat(date_str).date(), time(hour=hour, minute=minute), tzinfo=TZ
         )
         cur = conn.execute(
-            "INSERT INTO broadcasts (kind, target_type, target_value, message, run_at, is_question, file_id, created_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (kind, target_type, target_value, message_text, run_at.isoformat(), is_question, file_id, admin_id, datetime.now(TZ).isoformat()),
+            "INSERT INTO broadcasts (kind, target_type, target_value, message, run_at, is_question, file_id, created_by, name, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, target_type, target_value, message_text, run_at.isoformat(), is_question, file_id, admin_id, bc_name, datetime.now(TZ).isoformat()),
         )
     else:
         weekday = bc.get("weekday")
         hhmm = f"{hour:02d}:{minute:02d}"
         cur = conn.execute(
-            "INSERT INTO broadcasts (kind, target_type, target_value, message, weekday, hhmm, is_question, file_id, created_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (kind, target_type, target_value, message_text, weekday, hhmm, is_question, file_id, admin_id, datetime.now(TZ).isoformat()),
+            "INSERT INTO broadcasts (kind, target_type, target_value, message, weekday, hhmm, is_question, file_id, created_by, name, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, target_type, target_value, message_text, weekday, hhmm, is_question, file_id, admin_id, bc_name, datetime.now(TZ).isoformat()),
         )
     broadcast_id = cur.lastrowid
     conn.commit()
@@ -3822,8 +3865,10 @@ async def _finalize_scheduled_broadcast(
 
     kind_label = "Запитання так/ні" if is_question else "Розсилку"
     file_note = "\n📎 З прикріпленим файлом" if file_id else ""
+    name_line = f"Назва: {bc_name}\n" if bc_name else ""
     await update.message.reply_text(
         f"✅ {kind_label} заплановано!{file_note}\n\n"
+        f"{name_line}"
         f"Кому: {_bc_target_label(target_type, target_value)}\n"
         f"Коли: {_bc_timing_label(row)}\n"
         f"Текст: {message_text or '(без тексту)'}",
@@ -3942,6 +3987,16 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=_bc_select_keyboard(admin_id, clients))
         return
 
+    if data == "bc_showall":
+        conn = db()
+        rows = conn.execute(
+            "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 200"
+        ).fetchall()
+        conn.close()
+        context.chat_data["bc_clients"] = [dict(r) for r in rows]
+        await query.edit_message_reply_markup(reply_markup=_bc_select_keyboard(admin_id, context.chat_data["bc_clients"]))
+        return
+
     if data == "bc_selectdone":
         selected = BC_SELECTIONS.get(admin_id, set())
         if not selected:
@@ -3984,13 +4039,10 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, mm_str = data.split(":", 1)
         pending = BC_PENDING.setdefault(admin_id, {})
         pending["minute"] = int(mm_str)
-        MENU_PENDING[admin_id] = {"action": "bc_text"}
-        if pending.get("is_question"):
-            await query.edit_message_text(
-                "Напишіть текст запитання (наприклад: «Завтра доставка, потрібна?») — або надішліть файл із підписом:"
-            )
-        else:
-            await query.edit_message_text("Напишіть текст повідомлення для цієї розсилки — або надішліть файл із підписом:")
+        MENU_PENDING[admin_id] = {"action": "bc_name"}
+        await query.edit_message_text(
+            "Дайте цій розсилці коротку назву для себе (клієнти її не побачать, це лише для вашого списку):"
+        )
         return
 
     if data == "bc_cancellist":
@@ -4051,8 +4103,10 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "Ваші заплановані розсилки:\n\n"
         for r in rows:
             marker = "❓ Запитання так/ні" if r["is_question"] else "📌"
+            name_line = f"   Назва: {r['name']}\n" if r["name"] else ""
             text += (
                 f"{marker} Кому: {_bc_target_label(r['target_type'], r['target_value'])}\n"
+                f"{name_line}"
                 f"   Коли: {_bc_timing_label(r)}\n"
                 f"   Текст: {r['message']}\n\n"
             )
@@ -4379,6 +4433,14 @@ def _bc_job_name(broadcast_id: int) -> str:
     return f"bcast_{broadcast_id}"
 
 
+def _bc_name_prefix(row) -> str:
+    try:
+        name = row["name"]
+    except (KeyError, IndexError):
+        name = None
+    return f"🏷 {name} — " if name else ""
+
+
 def _bc_target_label(target_type: str, target_value: str) -> str:
     if target_type == "segment":
         return f"група «{target_value}»"
@@ -4668,9 +4730,11 @@ def main():
     application.add_handler(CallbackQueryHandler(adminmsgdel_callback, pattern=r"^adminmsgdel:"))
     application.add_handler(CallbackQueryHandler(adminprofile_editaddr_callback, pattern=r"^adminprofile_editaddr:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
+    application.add_handler(CallbackQueryHandler(client_assortment_back_callback, pattern=r"^clientassort_back$"))
     application.add_handler(CallbackQueryHandler(client_delivery_category_callback, pattern=r"^clientdelivery:"))
     application.add_handler(CallbackQueryHandler(client_delivery_back_callback, pattern=r"^clientdelivery_back$"))
     application.add_handler(CallbackQueryHandler(sendto_toggle_callback, pattern=r"^sendto_toggle:"))
+    application.add_handler(CallbackQueryHandler(sendto_showall_callback, pattern=r"^sendto_showall$"))
     application.add_handler(CallbackQueryHandler(sendto_done_callback, pattern=r"^sendto_done$"))
     application.add_handler(CallbackQueryHandler(sendto_cancel_callback, pattern=r"^sendto_cancel$"))
     application.add_handler(CallbackQueryHandler(assign_callback, pattern=r"^assign:"))
