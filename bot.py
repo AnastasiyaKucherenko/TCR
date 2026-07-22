@@ -830,7 +830,7 @@ async def clients_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_clients_text(admin_id=update.effective_chat.id))
 
 
-def _clients_with_admin_text() -> str:
+def _clients_with_admin_text(max_len: int = 3500) -> str:
     conn = db()
     rows = conn.execute(
         "SELECT s.chat_id, s.name, s.username, s.segment, a.name as admin_name "
@@ -840,29 +840,39 @@ def _clients_with_admin_text() -> str:
     conn.close()
     if not rows:
         return "Поки немає активних підписників."
-    text = f"Клієнти та їхні відповідальні ({len(rows)}):\n\n"
-    for r in rows[:80]:
-        admin_label = r["admin_name"] if r["admin_name"] else "❓ не призначено"
-        display = _client_display_label(r["chat_id"], r["name"], r["username"])
-        text += (
-            f"• {display} — chat_id: {r['chat_id']}\n"
-            f"   Група: {r['segment'] or 'немає'} | Відповідальний: {admin_label}\n"
-        )
-    if len(rows) > 80:
-        text += f"\n...і ще {len(rows) - 80}"
-    text += (
+    header = f"Клієнти та їхні відповідальні ({len(rows)}):\n\n"
+    footer = (
         "\n\nШвидко призначити відповідального відразу кільком клієнтам:\n"
         "/bulkresp @юзернейм_адміна id1,id2,id3\n"
         "або одразу всій групі:\n"
         "/bulkresp @юзернейм_адміна segment:назва_групи"
     )
-    return text
+    body = ""
+    shown = 0
+    for r in rows:
+        admin_label = r["admin_name"] if r["admin_name"] else "❓ не призначено"
+        display = _client_display_label(r["chat_id"], r["name"], r["username"])
+        line = (
+            f"• {display} — chat_id: {r['chat_id']}\n"
+            f"   Група: {r['segment'] or 'немає'} | Відповідальний: {admin_label}\n"
+        )
+        if len(header) + len(body) + len(line) + len(footer) > max_len:
+            break
+        body += line
+        shown += 1
+    if shown < len(rows):
+        body += f"\n...і ще {len(rows) - shown} (список задовгий для одного повідомлення — скасуйте фільтр чи зверніться до /clients для скороченого перегляду)."
+    return header + body + footer
 
 
 async def resplist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
-    await update.message.reply_text(_clients_with_admin_text())
+    try:
+        await update.message.reply_text(_clients_with_admin_text())
+    except Exception as e:
+        logger.warning(f"Не вдалось показати список клієнтів: {e}")
+        await update.message.reply_text("Не вдалось завантажити список (тимчасова помилка). Спробуйте ще раз.")
 
 
 async def bulkresp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3656,7 +3666,14 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_resplist":
-        await query.edit_message_text(_clients_with_admin_text(), reply_markup=_menu_back_keyboard())
+        try:
+            await query.edit_message_text(_clients_with_admin_text(), reply_markup=_menu_back_keyboard())
+        except Exception as e:
+            logger.warning(f"Не вдалось показати список клієнтів: {e}")
+            await query.edit_message_text(
+                "Не вдалось завантажити список (тимчасова помилка). Спробуйте ще раз або команду /resplist.",
+                reply_markup=_menu_back_keyboard(),
+            )
         return
 
     if data.startswith("menu_pickclientresp:"):
