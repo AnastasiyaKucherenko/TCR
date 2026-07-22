@@ -89,6 +89,15 @@ ADMIN_EDIT_PROFILE_PENDING: dict[int, dict] = {}
 # Стан, коли адмін додає адресу конкретному клієнту: admin_chat_id -> target_chat_id клієнта
 ADMIN_ADD_ADDRESS_PENDING: dict[int, dict] = {}
 
+# Стан майстра заповнення картки НОВОГО клієнта одразу після підписки: admin_chat_id -> {дані...}
+ADMIN_NEW_PROFILE_PENDING: dict[int, dict] = {}
+
+# Стан редагування адміном конкретного повідомлення в історії листування: admin_chat_id -> {дані...}
+ADMIN_MSGEDIT_PENDING: dict[int, dict] = {}
+
+# Вибір кількох запланованих розсилок для одночасного скасування: admin_chat_id -> set(broadcast_id)
+BC_CANCEL_SELECTIONS: dict[int, set[int]] = {}
+
 WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 BC_MINUTES = [0, 15, 30, 45]
@@ -218,6 +227,16 @@ def init_db():
             created_at TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            direction TEXT NOT NULL,
+            text TEXT,
+            telegram_message_id INTEGER,
+            created_at TEXT
+        )
+    """)
     # Міграція: переносимо старий (єдиний) розклад із таблиці segments у нову
     # таблицю schedules, щоб не втратити те, що вже було задано раніше.
     old_rows = conn.execute(
@@ -264,6 +283,25 @@ def _admin_link_button(admin_chat_id: int, label: str) -> InlineKeyboardButton |
     if row and row["username"]:
         return InlineKeyboardButton(label, url=f"https://t.me/{row['username']}")
     return None
+
+
+def _log_message(chat_id: int, direction: str, text: str, telegram_message_id: int | None) -> None:
+    conn = db()
+    conn.execute(
+        "INSERT INTO message_log (chat_id, direction, text, telegram_message_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, direction, text, telegram_message_id, datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _get_message_log(chat_id: int, limit: int = 15) -> list:
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM message_log WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in reversed(rows)]
 
 
 async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
@@ -425,14 +463,23 @@ async def respme_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not segments:
         await query.edit_message_text(f"✅ {name} — відповідальний за цього клієнта.")
-        return
-    buttons = [
-        [InlineKeyboardButton(seg, callback_data=f"assign:{chat_id}:{seg}")] for seg in segments
-    ]
-    buttons.append([InlineKeyboardButton("Без групи", callback_data=f"assign:{chat_id}:__none__")])
-    await query.edit_message_text(
-        f"✅ {name} — відповідальний за цього клієнта.\n\nТепер оберіть групу:",
-        reply_markup=InlineKeyboardMarkup(buttons),
+    else:
+        buttons = [
+            [InlineKeyboardButton(seg, callback_data=f"assign:{chat_id}:{seg}")] for seg in segments
+        ]
+        buttons.append([InlineKeyboardButton("Без групи", callback_data=f"assign:{chat_id}:__none__")])
+        await query.edit_message_text(
+            f"✅ {name} — відповідальний за цього клієнта.\n\nТепер оберіть групу:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    await context.bot.send_message(
+        admin_id,
+        "Бажаєте одразу заповнити картку цього клієнта (ім'я, точка, телефон, адреса тощо)?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Так, заповнити", callback_data=f"adminprofile_newwizard:{chat_id}")],
+            [InlineKeyboardButton("⏭ Ні, пізніше", callback_data="adminprofile_newskip")],
+        ]),
     )
 
 
@@ -919,6 +966,7 @@ async def forward_client_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not target_admin:
         return
     text = update.message.text or ""
+    _log_message(chat.id, "in", text, update.message.message_id)
     try:
         sent = await context.bot.send_message(
             target_admin,
@@ -1221,13 +1269,22 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_admin_edit_profile_text_step(update, context)
         return
 
+    if admin_id in ADMIN_NEW_PROFILE_PENDING:
+        await handle_admin_new_profile_text_step(update, context)
+        return
+
+    if admin_id in ADMIN_MSGEDIT_PENDING:
+        await handle_admin_msgedit_text(update, context)
+        return
+
     # 0) Якщо адмін відповідає (Reply) на переслане повідомлення клієнта — надсилаємо відповідь клієнту
     if update.message.reply_to_message:
         key = (admin_id, update.message.reply_to_message.message_id)
         if key in FORWARD_MAP:
             client_chat_id = FORWARD_MAP.pop(key)
             try:
-                await context.bot.send_message(client_chat_id, update.message.text)
+                sent = await context.bot.send_message(client_chat_id, update.message.text)
+                _log_message(client_chat_id, "out", update.message.text, sent.message_id)
                 await update.message.reply_text("✅ Надіслано клієнту.")
             except Exception as e:
                 await update.message.reply_text(f"Не вдалось надіслати клієнту: {e}")
@@ -1828,6 +1885,8 @@ async def adminprofile_cancelstep_callback(update: Update, context: ContextTypes
     admin_id = update.effective_chat.id
     ADMIN_EDIT_PROFILE_PENDING.pop(admin_id, None)
     ADMIN_ADD_ADDRESS_PENDING.pop(admin_id, None)
+    ADMIN_NEW_PROFILE_PENDING.pop(admin_id, None)
+    ADMIN_MSGEDIT_PENDING.pop(admin_id, None)
     await query.edit_message_text("Скасовано.", reply_markup=_menu_back_keyboard())
 
 
@@ -1963,6 +2022,7 @@ def _adminprofile_manage_keyboard(target_chat_id: int, addresses: list) -> Inlin
     buttons = [
         [InlineKeyboardButton("✏️ Редагувати дані", callback_data=f"adminprofile_edit:{target_chat_id}")],
         [InlineKeyboardButton("➕ Додати адресу", callback_data=f"adminprofile_addaddr:{target_chat_id}")],
+        [InlineKeyboardButton("💬 Історія повідомлень", callback_data=f"adminmsglog:{target_chat_id}")],
     ]
     for a in addresses:
         buttons.append([
@@ -1989,6 +2049,224 @@ async def adminprofile_deladdr_callback(update: Update, context: ContextTypes.DE
     addresses = _get_client_addresses(target_chat_id)
     text = "✅ Адресу видалено.\n\n" + (_profile_summary_text(profile, addresses, for_admin=True) if profile else "(картка ще не заповнена)")
     await query.edit_message_text(text, reply_markup=_adminprofile_manage_keyboard(target_chat_id, addresses))
+
+
+async def adminprofile_newwizard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін погодився одразу заповнити картку нового клієнта — починаємо покроковий майстер."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    _, target_chat_id_str = query.data.split(":", 1)
+    target_chat_id = int(target_chat_id_str)
+    ADMIN_NEW_PROFILE_PENDING[admin_id] = {"target_chat_id": target_chat_id, "step_idx": 0, "data": {}}
+    await query.edit_message_text(
+        "Заповнимо картку клієнта. Спочатку — оберіть зону доставки:",
+        reply_markup=_delivery_zone_keyboard("adminprofile_newzone"),
+    )
+
+
+async def adminprofile_newzone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    pending = ADMIN_NEW_PROFILE_PENDING.get(admin_id)
+    if not pending:
+        await query.edit_message_text("Цю картку вже неактуально заповнювати.")
+        return
+    _, zone = query.data.split(":", 1)
+    pending["data"]["delivery_zone"] = zone
+    await query.edit_message_text(
+        f"Зона доставки: {zone}\n\n" + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
+        reply_markup=_adminprofile_cancel_keyboard(),
+    )
+
+
+async def adminprofile_newskip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    await query.edit_message_text("Гаразд, картку можна буде заповнити пізніше через меню «👥 Клієнти».")
+
+
+async def handle_admin_new_profile_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_chat.id
+    pending = ADMIN_NEW_PROFILE_PENDING.get(admin_id)
+    if not pending:
+        return
+    target_chat_id = pending["target_chat_id"]
+    text = update.message.text or ""
+
+    if pending.get("awaiting_address"):
+        if pending.get("address_step") == "text":
+            pending["address_data"] = {"address": text}
+            pending["address_step"] = "phone"
+            await update.message.reply_text(
+                "Тепер напишіть номер телефону для зв'язку по цій адресі:",
+                reply_markup=_adminprofile_cancel_keyboard(),
+            )
+            return
+        if not _is_valid_phone(text):
+            await update.message.reply_text(
+                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+            )
+            return
+        phone = _normalize_phone(text)
+        address_text = pending["address_data"]["address"]
+        ADMIN_NEW_PROFILE_PENDING.pop(admin_id, None)
+        conn = db()
+        conn.execute(
+            "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
+            (target_chat_id, address_text, phone, datetime.now(TZ).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        profile = _get_client_profile(target_chat_id)
+        addresses = _get_client_addresses(target_chat_id)
+        await update.message.reply_text(
+            "✅ Картку клієнта заповнено!\n\n" + _profile_summary_text(profile, addresses, for_admin=True),
+            reply_markup=_adminprofile_manage_keyboard(target_chat_id, addresses),
+        )
+        return
+
+    step_idx = pending["step_idx"]
+    field = PROFILE_STEPS[step_idx]
+
+    if field == "phone":
+        if not _is_valid_phone(text):
+            await update.message.reply_text(
+                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+            )
+            return
+        text = _normalize_phone(text)
+
+    pending["data"][field] = text
+
+    if step_idx + 1 < len(PROFILE_STEPS):
+        pending["step_idx"] += 1
+        await update.message.reply_text(
+            PROFILE_STEP_PROMPTS[PROFILE_STEPS[pending["step_idx"]]],
+            reply_markup=_adminprofile_cancel_keyboard(),
+        )
+        return
+
+    data = pending["data"]
+    conn = db()
+    conn.execute(
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, ipn, delivery_zone, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
+        "phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, delivery_zone=excluded.delivery_zone, "
+        "updated_at=excluded.updated_at",
+        (target_chat_id, data["full_name"], data["point_name"], data["phone"], data["fop"],
+         data["ipn"], data.get("delivery_zone"), datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    pending["awaiting_address"] = True
+    pending["address_step"] = "text"
+    await update.message.reply_text(
+        "✅ Основні дані збережено! Залишилось додати хоча б одну адресу доставки.\n\nНапишіть адресу:",
+        reply_markup=_adminprofile_cancel_keyboard(),
+    )
+
+
+def _message_log_screen(target_chat_id: int):
+    logs = _get_message_log(target_chat_id, limit=15)
+    if not logs:
+        return (
+            "Повідомлень із цим клієнтом ще немає (в історії тільки те, що пройшло через переписку з менеджером).",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=f"menu_pickclientprofile:{target_chat_id}")]]),
+        )
+    lines = ["💬 Останні повідомлення з клієнтом:\n"]
+    buttons = []
+    for log in logs:
+        icon = "📩" if log["direction"] == "in" else "📤"
+        preview = (log["text"] or "")[:70]
+        lines.append(f"{icon} {preview}")
+        if log["direction"] == "out" and log.get("telegram_message_id"):
+            buttons.append([
+                InlineKeyboardButton(f"✏️ Редагувати #{log['id']}", callback_data=f"adminmsgedit:{target_chat_id}:{log['id']}"),
+                InlineKeyboardButton(f"🗑 #{log['id']}", callback_data=f"adminmsgdel:{target_chat_id}:{log['id']}"),
+            ])
+    lines.append("\n(📩 — від клієнта, редагувати/видаляти не можна; 📤 — ваші повідомлення)")
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data=f"menu_pickclientprofile:{target_chat_id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def adminmsglog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    _, target_chat_id_str = query.data.split(":", 1)
+    target_chat_id = int(target_chat_id_str)
+    text, kb = _message_log_screen(target_chat_id)
+    await query.edit_message_text(text, reply_markup=kb)
+
+
+async def adminmsgedit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    _, target_chat_id_str, log_id_str = query.data.split(":", 2)
+    target_chat_id, log_id = int(target_chat_id_str), int(log_id_str)
+    ADMIN_MSGEDIT_PENDING[admin_id] = {"target_chat_id": target_chat_id, "log_id": log_id}
+    await query.edit_message_text(
+        "Напишіть новий текст цього повідомлення (замінить попередній у клієнта):",
+        reply_markup=_adminprofile_cancel_keyboard(),
+    )
+
+
+async def adminmsgdel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    _, target_chat_id_str, log_id_str = query.data.split(":", 2)
+    target_chat_id, log_id = int(target_chat_id_str), int(log_id_str)
+    conn = db()
+    row = conn.execute("SELECT * FROM message_log WHERE id=? AND chat_id=?", (log_id, target_chat_id)).fetchone()
+    if row and row["telegram_message_id"]:
+        try:
+            await context.bot.delete_message(target_chat_id, row["telegram_message_id"])
+        except Exception as e:
+            logger.warning(f"Не вдалось видалити повідомлення в Telegram: {e}")
+    conn.execute("DELETE FROM message_log WHERE id=?", (log_id,))
+    conn.commit()
+    conn.close()
+    text, kb = _message_log_screen(target_chat_id)
+    await query.edit_message_text(text, reply_markup=kb)
+
+
+async def handle_admin_msgedit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_chat.id
+    pending = ADMIN_MSGEDIT_PENDING.pop(admin_id, None)
+    if not pending:
+        return
+    target_chat_id = pending["target_chat_id"]
+    log_id = pending["log_id"]
+    new_text = update.message.text or ""
+    conn = db()
+    row = conn.execute("SELECT * FROM message_log WHERE id=? AND chat_id=?", (log_id, target_chat_id)).fetchone()
+    if not row or not row["telegram_message_id"]:
+        conn.close()
+        await update.message.reply_text("Це повідомлення вже недоступне для редагування.")
+        return
+    try:
+        await context.bot.edit_message_text(chat_id=target_chat_id, message_id=row["telegram_message_id"], text=new_text)
+        conn.execute("UPDATE message_log SET text=? WHERE id=?", (new_text, log_id))
+        conn.commit()
+        await update.message.reply_text("✅ Повідомлення клієнту оновлено.")
+    except Exception as e:
+        await update.message.reply_text(f"Не вдалось відредагувати повідомлення: {e}")
+    conn.close()
 
 
 async def handle_admin_add_address_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3425,6 +3703,20 @@ def _bc_select_keyboard(admin_id: int, clients: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def _bc_cancel_keyboard(admin_id: int, rows: list) -> InlineKeyboardMarkup:
+    selected = BC_CANCEL_SELECTIONS.get(admin_id, set())
+    buttons = []
+    for r in rows:
+        mark = "✅" if r["id"] in selected else "⬜"
+        label = f"{mark} {'❓ ' if r['is_question'] else ''}{_bc_target_label(r['target_type'], r['target_value'])} — {_bc_timing_label(r)}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"bc_canceltoggle:{r['id']}")])
+    buttons.append([
+        InlineKeyboardButton("🗑 Скасувати обрані", callback_data="bc_cancelconfirmall"),
+    ])
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def _bc_timing_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📆 Одноразово, конкретна дата", callback_data="bc_timing_once")],
@@ -3710,57 +4002,41 @@ async def bc_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await query.edit_message_text("У вас немає активних запланованих розсилок.", reply_markup=_menu_back_keyboard())
             return
-        buttons = [
-            [InlineKeyboardButton(
-                f"{'❓ ' if r['is_question'] else ''}{_bc_target_label(r['target_type'], r['target_value'])} — {_bc_timing_label(r)}",
-                callback_data=f"bc_cancelpick:{r['id']}",
-            )]
-            for r in rows
-        ]
-        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        BC_CANCEL_SELECTIONS[admin_id] = set()
+        context.chat_data["bc_cancel_rows"] = [dict(r) for r in rows]
         await query.edit_message_text(
-            "Оберіть, яку розсилку скасувати:", reply_markup=InlineKeyboardMarkup(buttons)
+            "Оберіть, які розсилки скасувати (тапніть, щоб позначити одну чи кілька):",
+            reply_markup=_bc_cancel_keyboard(admin_id, context.chat_data["bc_cancel_rows"]),
         )
         return
 
-    if data.startswith("bc_cancelpick:"):
+    if data.startswith("bc_canceltoggle:"):
         _, bid_str = data.split(":", 1)
         bid = int(bid_str)
-        conn = db()
-        row = conn.execute("SELECT * FROM broadcasts WHERE id=? AND created_by=?", (bid, admin_id)).fetchone()
-        conn.close()
-        if not row:
-            await query.edit_message_text("Цю розсилку вже не знайдено.", reply_markup=_menu_back_keyboard())
-            return
-        preview = row["message"][:80] + ("..." if len(row["message"]) > 80 else "")
-        buttons = [
-            [InlineKeyboardButton("✅ Так, скасувати", callback_data=f"bc_cancelconfirm:{bid}")],
-            [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
-        ]
-        await query.edit_message_text(
-            f"Скасувати цю розсилку?\n\n"
-            f"Кому: {_bc_target_label(row['target_type'], row['target_value'])}\n"
-            f"Коли: {_bc_timing_label(row)}\n"
-            f"Текст: {preview}",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        selected = BC_CANCEL_SELECTIONS.setdefault(admin_id, set())
+        selected.discard(bid) if bid in selected else selected.add(bid)
+        rows = context.chat_data.get("bc_cancel_rows", [])
+        await query.edit_message_reply_markup(reply_markup=_bc_cancel_keyboard(admin_id, rows))
         return
 
-    if data.startswith("bc_cancelconfirm:"):
-        _, bid_str = data.split(":", 1)
-        bid = int(bid_str)
-        conn = db()
-        row = conn.execute("SELECT id FROM broadcasts WHERE id=? AND created_by=?", (bid, admin_id)).fetchone()
-        if not row:
-            conn.close()
-            await query.edit_message_text("Цю розсилку вже не знайдено.", reply_markup=_menu_back_keyboard())
+    if data == "bc_cancelconfirmall":
+        selected = BC_CANCEL_SELECTIONS.get(admin_id, set())
+        if not selected:
+            await query.answer("Оберіть хоча б одну розсилку.", show_alert=True)
             return
-        conn.execute("UPDATE broadcasts SET active=0 WHERE id=?", (bid,))
+        conn = db()
+        count = 0
+        for bid in selected:
+            row = conn.execute("SELECT id FROM broadcasts WHERE id=? AND created_by=?", (bid, admin_id)).fetchone()
+            if row:
+                conn.execute("UPDATE broadcasts SET active=0 WHERE id=?", (bid,))
+                count += 1
+                for job in context.application.job_queue.get_jobs_by_name(_bc_job_name(bid)):
+                    job.schedule_removal()
         conn.commit()
         conn.close()
-        for job in context.application.job_queue.get_jobs_by_name(_bc_job_name(bid)):
-            job.schedule_removal()
-        await query.edit_message_text("✅ Розсилку скасовано.", reply_markup=_menu_back_keyboard())
+        BC_CANCEL_SELECTIONS.pop(admin_id, None)
+        await query.edit_message_text(f"✅ Скасовано розсилок: {count}.", reply_markup=_menu_back_keyboard())
         return
 
     if data == "bc_viewlist":
@@ -4184,14 +4460,19 @@ async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Не вдалось надіслати {r['chat_id']}: {e}")
             failed += 1
 
-    if ADMIN_IDS:
+    created_by = row["created_by"] if "created_by" in row.keys() else None
+    notify_target = created_by or (ADMIN_IDS[0] if ADMIN_IDS else None)
+    if notify_target:
         label = "запитання" if is_question else "розсилка"
-        await notify_admins(
-            context,
-            f"✅ Запланован{'е' if is_question else 'а'} {label} "
-            f"({_bc_target_label(row['target_type'], row['target_value'])}) "
-            f"виконан{'о' if is_question else 'а'}. Надіслано: {sent}, помилок: {failed}.",
-        )
+        try:
+            await context.bot.send_message(
+                notify_target,
+                f"✅ Запланован{'е' if is_question else 'а'} {label} "
+                f"({_bc_target_label(row['target_type'], row['target_value'])}) "
+                f"виконан{'о' if is_question else 'а'}. Надіслано: {sent}, помилок: {failed}.",
+            )
+        except Exception as e:
+            logger.warning(f"Не вдалось надіслати підсумок розсилки адміну {notify_target}: {e}")
 
 
 def schedule_broadcast_job(application: Application, row) -> None:
@@ -4312,7 +4593,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/sendto — обрати конкретних людей зі списку (кнопками) і надіслати їм окреме повідомлення\n"
         "/menu — відкрити меню з кнопками українською (усі дії без потреби набирати команди)\n"
         "\nУ меню також доступні: призначення відповідального адміна клієнту, "
-        "запитання «так/ні» з персональним посиланням на відповідального, планування розсилок на дату/день.\n"
+        "запитання «так/ні» з персональним посиланням на відповідального, планування розсилок на дату/день, "
+        "заповнення картки нового клієнта одразу після підписки, перегляд/редагування/видалення своїх "
+        "повідомлень в історії листування з клієнтом (кнопка «💬 Історія повідомлень» у картці клієнта), "
+        "та скасування одразу кількох запланованих розсилок.\n"
     )
 
 
@@ -4376,6 +4660,12 @@ def main():
     application.add_handler(CallbackQueryHandler(adminprofile_zonefield_callback, pattern=r"^adminprofile_zonefield:"))
     application.add_handler(CallbackQueryHandler(adminprofile_addaddr_callback, pattern=r"^adminprofile_addaddr:"))
     application.add_handler(CallbackQueryHandler(adminprofile_deladdr_callback, pattern=r"^adminprofile_deladdr:"))
+    application.add_handler(CallbackQueryHandler(adminprofile_newwizard_callback, pattern=r"^adminprofile_newwizard:"))
+    application.add_handler(CallbackQueryHandler(adminprofile_newzone_callback, pattern=r"^adminprofile_newzone:"))
+    application.add_handler(CallbackQueryHandler(adminprofile_newskip_callback, pattern=r"^adminprofile_newskip$"))
+    application.add_handler(CallbackQueryHandler(adminmsglog_callback, pattern=r"^adminmsglog:"))
+    application.add_handler(CallbackQueryHandler(adminmsgedit_callback, pattern=r"^adminmsgedit:"))
+    application.add_handler(CallbackQueryHandler(adminmsgdel_callback, pattern=r"^adminmsgdel:"))
     application.add_handler(CallbackQueryHandler(adminprofile_editaddr_callback, pattern=r"^adminprofile_editaddr:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(client_delivery_category_callback, pattern=r"^clientdelivery:"))
