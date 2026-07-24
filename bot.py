@@ -4903,7 +4903,7 @@ def main():
     application.add_handler(CommandHandler("setsegment", setsegment))
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(
-        MessageHandler(filters.Document.ALL, handle_admin_document)
+        MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_admin_document)
     )
     application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CommandHandler("diagorders", diag_orders))
@@ -4958,7 +4958,7 @@ def main():
     application.add_handler(CallbackQueryHandler(qna_router, pattern=r"^qna_"))
     application.add_handler(CallbackQueryHandler(wg_router, pattern=r"^wg_"))
     application.add_handler(CallbackQueryHandler(order_router, pattern=r"^order_"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_text))
 
     logger.info("Бот запущено")
     application.run_polling()
