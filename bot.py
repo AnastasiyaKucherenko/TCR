@@ -1707,10 +1707,19 @@ def _get_client_profile(chat_id: int):
 
 
 DELIVERY_ZONE_OPTIONS = ["Київ лівий берег", "Київ правий берег", "Самовивіз", "НП (Нова Пошта)"]
+DELIVERY_ZONE_CODES = ["left", "right", "pickup", "np"]
+
+
+def _zone_from_code(code: str) -> str:
+    mapping = dict(zip(DELIVERY_ZONE_CODES, DELIVERY_ZONE_OPTIONS))
+    return mapping.get(code, code)
 
 
 def _delivery_zone_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton(z, callback_data=f"{callback_prefix}:{z}")] for z in DELIVERY_ZONE_OPTIONS]
+    buttons = [
+        [InlineKeyboardButton(z, callback_data=f"{callback_prefix}:{code}")]
+        for z, code in zip(DELIVERY_ZONE_OPTIONS, DELIVERY_ZONE_CODES)
+    ]
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1878,7 +1887,8 @@ async def profile_zonefield_callback(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
-    _, zone = query.data.split(":", 1)
+    _, zone_code = query.data.split(":", 1)
+    zone = _zone_from_code(zone_code)
     PROFILE_PENDING.pop(chat_id, None)
     conn = db()
     conn.execute(
@@ -1900,7 +1910,8 @@ async def profile_zone_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
-    _, zone = query.data.split(":", 1)
+    _, zone_code = query.data.split(":", 1)
+    zone = _zone_from_code(zone_code)
     pending = PROFILE_PENDING.setdefault(chat_id, {"data": {}})
     pending["data"]["delivery_zone"] = zone
     pending.pop("awaiting_zone", None)
@@ -2134,7 +2145,8 @@ async def adminprofile_zonefield_callback(update: Update, context: ContextTypes.
     if not is_admin(update):
         return
     admin_id = update.effective_chat.id
-    _, target_chat_id_str, zone = query.data.split(":", 2)
+    _, target_chat_id_str, zone_code = query.data.split(":", 2)
+    zone = _zone_from_code(zone_code)
     target_chat_id = int(target_chat_id_str)
     ADMIN_EDIT_PROFILE_PENDING.pop(admin_id, None)
     conn = db()
@@ -2246,7 +2258,8 @@ async def adminprofile_newzone_callback(update: Update, context: ContextTypes.DE
     if not pending:
         await query.edit_message_text("Цю картку вже неактуально заповнювати.")
         return
-    _, zone = query.data.split(":", 1)
+    _, zone_code = query.data.split(":", 1)
+    zone = _zone_from_code(zone_code)
     pending["data"]["delivery_zone"] = zone
     await query.edit_message_text(
         f"Зона доставки: {zone}\n\n" + PROFILE_STEP_PROMPTS[PROFILE_STEPS[0]],
