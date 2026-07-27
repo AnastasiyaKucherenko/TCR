@@ -4931,6 +4931,7 @@ async def clearordersgroup_command(update: Update, context: ContextTypes.DEFAULT
 
 def _group_order_buttons(message_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Прийняти", callback_data=f"grouporder_accept:{message_id}"),
         InlineKeyboardButton("✏️ Редагувати", callback_data=f"grouporder_edit:{message_id}"),
         InlineKeyboardButton("🗑 Видалити", callback_data=f"grouporder_del:{message_id}"),
     ]])
@@ -4941,6 +4942,32 @@ def _group_order_confirm_del_buttons(message_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("✅ Так, видалити для всіх", callback_data=f"grouporder_delconfirm:{message_id}"),
         InlineKeyboardButton("❌ Скасувати", callback_data=f"grouporder_delcancel:{message_id}"),
     ]])
+
+
+async def grouporder_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        await query.answer("Тільки адміністратор може приймати замовлення.", show_alert=True)
+        return
+    await query.answer("Прийнято!")
+    _, msg_id_str = query.data.split(":", 1)
+    message_id = int(msg_id_str)
+    group_chat_id = update.effective_chat.id
+    current_text = GROUP_ORDER_TEXT.get((group_chat_id, message_id), query.message.text or "")
+    accepted_note = f"\n\n✅ <b>Прийнято:</b> {_esc(user.full_name)}"
+    new_text = current_text + accepted_note
+    try:
+        await context.bot.edit_message_text(
+            chat_id=group_chat_id,
+            message_id=message_id,
+            text=new_text,
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+        GROUP_ORDER_TEXT[(group_chat_id, message_id)] = new_text
+    except Exception as e:
+        logger.warning(f"Не вдалось позначити замовлення прийнятим: {e}")
 
 
 async def grouporder_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5199,6 +5226,7 @@ def main():
     application.add_handler(CallbackQueryHandler(adminmsgedit_callback, pattern=r"^adminmsgedit:"))
     application.add_handler(CallbackQueryHandler(adminmsgdel_callback, pattern=r"^adminmsgdel:"))
     application.add_handler(CallbackQueryHandler(grouporder_edit_callback, pattern=r"^grouporder_edit:"))
+    application.add_handler(CallbackQueryHandler(grouporder_accept_callback, pattern=r"^grouporder_accept:"))
     application.add_handler(CallbackQueryHandler(grouporder_del_callback, pattern=r"^grouporder_del:"))
     application.add_handler(CallbackQueryHandler(grouporder_delconfirm_callback, pattern=r"^grouporder_delconfirm:"))
     application.add_handler(CallbackQueryHandler(grouporder_delcancel_callback, pattern=r"^grouporder_delcancel:"))
