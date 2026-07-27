@@ -335,15 +335,29 @@ async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str, reply_mar
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
+
+    referred_admin_id = None
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("admin_"):
+            try:
+                candidate = int(arg[len("admin_"):])
+                if candidate in ADMIN_IDS:
+                    referred_admin_id = candidate
+            except ValueError:
+                pass
+
     conn = db()
+    existing = conn.execute("SELECT chat_id FROM subscribers WHERE chat_id=?", (chat.id,)).fetchone()
     conn.execute(
-        """INSERT INTO subscribers (chat_id, name, username, segment, active, joined_at)
-           VALUES (?, ?, ?, NULL, 1, ?)
+        """INSERT INTO subscribers (chat_id, name, username, segment, active, joined_at, responsible_admin)
+           VALUES (?, ?, ?, NULL, 1, ?, ?)
            ON CONFLICT(chat_id) DO UPDATE SET active=1""",
-        (chat.id, user.full_name, user.username or "", datetime.now(TZ).isoformat()),
+        (chat.id, user.full_name, user.username or "", datetime.now(TZ).isoformat(), referred_admin_id),
     )
     conn.commit()
     conn.close()
+    is_new = existing is None
 
     welcome_msg = await update.message.reply_text(
         "Привіт! Дякуємо, що підписались на новини нашої ростерії 🫶\n"
@@ -356,6 +370,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.pin_chat_message(chat.id, welcome_msg.message_id, disable_notification=True)
     except Exception as e:
         logger.warning(f"Не вдалось закріпити привітальне повідомлення клієнту {chat.id}: {e}")
+
+    if not is_new:
+        return  # повторний /start від вже відомого клієнта - нових сповіщень адмінам не треба
+
+    if referred_admin_id:
+        conn = db()
+        segments = [r["name"] for r in conn.execute("SELECT name FROM segments")]
+        conn.close()
+        text = (
+            f"🆕 За вашим персональним запрошенням приєднався: {user.full_name} "
+            f"(@{user.username or '—'})\nchat_id: {chat.id}\n\nВи автоматично призначені відповідальним."
+        )
+        try:
+            if segments:
+                buttons = [[InlineKeyboardButton(seg, callback_data=f"assign:{chat.id}:{seg}")] for seg in segments]
+                buttons.append([InlineKeyboardButton("Без групи", callback_data=f"assign:{chat.id}:__none__")])
+                await context.bot.send_message(
+                    referred_admin_id, text + "\n\nОберіть групу для клієнта:",
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+            else:
+                await context.bot.send_message(referred_admin_id, text)
+            await context.bot.send_message(
+                referred_admin_id,
+                "Бажаєте одразу заповнити картку цього клієнта?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📝 Так, заповнити", callback_data=f"adminprofile_newwizard:{chat.id}")],
+                    [InlineKeyboardButton("⏭ Ні, пізніше", callback_data="adminprofile_newskip")],
+                ]),
+            )
+        except Exception as e:
+            logger.warning(f"Не вдалось надіслати запрошувачу {referred_admin_id}: {e}")
+        return
 
     admins_avail = _admins_with_username()
     if len(admins_avail) == 1:
@@ -1545,6 +1592,7 @@ def _menu_scheduled_keyboard() -> InlineKeyboardMarkup:
 
 def _menu_clients_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Запросити клієнта", callback_data="menu_invitelink")],
         [
             InlineKeyboardButton("👥 Змінити групу", callback_data="menu_changeseg"),
             InlineKeyboardButton("🙋 Відповідальний", callback_data="menu_setresp"),
@@ -3091,6 +3139,28 @@ def _pending_orders_text() -> str:
     return text
 
 
+async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    try:
+        me = await context.bot.get_me()
+        username = me.username
+    except Exception as e:
+        logger.warning(f"Не вдалось отримати юзернейм бота: {e}")
+        username = None
+    if not username:
+        await update.message.reply_text("Не вдалось отримати посилання, спробуйте ще раз трохи пізніше.")
+        return
+    link = f"https://t.me/{username}?start=admin_{admin_id}"
+    await update.message.reply_text(
+        f"Ваше персональне посилання-запрошення:\n\n{link}\n\n"
+        "Надішліть його клієнту. Щойно людина натисне на нього і запустить бота — "
+        "вона одразу з'явиться у вашому списку клієнтів, і ви автоматично будете "
+        "призначені відповідальним (без додаткових кроків)."
+    )
+
+
 async def pending_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показує адміну всі замовлення, що зараз очікують підтвердження клієнтом (ще не натиснули «Підтвердити»)."""
     if not is_admin(update):
@@ -3633,6 +3703,29 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_pendingorders":
         await query.edit_message_text(_pending_orders_text(), reply_markup=_menu_back_keyboard())
+        return
+
+    if data == "menu_invitelink":
+        try:
+            me = await context.bot.get_me()
+            username = me.username
+        except Exception as e:
+            logger.warning(f"Не вдалось отримати юзернейм бота: {e}")
+            username = None
+        if not username:
+            await query.edit_message_text(
+                "Не вдалось отримати посилання, спробуйте ще раз трохи пізніше.",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        link = f"https://t.me/{username}?start=admin_{admin_id}"
+        await query.edit_message_text(
+            f"Ваше персональне посилання-запрошення:\n\n{link}\n\n"
+            "Надішліть його клієнту. Щойно людина натисне на нього і запустить бота — "
+            "вона одразу з'явиться у вашому списку клієнтів, і ви автоматично будете "
+            "призначені відповідальним (без додаткових кроків).",
+            reply_markup=_menu_back_keyboard(),
+        )
         return
 
     if data == "menu_now":
@@ -5140,6 +5233,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/jobs — перевірити заплановані розсилки і час наступного запуску (діагностика)\n"
         "/pendingorders — замовлення, що клієнти почали оформлювати, але ще не підтвердили\n"
         "/cancel — аварійно скинути будь-який незавершений крок (свій чи клієнтський), якщо щось застрягло\n"
+        "/invite — отримати своє персональне посилання-запрошення для клієнтів (меню → Клієнти → «➕ Запросити клієнта»)\n"
         "/setordersgroup — прив'язати ГРУПУ (написати цю команду всередині групи), щоб усі "
         "підтверджені замовлення клієнтів автоматично дублювались туди\n"
         "/clearordersgroup — відв'язати групу замовлень\n"
@@ -5194,6 +5288,7 @@ def main():
     application.add_handler(CommandHandler("setordersgroup", setordersgroup_command))
     application.add_handler(CommandHandler("clearordersgroup", clearordersgroup_command))
     application.add_handler(CommandHandler("pendingorders", pending_orders_command))
+    application.add_handler(CommandHandler("invite", invite_command))
     application.add_handler(CommandHandler("testsegment", testsegment))
     application.add_handler(CommandHandler("sendto", sendto_start))
     application.add_handler(CommandHandler("menu", menu_command))
