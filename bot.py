@@ -173,6 +173,8 @@ def init_db():
         conn.execute("ALTER TABLE subscribers ADD COLUMN responsible_admin INTEGER")
     if "needs_packaging" not in existing_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN needs_packaging INTEGER DEFAULT 0")
+    if "needs_invoice_choice" not in existing_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN needs_invoice_choice INTEGER DEFAULT 0")
     bc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
     if "is_question" not in bc_cols:
         conn.execute("ALTER TABLE broadcasts ADD COLUMN is_question INTEGER DEFAULT 0")
@@ -982,10 +984,19 @@ async def forward_client_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     client = update.effective_user
     chat = update.effective_chat
     target_admin = _resolve_target_admin(chat.id)
-    if not target_admin:
-        return
     text = update.message.text or ""
     _log_message(chat.id, "in", text, update.message.message_id)
+
+    if _is_valid_phone(text) and chat.id not in PROFILE_PENDING and chat.id not in ORDER_PENDING:
+        await update.message.reply_text(
+            "Це схоже на номер телефону, але зараз ви не заповнюєте жодної форми 🙈\n\n"
+            "Якщо хотіли додати або змінити номер — натисніть кнопку «🪪 Моя картка» внизу "
+            "екрана і пройдіть кроки заново. Це могло статись через тимчасовий технічний збій "
+            "під час заповнення — вибачте за незручність!",
+        )
+
+    if not target_admin:
+        return
     try:
         sent = await context.bot.send_message(
             target_admin,
@@ -1168,6 +1179,29 @@ def _client_needs_packaging(chat_id: int) -> bool:
     row = conn.execute("SELECT needs_packaging FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
     conn.close()
     return bool(row and row["needs_packaging"])
+
+
+def _client_needs_invoice_choice(chat_id: int) -> bool:
+    conn = db()
+    row = conn.execute("SELECT needs_invoice_choice FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    return bool(row and row["needs_invoice_choice"])
+
+
+def _invoice_toggle_keyboard() -> InlineKeyboardMarkup:
+    conn = db()
+    rows = conn.execute(
+        "SELECT chat_id, name, username, needs_invoice_choice FROM subscribers WHERE active=1 "
+        "ORDER BY joined_at DESC LIMIT 60"
+    ).fetchall()
+    conn.close()
+    buttons = []
+    for r in rows:
+        mark = "✅" if r["needs_invoice_choice"] else "⬜"
+        label = f"{mark} {_client_display_label(r['chat_id'], r['name'], r['username'])}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"menu_invoicetoggle:{r['chat_id']}")])
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def _get_admin_clients(admin_id: int, segment: str | None = None) -> list:
@@ -1487,6 +1521,7 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("🪪 Редагувати картку клієнта", callback_data="menu_editclientprofile")],
         [InlineKeyboardButton("📦 Кому показувати вибір пакування", callback_data="menu_packaging")],
+        [InlineKeyboardButton("🧾 Кому показувати вибір накладної", callback_data="menu_invoice")],
         [InlineKeyboardButton("📋 Список клієнтів і відповідальних", callback_data="menu_resplist")],
         [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
         [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
@@ -2886,6 +2921,8 @@ def _order_client_summary_text(order: dict, profile: dict) -> str:
         )
     lines.append("")
     lines.append(f"💳 Оплата: {_esc(order.get('payment_method') or '—')}")
+    if "invoice" in order:
+        lines.append(f"🧾 Накладна: {_esc(order.get('invoice'))}")
     return "\n".join(lines)
 
 
@@ -2902,6 +2939,7 @@ def _order_summary_text(order: dict, profile: dict) -> str:
         f"📞 Телефон: {_esc(profile.get('phone') or '—')}",
         f"🏢 ФОП: {_esc(profile.get('fop') or '—')}  |  ІПН: {_esc(profile.get('ipn') or '—')}",
         f"💳 Оплата: {_esc(order.get('payment_method') or '—')}",
+    ] + ([f"🧾 Накладна: {_esc(order.get('invoice'))}"] if "invoice" in order else []) + [
         "",
         "📦 <b>Позиції для складу:</b>",
         "",
@@ -3002,6 +3040,30 @@ async def pending_orders_command(update: Update, context: ContextTypes.DEFAULT_T
     if not is_admin(update):
         return
     await update.message.reply_text(_pending_orders_text())
+
+
+async def _order_go_to_confirm_or_invoice(query, context, chat_id: int, order: dict):
+    """Показує клієнту питання «Потрібна накладна?» (тільки якщо адмін позначив цього клієнта),
+    інакше одразу показує підсумок замовлення з кнопками Змінити/Підтвердити."""
+    if _client_needs_invoice_choice(chat_id) and "invoice" not in order:
+        order["step"] = "invoice"
+        await query.edit_message_text(
+            "Чи потрібна вам товарна накладна на це замовлення?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Так", callback_data="order_invoice:Так")],
+                [InlineKeyboardButton("❌ Ні", callback_data="order_invoice:Ні")],
+            ]),
+        )
+        return
+    order["awaiting_confirm"] = True
+    schedule_order_confirm_reminder(context.application, chat_id)
+    profile = _get_client_profile(chat_id) or {}
+    summary = _order_client_summary_text(order, profile)
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Змінити", callback_data="order_editagain")],
+        [InlineKeyboardButton("✅ Підтвердити замовлення", callback_data="order_confirm")],
+    ])
+    await query.edit_message_text(summary, reply_markup=buttons, parse_mode="HTML")
 
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3358,19 +3420,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         if order.get("payment_method"):
-            order["awaiting_confirm"] = True
-            schedule_order_confirm_reminder(context.application, chat_id)
-            profile = _get_client_profile(chat_id) or {}
-            summary = _order_client_summary_text(order, profile)
-            buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Змінити", callback_data="order_editagain")],
-                [InlineKeyboardButton("✅ Підтвердити замовлення", callback_data="order_confirm")],
-            ])
-            await query.edit_message_text(
-                summary,
-                reply_markup=buttons,
-                parse_mode="HTML",
-            )
+            await _order_go_to_confirm_or_invoice(query, context, chat_id, order)
             return
         order["step"] = "payment"
         await query.edit_message_text(
@@ -3416,19 +3466,13 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("order_payment:"):
         _, method = data.split(":", 1)
         order["payment_method"] = method
-        order["awaiting_confirm"] = True
-        schedule_order_confirm_reminder(context.application, chat_id)
-        profile = _get_client_profile(chat_id) or {}
-        summary = _order_client_summary_text(order, profile)
-        buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Змінити", callback_data="order_editagain")],
-            [InlineKeyboardButton("✅ Підтвердити замовлення", callback_data="order_confirm")],
-        ])
-        await query.edit_message_text(
-            summary,
-            reply_markup=buttons,
-            parse_mode="HTML",
-        )
+        await _order_go_to_confirm_or_invoice(query, context, chat_id, order)
+        return
+
+    if data.startswith("order_invoice:"):
+        _, answer = data.split(":", 1)
+        order["invoice"] = answer
+        await _order_go_to_confirm_or_invoice(query, context, chat_id, order)
         return
 
     if data == "order_editagain":
@@ -3645,6 +3689,26 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "(тап додає/прибирає позначку, зберігається одразу):",
             reply_markup=_packaging_toggle_keyboard(),
         )
+        return
+
+    if data == "menu_invoice":
+        await query.edit_message_text(
+            "Оберіть клієнтів, яким показувати вибір «Потрібна накладна?» під час оформлення "
+            "замовлення (тап додає/прибирає позначку, зберігається одразу):",
+            reply_markup=_invoice_toggle_keyboard(),
+        )
+        return
+
+    if data.startswith("menu_invoicetoggle:"):
+        _, target_chat_id_str = data.split(":", 1)
+        target_chat_id = int(target_chat_id_str)
+        conn = db()
+        row = conn.execute("SELECT needs_invoice_choice FROM subscribers WHERE chat_id=?", (target_chat_id,)).fetchone()
+        new_val = 0 if (row and row["needs_invoice_choice"]) else 1
+        conn.execute("UPDATE subscribers SET needs_invoice_choice=? WHERE chat_id=?", (new_val, target_chat_id))
+        conn.commit()
+        conn.close()
+        await query.edit_message_reply_markup(reply_markup=_invoice_toggle_keyboard())
         return
 
     if data.startswith("menu_packagingtoggle:"):
