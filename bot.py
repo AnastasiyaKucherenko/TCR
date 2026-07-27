@@ -1565,6 +1565,7 @@ CLIENT_BTN_MANAGER = "💬 Зв'язок з менеджером"
 CLIENT_BTN_DELIVERY = "🚚 Умови доставки"
 CLIENT_BTN_ORDER = "📝 Замовити"
 CLIENT_BTN_PROFILE = "🪪 Моя картка"
+CLIENT_BTN_INSTRUCTIONS = "ℹ️ Інструкція"
 
 DELIVERY_COMMON_TAIL = (
     "\n\nЗамовлення прийняті до 09:00 - можуть бути доставлені КУР'ЄРОМ в той самий день.\n\n"
@@ -1612,9 +1613,10 @@ def _default_delivery_text(cat_key: str) -> str:
 def _client_persistent_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton(CLIENT_BTN_ASSORTMENT), KeyboardButton(CLIENT_BTN_DELIVERY)],
-            [KeyboardButton(CLIENT_BTN_ORDER), KeyboardButton(CLIENT_BTN_PROFILE)],
+            [KeyboardButton(CLIENT_BTN_ORDER)],
             [KeyboardButton(CLIENT_BTN_MANAGER)],
+            [KeyboardButton(CLIENT_BTN_ASSORTMENT), KeyboardButton(CLIENT_BTN_DELIVERY)],
+            [KeyboardButton(CLIENT_BTN_PROFILE), KeyboardButton(CLIENT_BTN_INSTRUCTIONS)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -1679,6 +1681,30 @@ async def client_assortment_back_callback(update: Update, context: ContextTypes.
     await query.edit_message_text(
         "☕ Оберіть категорію:", reply_markup=_assortment_category_keyboard("clientassort")
     )
+
+
+CLIENT_INSTRUCTIONS_TEXT = (
+    "📖 <b>Як користуватись ботом</b>\n\n"
+    "<b>🪪 Моя картка</b> — заповніть один раз: зона доставки, ім'я, точка, телефон, ФОП/ІПН "
+    "(або «немає») та хоча б одну адресу. Якщо для адреси номер такий самий, як основний — "
+    "не передруковуйте, тисніть кнопку «📞 Такий самий».\n\n"
+    "<b>📝 Замовити</b>:\n"
+    "• Якщо це перше замовлення — оберете дату, категорію, позицію, вагу, зерно/молоте "
+    "(і тип помелу), кількість. Можна додати кілька позицій.\n"
+    "• Якщо замовляли раніше — можна натиснути «🔁 Повторити попереднє»: бот покаже минулі "
+    "позиції по черзі, кожну можна змінити (кількість) чи прибрати, або просто натиснути «Далі».\n"
+    "• В кінці — дата, спосіб оплати і короткий підсумок для перевірки.\n\n"
+    "⚠️ <b>Важливо:</b> замовлення потрапляє менеджеру тільки після кнопки "
+    "«✅ Підтвердити замовлення» на фінальному екрані! До того можна натиснути «✏️ Змінити».\n\n"
+    "<b>☕ Асортимент</b> — поточний перелік кави за категоріями.\n"
+    "<b>🚚 Умови доставки</b> — окремо для роздрібу і гурту.\n"
+    "<b>💬 Зв'язок з менеджером</b> — пряме посилання на вашого відповідального менеджера.\n\n"
+    "Якщо на якомусь кроці бот не реагує — просто натисніть потрібну кнопку ще раз і повторіть крок."
+)
+
+
+async def client_show_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(CLIENT_INSTRUCTIONS_TEXT, parse_mode="HTML")
 
 
 async def client_show_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4980,6 +5006,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^📋 Меню$"), menu_command))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ASSORTMENT)}$"), client_show_assortment))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_DELIVERY)}$"), client_show_delivery))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_INSTRUCTIONS)}$"), client_show_instructions))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_MANAGER)}$"), client_contact_manager))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER)}$"), order_start))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_PROFILE)}$"), profile_show))
