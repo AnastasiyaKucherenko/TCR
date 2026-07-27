@@ -98,6 +98,12 @@ ADMIN_MSGEDIT_PENDING: dict[int, dict] = {}
 # Вибір кількох запланованих розсилок для одночасного скасування: admin_chat_id -> set(broadcast_id)
 BC_CANCEL_SELECTIONS: dict[int, set[int]] = {}
 
+# Поточний текст повідомлення замовлення в групі (щоб відновити його при скасуванні видалення)
+GROUP_ORDER_TEXT: dict[tuple[int, int], str] = {}
+
+# Адмін пише новий текст для замовлення в групі: admin_chat_id -> {"group_chat_id":..., "message_id":...}
+ADMIN_GROUPEDIT_PENDING: dict[int, dict] = {}
+
 WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 BC_MINUTES = [0, 15, 30, 45]
@@ -1315,13 +1321,33 @@ async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
+    # Якщо в адміна зараз є активна АДМІНСЬКА дія (крок меню, редагування чужої картки,
+    # очікування тексту розсилки тощо) — вона має пріоритет над старим незавершеним
+    # клієнтським кроком (PROFILE_PENDING/ORDER_PENDING), який міг лишитись від тестування
+    # адміном самого себе як клієнта і інакше "назавжди" перехоплював би всі його повідомлення.
+    reply_matches_forward = bool(
+        update.message.reply_to_message
+        and (chat_id, update.message.reply_to_message.message_id) in FORWARD_MAP
+    )
+    admin_has_active_action = (
+        chat_id in ADMIN_ADD_ADDRESS_PENDING
+        or chat_id in ADMIN_EDIT_PROFILE_PENDING
+        or chat_id in ADMIN_NEW_PROFILE_PENDING
+        or chat_id in ADMIN_MSGEDIT_PENDING
+        or chat_id in ADMIN_GROUPEDIT_PENDING
+        or chat_id in MENU_PENDING
+        or chat_id in SENDTO_AWAITING_TEXT
+        or reply_matches_forward
+    )
+
     # Пріоритет: якщо цей chat_id саме зараз щось заповнює як клієнт (картка/замовлення) —
     # обробляємо це незалежно від того, чи цей самий chat_id є ще й адміном
-    # (адмін міг тестувати ці кроки на своєму ж акаунті).
-    if chat_id in PROFILE_PENDING:
+    # (адмін міг тестувати ці кроки на своєму ж акаунті), АЛЕ тільки якщо немає активнішої
+    # адмінської дії, що очікує саме цей текст прямо зараз.
+    if chat_id in PROFILE_PENDING and not admin_has_active_action:
         await handle_profile_text_step(update, context)
         return
-    if chat_id in ORDER_PENDING:
+    if chat_id in ORDER_PENDING and not admin_has_active_action:
         await handle_order_text_step(update, context)
         return
 
@@ -1344,6 +1370,10 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if admin_id in ADMIN_MSGEDIT_PENDING:
         await handle_admin_msgedit_text(update, context)
+        return
+
+    if admin_id in ADMIN_GROUPEDIT_PENDING:
+        await handle_admin_groupedit_text(update, context)
         return
 
     # 0) Якщо адмін відповідає (Reply) на переслане повідомлення клієнта — надсилаємо відповідь клієнту
@@ -3543,10 +3573,13 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         orders_group_id = _get_orders_group_id()
         if orders_group_id:
             try:
-                await context.bot.send_message(
-                    orders_group_id,
-                    f"{summary}\n\nВід: {_esc(client.full_name)} (@{_esc(client.username or '—')}, chat_id: {chat_id})",
-                    parse_mode="HTML",
+                group_text = f"{summary}\n\nВід: {_esc(client.full_name)} (@{_esc(client.username or '—')}, chat_id: {chat_id})"
+                sent_group = await context.bot.send_message(orders_group_id, group_text, parse_mode="HTML")
+                GROUP_ORDER_TEXT[(orders_group_id, sent_group.message_id)] = group_text
+                await context.bot.edit_message_reply_markup(
+                    chat_id=orders_group_id,
+                    message_id=sent_group.message_id,
+                    reply_markup=_group_order_buttons(sent_group.message_id),
                 )
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати замовлення в групу замовлень: {e}")
@@ -4896,6 +4929,138 @@ async def clearordersgroup_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text("✅ Групу для замовлень відв'язано. Замовлення більше не дублюватимуться туди.")
 
 
+def _group_order_buttons(message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ Редагувати", callback_data=f"grouporder_edit:{message_id}"),
+        InlineKeyboardButton("🗑 Видалити", callback_data=f"grouporder_del:{message_id}"),
+    ]])
+
+
+def _group_order_confirm_del_buttons(message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Так, видалити для всіх", callback_data=f"grouporder_delconfirm:{message_id}"),
+        InlineKeyboardButton("❌ Скасувати", callback_data=f"grouporder_delcancel:{message_id}"),
+    ]])
+
+
+async def grouporder_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        await query.answer("Тільки адміністратор може редагувати замовлення.", show_alert=True)
+        return
+    await query.answer()
+    _, msg_id_str = query.data.split(":", 1)
+    message_id = int(msg_id_str)
+    group_chat_id = update.effective_chat.id
+    ADMIN_GROUPEDIT_PENDING[user.id] = {"group_chat_id": group_chat_id, "message_id": message_id}
+    try:
+        await context.bot.send_message(
+            user.id,
+            "Напишіть новий текст цього замовлення — повністю замінить те, що зараз у групі:",
+        )
+    except Exception as e:
+        logger.warning(f"Не вдалось написати адміну в особисті для редагування замовлення: {e}")
+        await query.answer(
+            "Спочатку напишіть боту в особисті хоча б /start, потім спробуйте ще раз.", show_alert=True
+        )
+
+
+async def grouporder_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        await query.answer("Тільки адміністратор може видаляти замовлення.", show_alert=True)
+        return
+    await query.answer()
+    _, msg_id_str = query.data.split(":", 1)
+    message_id = int(msg_id_str)
+    await query.edit_message_reply_markup(reply_markup=_group_order_confirm_del_buttons(message_id))
+
+
+async def grouporder_delconfirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        await query.answer("Тільки адміністратор може видаляти замовлення.", show_alert=True)
+        return
+    await query.answer()
+    _, msg_id_str = query.data.split(":", 1)
+    message_id = int(msg_id_str)
+    group_chat_id = update.effective_chat.id
+    try:
+        await context.bot.delete_message(group_chat_id, message_id)
+    except Exception as e:
+        logger.warning(f"Не вдалось видалити повідомлення замовлення в групі: {e}")
+        await query.answer("Не вдалось видалити (можливо, вже видалено).", show_alert=True)
+    GROUP_ORDER_TEXT.pop((group_chat_id, message_id), None)
+
+
+async def grouporder_delcancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, msg_id_str = query.data.split(":", 1)
+    message_id = int(msg_id_str)
+    await query.edit_message_reply_markup(reply_markup=_group_order_buttons(message_id))
+
+
+async def handle_admin_groupedit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_chat.id
+    pending = ADMIN_GROUPEDIT_PENDING.pop(admin_id, None)
+    if not pending:
+        return
+    group_chat_id = pending["group_chat_id"]
+    message_id = pending["message_id"]
+    new_text = update.message.text or ""
+    try:
+        await context.bot.edit_message_text(
+            chat_id=group_chat_id,
+            message_id=message_id,
+            text=new_text,
+            parse_mode="HTML",
+            reply_markup=_group_order_buttons(message_id),
+        )
+        GROUP_ORDER_TEXT[(group_chat_id, message_id)] = new_text
+        await update.message.reply_text("✅ Оновлено в групі замовлень.")
+    except Exception as e:
+        await update.message.reply_text(f"Не вдалось оновити повідомлення в групі: {e}")
+
+
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скидає будь-який незавершений крок (заповнення картки, замовлення, дію меню тощо)
+    для цього чату — універсальний «аварійний вихід», якщо щось застрягло."""
+    chat_id = update.effective_chat.id
+    had_something = any([
+        PROFILE_PENDING.pop(chat_id, None) is not None,
+        ORDER_PENDING.pop(chat_id, None) is not None,
+        MENU_PENDING.pop(chat_id, None) is not None,
+        ADMIN_ADD_ADDRESS_PENDING.pop(chat_id, None) is not None,
+        ADMIN_EDIT_PROFILE_PENDING.pop(chat_id, None) is not None,
+        ADMIN_NEW_PROFILE_PENDING.pop(chat_id, None) is not None,
+        ADMIN_MSGEDIT_PENDING.pop(chat_id, None) is not None,
+        ADMIN_GROUPEDIT_PENDING.pop(chat_id, None) is not None,
+        SENDTO_AWAITING_TEXT.pop(chat_id, None) is not None,
+        SENDTO_SELECTIONS.pop(chat_id, None) is not None,
+        BC_PENDING.pop(chat_id, None) is not None,
+        BC_SELECTIONS.pop(chat_id, None) is not None,
+        BC_CANCEL_SELECTIONS.pop(chat_id, None) is not None,
+        QNA_PENDING.pop(chat_id, None) is not None,
+        QNA_SELECTIONS.pop(chat_id, None) is not None,
+    ])
+    if had_something:
+        await update.message.reply_text(
+            "✅ Скинуто. Будь-який незавершений крок прибрано — можна починати заново.",
+            reply_markup=_keyboard_for_recipient(chat_id),
+        )
+    else:
+        await update.message.reply_text(
+            "Немає жодного незавершеного кроку — все й так чисто.",
+            reply_markup=_keyboard_for_recipient(chat_id),
+        )
+
+
 async def diag_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Діагностика: показує останні збережені замовлення в базі (для перевірки функції «Повторити»)."""
     if not is_admin(update):
@@ -4947,6 +5112,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«/broadcastfile ваш текст», і він одразу розійде цей файл усім підписникам\n"
         "/jobs — перевірити заплановані розсилки і час наступного запуску (діагностика)\n"
         "/pendingorders — замовлення, що клієнти почали оформлювати, але ще не підтвердили\n"
+        "/cancel — аварійно скинути будь-який незавершений крок (свій чи клієнтський), якщо щось застрягло\n"
         "/setordersgroup — прив'язати ГРУПУ (написати цю команду всередині групи), щоб усі "
         "підтверджені замовлення клієнтів автоматично дублювались туди\n"
         "/clearordersgroup — відв'язати групу замовлень\n"
@@ -4978,6 +5144,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("addsegment", addsegment))
     application.add_handler(CommandHandler("segments", segments_list))
@@ -5031,6 +5198,10 @@ def main():
     application.add_handler(CallbackQueryHandler(adminmsglog_callback, pattern=r"^adminmsglog:"))
     application.add_handler(CallbackQueryHandler(adminmsgedit_callback, pattern=r"^adminmsgedit:"))
     application.add_handler(CallbackQueryHandler(adminmsgdel_callback, pattern=r"^adminmsgdel:"))
+    application.add_handler(CallbackQueryHandler(grouporder_edit_callback, pattern=r"^grouporder_edit:"))
+    application.add_handler(CallbackQueryHandler(grouporder_del_callback, pattern=r"^grouporder_del:"))
+    application.add_handler(CallbackQueryHandler(grouporder_delconfirm_callback, pattern=r"^grouporder_delconfirm:"))
+    application.add_handler(CallbackQueryHandler(grouporder_delcancel_callback, pattern=r"^grouporder_delcancel:"))
     application.add_handler(CallbackQueryHandler(adminprofile_editaddr_callback, pattern=r"^adminprofile_editaddr:"))
     application.add_handler(CallbackQueryHandler(client_assortment_category_callback, pattern=r"^clientassort:"))
     application.add_handler(CallbackQueryHandler(client_assortment_back_callback, pattern=r"^clientassort_back$"))
