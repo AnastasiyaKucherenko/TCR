@@ -4849,11 +4849,27 @@ QNA_CLARIFICATION = "\n\n👇 Оберіть один із варіантів н
 
 async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
     broadcast_id = context.job.data["broadcast_id"]
+    logger.info(
+        f"[BCAST-FIRE] bcast_{broadcast_id} спрацювало о {datetime.now(TZ)} "
+        f"(день тижня зараз: {datetime.now(TZ).weekday()} - {WEEKDAYS_UA.get(datetime.now(TZ).weekday(), '?')})"
+    )
     conn = db()
     row = conn.execute("SELECT * FROM broadcasts WHERE id=? AND active=1", (broadcast_id,)).fetchone()
     if not row:
         conn.close()
         return
+
+    if row["kind"] != "once":
+        today_weekday = datetime.now(TZ).weekday()
+        if row["weekday"] != today_weekday:
+            conn.close()
+            logger.warning(
+                f"[BCAST-GUARD] bcast_{broadcast_id} заблоковано: заплановано на "
+                f"{WEEKDAYS_UA.get(row['weekday'], row['weekday'])}, а зараз "
+                f"{WEEKDAYS_UA.get(today_weekday, today_weekday)}. Розсилку НЕ надіслано, "
+                f"розклад залишається на наступний правильний день."
+            )
+            return
 
     is_question = bool(row["is_question"]) if "is_question" in row.keys() else False
 
@@ -4931,17 +4947,26 @@ def schedule_broadcast_job(application: Application, row) -> None:
 
     if row["kind"] == "once":
         run_at = datetime.fromisoformat(row["run_at"])
-        application.job_queue.run_once(
+        new_job = application.job_queue.run_once(
             send_scheduled_broadcast, when=run_at, name=name, data={"broadcast_id": row["id"]}
+        )
+        logger.info(
+            f"[BCAST-SCHEDULE] {name}: kind=once, run_at={run_at} TZ={TZ}. "
+            f"Наступний запуск: {getattr(new_job, 'next_t', '—')}"
         )
     else:
         hh, mm = map(int, row["hhmm"].split(":"))
-        application.job_queue.run_daily(
+        new_job = application.job_queue.run_daily(
             send_scheduled_broadcast,
             time=time(hour=hh, minute=mm, tzinfo=TZ),
             days=(row["weekday"],),
             name=name,
             data={"broadcast_id": row["id"]},
+        )
+        logger.info(
+            f"[BCAST-SCHEDULE] {name}: kind=weekly, weekday={row['weekday']} "
+            f"({WEEKDAYS_UA.get(row['weekday'], '?')}), time={hh:02d}:{mm:02d} TZ={TZ}. "
+            f"Наступний запуск: {getattr(new_job, 'next_t', '—')}"
         )
 
 
