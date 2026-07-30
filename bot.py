@@ -4862,6 +4862,8 @@ async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
     if row["kind"] != "once":
         today_weekday = datetime.now(TZ).weekday()
         if row["weekday"] != today_weekday:
+            created_by = row["created_by"] if "created_by" in row.keys() else None
+            bc_name = row["name"] if "name" in row.keys() else None
             conn.close()
             logger.warning(
                 f"[BCAST-GUARD] bcast_{broadcast_id} заблоковано: заплановано на "
@@ -4869,6 +4871,20 @@ async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
                 f"{WEEKDAYS_UA.get(today_weekday, today_weekday)}. Розсилку НЕ надіслано, "
                 f"розклад залишається на наступний правильний день."
             )
+            notify_target = created_by or (ADMIN_IDS[0] if ADMIN_IDS else None)
+            if notify_target:
+                name_line = f"«{bc_name}» " if bc_name else ""
+                try:
+                    await context.bot.send_message(
+                        notify_target,
+                        f"⚠️ Розсилку {name_line}не надіслано сьогодні — захист виявив "
+                        f"розбіжність: у розкладі стоїть {WEEKDAYS_UA.get(row['weekday'], row['weekday'])}, "
+                        f"а сьогодні {WEEKDAYS_UA.get(today_weekday, today_weekday)}. "
+                        f"Перевірте розклад цієї розсилки (📅 Заплановано → 📖 Заплановані) — можливо, "
+                        f"варто скасувати і створити заново з правильним днем.",
+                    )
+                except Exception as e:
+                    logger.warning(f"Не вдалось сповістити адміна про заблоковану розсилку: {e}")
             return
 
     is_question = bool(row["is_question"]) if "is_question" in row.keys() else False
