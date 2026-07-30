@@ -104,6 +104,9 @@ GROUP_ORDER_TEXT: dict[tuple[int, int], str] = {}
 # Адмін пише новий текст для замовлення в групі: admin_chat_id -> {"group_chat_id":..., "message_id":...}
 ADMIN_GROUPEDIT_PENDING: dict[int, dict] = {}
 
+# Reply-редагування прямо в групі: (group_chat_id, prompt_message_id) -> {"target_message_id":..., "mode": "replace"/"append"}
+GROUP_EDIT_PROMPTS: dict[tuple[int, int], dict] = {}
+
 WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 BC_HOURS = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 BC_MINUTES = [0, 15, 30, 45]
@@ -3227,6 +3230,28 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
 
 
+async def qna_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «❌ Ні» в запитанні так/ні — натискає КЛІЄНТ, тому без перевірки на адміна."""
+    query = update.callback_query
+    await query.answer()
+    _, client_chat_id_str = query.data.split(":", 1)
+    client_chat_id = int(client_chat_id_str)
+    await query.edit_message_text("Дякуємо, що дали знати! 🙏 Якщо передумаєте — завжди можна написати нам.")
+    conn = db()
+    row = conn.execute(
+        "SELECT name, username, responsible_admin FROM subscribers WHERE chat_id=?", (client_chat_id,)
+    ).fetchone()
+    conn.close()
+    if row:
+        target_admin = row["responsible_admin"] or (ADMIN_IDS[0] if ADMIN_IDS else None)
+        note = f"❌ {row['name']} (@{row['username'] or '—'}) відповів(-ла) «Ні» на запитання."
+        if target_admin:
+            try:
+                await context.bot.send_message(target_admin, note)
+            except Exception as e:
+                logger.warning(f"Не вдалось сповістити відповідального {target_admin}: {e}")
+
+
 async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопка «📝 Замовити прямо тут» у запитанні так/ні — запускає той самий опитувальник замовлення."""
     query = update.callback_query
@@ -4651,22 +4676,7 @@ async def qna_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("qna_no:"):
-        _, client_chat_id_str = data.split(":", 1)
-        client_chat_id = int(client_chat_id_str)
-        await query.edit_message_text("Дякуємо, що дали знати! 🙏 Якщо передумаєте — завжди можна написати нам.")
-        conn = db()
-        row = conn.execute(
-            "SELECT name, username, responsible_admin FROM subscribers WHERE chat_id=?", (client_chat_id,)
-        ).fetchone()
-        conn.close()
-        if row:
-            target_admin = row["responsible_admin"] or (ADMIN_IDS[0] if ADMIN_IDS else None)
-            note = f"❌ {row['name']} (@{row['username'] or '—'}) відповів(-ла) «Ні» на запитання."
-            if target_admin:
-                try:
-                    await context.bot.send_message(target_admin, note)
-                except Exception as e:
-                    logger.warning(f"Не вдалось сповістити відповідального {target_admin}: {e}")
+        # Обробляється окремою функцією qna_no_callback (без перевірки на адміна) - див. нижче
         return
 
 
@@ -5064,11 +5074,16 @@ async def clearordersgroup_command(update: Update, context: ContextTypes.DEFAULT
 
 
 def _group_order_buttons(message_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Прийняти", callback_data=f"grouporder_accept:{message_id}"),
-        InlineKeyboardButton("✏️ Редагувати", callback_data=f"grouporder_edit:{message_id}"),
-        InlineKeyboardButton("🗑 Видалити", callback_data=f"grouporder_del:{message_id}"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Прийняти", callback_data=f"grouporder_accept:{message_id}"),
+            InlineKeyboardButton("✏️ Редагувати", callback_data=f"grouporder_edit:{message_id}"),
+        ],
+        [
+            InlineKeyboardButton("➕ Дописати", callback_data=f"grouporder_append:{message_id}"),
+            InlineKeyboardButton("🗑 Видалити", callback_data=f"grouporder_del:{message_id}"),
+        ],
+    ])
 
 
 def _group_order_confirm_del_buttons(message_id: int) -> InlineKeyboardMarkup:
@@ -5114,17 +5129,77 @@ async def grouporder_edit_callback(update: Update, context: ContextTypes.DEFAULT
     _, msg_id_str = query.data.split(":", 1)
     message_id = int(msg_id_str)
     group_chat_id = update.effective_chat.id
-    ADMIN_GROUPEDIT_PENDING[user.id] = {"group_chat_id": group_chat_id, "message_id": message_id}
+    prompt = await context.bot.send_message(
+        group_chat_id,
+        f"✏️ {user.full_name}, зробіть Reply на ЦЕ повідомлення з новим повним текстом замовлення "
+        f"(повністю замінить те, що зараз написано вище).",
+        reply_to_message_id=message_id,
+    )
+    GROUP_EDIT_PROMPTS[(group_chat_id, prompt.message_id)] = {
+        "target_message_id": message_id, "mode": "replace",
+    }
+
+
+async def grouporder_append_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        await query.answer("Тільки адміністратор може редагувати замовлення.", show_alert=True)
+        return
+    await query.answer()
+    _, msg_id_str = query.data.split(":", 1)
+    message_id = int(msg_id_str)
+    group_chat_id = update.effective_chat.id
+    prompt = await context.bot.send_message(
+        group_chat_id,
+        f"➕ {user.full_name}, зробіть Reply на ЦЕ повідомлення з текстом, який треба ДОДАТИ "
+        f"до замовлення (допишеться окремим рядком знизу, решта тексту лишиться як є).",
+        reply_to_message_id=message_id,
+    )
+    GROUP_EDIT_PROMPTS[(group_chat_id, prompt.message_id)] = {
+        "target_message_id": message_id, "mode": "append",
+    }
+
+
+async def handle_group_order_edit_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробляє Reply прямо в групі на запит редагування/дописування замовлення."""
+    message = update.message
+    if not message or not message.reply_to_message or not message.text:
+        return
+    chat_id = update.effective_chat.id
+    key = (chat_id, message.reply_to_message.message_id)
+    pending = GROUP_EDIT_PROMPTS.pop(key, None)
+    if not pending:
+        return
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return
+
+    target_message_id = pending["target_message_id"]
+    mode = pending["mode"]
+    current_text = GROUP_ORDER_TEXT.get((chat_id, target_message_id), "")
+
+    if mode == "append":
+        new_text = current_text + f"\n\n➕ <b>Додано:</b> {_esc(message.text)}"
+    else:
+        new_text = message.text
+
     try:
-        await context.bot.send_message(
-            user.id,
-            "Напишіть новий текст цього замовлення — повністю замінить те, що зараз у групі:",
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=target_message_id,
+            text=new_text,
+            parse_mode="HTML",
+            reply_markup=_group_order_buttons(target_message_id),
         )
+        GROUP_ORDER_TEXT[(chat_id, target_message_id)] = new_text
+        await message.reply_text("✅ Оновлено.")
     except Exception as e:
-        logger.warning(f"Не вдалось написати адміну в особисті для редагування замовлення: {e}")
-        await query.answer(
-            "Спочатку напишіть боту в особисті хоча б /start, потім спробуйте ще раз.", show_alert=True
-        )
+        await message.reply_text(f"Не вдалось оновити повідомлення: {e}")
+    try:
+        await context.bot.delete_message(chat_id, message.reply_to_message.message_id)
+    except Exception:
+        pass
 
 
 async def grouporder_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5362,6 +5437,7 @@ def main():
     application.add_handler(CallbackQueryHandler(adminmsgedit_callback, pattern=r"^adminmsgedit:"))
     application.add_handler(CallbackQueryHandler(adminmsgdel_callback, pattern=r"^adminmsgdel:"))
     application.add_handler(CallbackQueryHandler(grouporder_edit_callback, pattern=r"^grouporder_edit:"))
+    application.add_handler(CallbackQueryHandler(grouporder_append_callback, pattern=r"^grouporder_append:"))
     application.add_handler(CallbackQueryHandler(grouporder_accept_callback, pattern=r"^grouporder_accept:"))
     application.add_handler(CallbackQueryHandler(grouporder_del_callback, pattern=r"^grouporder_del:"))
     application.add_handler(CallbackQueryHandler(grouporder_delconfirm_callback, pattern=r"^grouporder_delconfirm:"))
@@ -5381,9 +5457,13 @@ def main():
     application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu_"))
     application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^(bc_|bcq_)"))
     application.add_handler(CallbackQueryHandler(qna_order_callback, pattern=r"^qna_order$"))
+    application.add_handler(CallbackQueryHandler(qna_no_callback, pattern=r"^qna_no:"))
     application.add_handler(CallbackQueryHandler(qna_router, pattern=r"^qna_"))
     application.add_handler(CallbackQueryHandler(wg_router, pattern=r"^wg_"))
     application.add_handler(CallbackQueryHandler(order_router, pattern=r"^order_"))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, handle_group_order_edit_reply)
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_text))
 
     logger.info("Бот запущено")
