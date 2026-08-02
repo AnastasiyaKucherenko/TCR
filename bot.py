@@ -1394,11 +1394,11 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # обробляємо це незалежно від того, чи цей самий chat_id є ще й адміном
     # (адмін міг тестувати ці кроки на своєму ж акаунті), АЛЕ тільки якщо немає активнішої
     # адмінської дії, що очікує саме цей текст прямо зараз.
-    if chat_id in PROFILE_PENDING and not admin_has_active_action:
-        await handle_profile_text_step(update, context)
-        return
     if chat_id in ORDER_PENDING and not admin_has_active_action:
         await handle_order_text_step(update, context)
+        return
+    if chat_id in PROFILE_PENDING and not admin_has_active_action:
+        await handle_profile_text_step(update, context)
         return
 
     admin_id = chat_id
@@ -1596,6 +1596,7 @@ def _menu_scheduled_keyboard() -> InlineKeyboardMarkup:
 def _menu_clients_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Запросити клієнта", callback_data="menu_invitelink")],
+        [InlineKeyboardButton("🛒 Оформити замовлення за клієнта", callback_data="menu_orderforclient")],
         [
             InlineKeyboardButton("👥 Змінити групу", callback_data="menu_changeseg"),
             InlineKeyboardButton("🙋 Відповідальний", callback_data="menu_setresp"),
@@ -3174,7 +3175,8 @@ async def pending_orders_command(update: Update, context: ContextTypes.DEFAULT_T
 async def _order_go_to_confirm_or_invoice(query, context, chat_id: int, order: dict):
     """Показує клієнту питання «Потрібна накладна?» (тільки якщо адмін позначив цього клієнта),
     інакше одразу показує підсумок замовлення з кнопками Змінити/Підтвердити."""
-    if _client_needs_invoice_choice(chat_id) and "invoice" not in order:
+    target_chat_id = order.get("on_behalf_of", chat_id)
+    if _client_needs_invoice_choice(target_chat_id) and "invoice" not in order:
         order["step"] = "invoice"
         await query.edit_message_text(
             "Чи потрібна вам товарна накладна на це замовлення?",
@@ -3186,7 +3188,7 @@ async def _order_go_to_confirm_or_invoice(query, context, chat_id: int, order: d
         return
     order["awaiting_confirm"] = True
     schedule_order_confirm_reminder(context.application, chat_id)
-    profile = _get_client_profile(chat_id) or {}
+    profile = _get_client_profile(target_chat_id) or {}
     summary = _order_client_summary_text(order, profile)
     buttons = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Змінити", callback_data="order_editagain")],
@@ -3197,6 +3199,7 @@ async def _order_go_to_confirm_or_invoice(query, context, chat_id: int, order: d
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    PROFILE_PENDING.pop(chat_id, None)
     profile = _get_client_profile(chat_id)
     if not profile:
         PROFILE_PENDING[chat_id] = {"awaiting_zone": True, "data": {}}
@@ -3257,6 +3260,7 @@ async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
+    PROFILE_PENDING.pop(chat_id, None)
     profile = _get_client_profile(chat_id)
     if not profile:
         PROFILE_PENDING[chat_id] = {"awaiting_zone": True, "data": {}}
@@ -3319,6 +3323,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     chat_id = update.effective_chat.id
     order = ORDER_PENDING.get(chat_id)
+    target_chat_id = order.get("on_behalf_of", chat_id) if order else chat_id
     data = query.data
 
     if data == "order_cancel":
@@ -3328,13 +3333,19 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "order_new":
-        ORDER_PENDING[chat_id] = {"step": "date", "items": []}
+        prev_on_behalf = order.get("on_behalf_of") if order else None
+        new_order = {"step": "date", "items": []}
+        if prev_on_behalf:
+            new_order["on_behalf_of"] = prev_on_behalf
+        ORDER_PENDING[chat_id] = new_order
         await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
         return
 
     if data == "order_repeat":
-        last_items = _get_last_order_items(chat_id)
-        order = ORDER_PENDING[chat_id] = {"step": "review", "items": last_items, "review_idx": 0}
+        last_items = _get_last_order_items(target_chat_id)
+        order = ORDER_PENDING[chat_id] = {"step": "review", "items": last_items, "review_idx": 0, "on_behalf_of": order.get("on_behalf_of") if order else None}
+        if not order.get("on_behalf_of"):
+            order.pop("on_behalf_of", None)
         text, kb = _order_review_step_screen(order)
         await query.edit_message_text(text, reply_markup=kb)
         return
@@ -3347,7 +3358,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, date_str = data.split(":", 1)
         d = datetime.fromisoformat(date_str).date()
         order["date"] = f"{d.strftime('%d.%m.%Y')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
-        addresses = _get_client_addresses(chat_id)
+        addresses = _get_client_addresses(target_chat_id)
         if len(addresses) == 1:
             order["address"] = addresses[0]["address"]
             order["contact_phone"] = addresses[0].get("phone") or "—"
@@ -3372,7 +3383,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_addr:"):
         _, addr_id = data.split(":", 1)
-        addresses = _get_client_addresses(chat_id)
+        addresses = _get_client_addresses(target_chat_id)
         chosen = next((a for a in addresses if str(a["id"]) == addr_id), None)
         order["address"] = chosen["address"] if chosen else "—"
         order["contact_phone"] = (chosen.get("phone") if chosen else None) or "—"
@@ -3583,7 +3594,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, date_str = data.split(":", 1)
         d = datetime.fromisoformat(date_str).date()
         order["date"] = f"{d.strftime('%d.%m.%Y')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
-        addresses = _get_client_addresses(chat_id)
+        addresses = _get_client_addresses(target_chat_id)
         if len(addresses) == 1:
             order["address"] = addresses[0]["address"]
             order["contact_phone"] = addresses[0].get("phone") or "—"
@@ -3604,7 +3615,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_finaladdr:"):
         _, addr_id = data.split(":", 1)
-        addresses = _get_client_addresses(chat_id)
+        addresses = _get_client_addresses(target_chat_id)
         chosen = next((a for a in addresses if str(a["id"]) == addr_id), None)
         order["address"] = chosen["address"] if chosen else "—"
         order["contact_phone"] = (chosen.get("phone") if chosen else None) or "—"
@@ -3641,34 +3652,48 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Це замовлення вже неактуальне.")
             return
         cancel_order_confirm_reminder(context.application, chat_id)
-        _save_completed_order(chat_id, order)
-        profile = _get_client_profile(chat_id) or {}
+        _save_completed_order(target_chat_id, order)
+        profile = _get_client_profile(target_chat_id) or {}
         summary = _order_summary_text(order, profile)
-        client = update.effective_user
-        target_admin = _resolve_target_admin(chat_id)
-        await query.edit_message_text("✅ Замовлення оформлено!")
+        on_behalf = order.get("on_behalf_of")
+        if on_behalf:
+            conn = db()
+            client_row = conn.execute(
+                "SELECT name, username FROM subscribers WHERE chat_id=?", (target_chat_id,)
+            ).fetchone()
+            conn.close()
+            client_full_name = client_row["name"] if client_row else str(target_chat_id)
+            client_username = client_row["username"] if client_row else ""
+        else:
+            client = update.effective_user
+            client_full_name = client.full_name
+            client_username = client.username or ""
+        target_admin = _resolve_target_admin(target_chat_id)
+        await query.edit_message_text(
+            "✅ Замовлення оформлено за клієнта!" if on_behalf else "✅ Замовлення оформлено!"
+        )
         await context.bot.send_message(
-            chat_id,
+            target_chat_id,
             "Дякуємо! Ваше замовлення передано менеджеру, скоро з вами зв'яжуться 🙌\n\n"
             "👇 Кнопки внизу завжди тут, якщо треба щось інше.",
-            reply_markup=_keyboard_for_recipient(chat_id),
+            reply_markup=_keyboard_for_recipient(target_chat_id),
         )
-        if target_admin:
+        if target_admin and target_admin != chat_id:
             try:
                 sent = await context.bot.send_message(
                     target_admin,
-                    f"{summary}\n\nВід: {_esc(client.full_name)} (@{_esc(client.username or '—')}, chat_id: {chat_id})\n\n"
+                    f"{summary}\n\nВід: {_esc(client_full_name)} (@{_esc(client_username or '—')}, chat_id: {target_chat_id})\n\n"
                     f"Щоб відповісти клієнту — зробіть Reply на це повідомлення.",
                     parse_mode="HTML",
                 )
-                FORWARD_MAP[(target_admin, sent.message_id)] = chat_id
+                FORWARD_MAP[(target_admin, sent.message_id)] = target_chat_id
             except Exception as e:
                 logger.warning(f"Не вдалось переслати замовлення адміну: {e}")
 
         orders_group_id = _get_orders_group_id()
         if orders_group_id:
             try:
-                group_text = f"{summary}\n\nВід: {_esc(client.full_name)} (@{_esc(client.username or '—')}, chat_id: {chat_id})"
+                group_text = f"{summary}\n\nВід: {_esc(client_full_name)} (@{_esc(client_username or '—')}, chat_id: {target_chat_id})"
                 sent_group = await context.bot.send_message(orders_group_id, group_text, parse_mode="HTML")
                 GROUP_ORDER_TEXT[(orders_group_id, sent_group.message_id)] = group_text
                 await context.bot.edit_message_reply_markup(
@@ -3751,6 +3776,61 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "призначені відповідальним (без додаткових кроків).",
             reply_markup=_menu_back_keyboard(),
         )
+        return
+
+    if data == "menu_orderforclient":
+        conn = db()
+        rows = conn.execute(
+            "SELECT chat_id, name, username FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
+            return
+        buttons = [
+            [InlineKeyboardButton(_client_display_label(r['chat_id'], r['name'], r['username']), callback_data=f"menu_pickorderclient:{r['chat_id']}")]
+            for r in rows
+        ]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "За якого клієнта оформити замовлення?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("menu_pickorderclient:"):
+        _, target_chat_id_str = data.split(":", 1)
+        target_chat_id = int(target_chat_id_str)
+        profile = _get_client_profile(target_chat_id)
+        if not profile:
+            await query.edit_message_text(
+                "У цього клієнта ще немає заповненої картки. Спочатку заповніть її "
+                "(«👥 Клієнти» → «Редагувати картку клієнта»), щоб знати зону доставки й адресу.",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        addresses = _get_client_addresses(target_chat_id)
+        if not addresses:
+            await query.edit_message_text(
+                "У цього клієнта ще немає жодної адреси доставки. Спочатку додайте адресу "
+                "(«👥 Клієнти» → «Редагувати картку клієнта» → цей клієнт → «➕ Додати адресу»).",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        last_items = _get_last_order_items(target_chat_id)
+        if last_items:
+            await query.edit_message_text(
+                f"У клієнта є попереднє замовлення. Повторити його (можна змінити), чи почати нове?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔁 Повторити попереднє", callback_data="order_repeat")],
+                    [InlineKeyboardButton("🆕 Нове замовлення", callback_data="order_new")],
+                    [InlineKeyboardButton("❌ Скасувати", callback_data="order_cancel")],
+                ]),
+            )
+        else:
+            ORDER_PENDING[admin_id] = {"step": "date", "items": [], "on_behalf_of": target_chat_id}
+            await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+            return
+        ORDER_PENDING[admin_id] = {"on_behalf_of": target_chat_id}
         return
 
     if data == "menu_now":
