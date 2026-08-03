@@ -2319,6 +2319,9 @@ async def profile_editfield_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     chat_id = update.effective_chat.id
     _, field = query.data.split(":", 1)
+    if field not in PROFILE_EDITABLE_FIELDS:
+        logger.warning(f"[SECURITY] Підозрілий field у profile_editfield_callback: {field!r} від chat_id={chat_id}")
+        return
     if field == "delivery_zone":
         PROFILE_PENDING[chat_id] = {"single_field": "delivery_zone"}
         await query.edit_message_text(
@@ -2574,6 +2577,9 @@ async def adminprofile_editfield_callback(update: Update, context: ContextTypes.
     admin_id = update.effective_chat.id
     _, target_chat_id_str, field = query.data.split(":", 2)
     target_chat_id = int(target_chat_id_str)
+    if field not in PROFILE_EDITABLE_FIELDS:
+        logger.warning(f"[SECURITY] Підозрілий field у adminprofile_editfield_callback: {field!r} від admin_id={admin_id}")
+        return
     if field == "delivery_zone":
         ADMIN_EDIT_PROFILE_PENDING[admin_id] = {"target_chat_id": target_chat_id, "single_field": "delivery_zone"}
         await query.edit_message_text(
@@ -2722,6 +2728,8 @@ async def adminprofile_newskip_callback(update: Update, context: ContextTypes.DE
 
 
 async def handle_admin_new_profile_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
     admin_id = update.effective_chat.id
     pending = ADMIN_NEW_PROFILE_PENDING.get(admin_id)
     if not pending:
@@ -2885,6 +2893,8 @@ async def adminmsgdel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_admin_msgedit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
     admin_id = update.effective_chat.id
     pending = ADMIN_MSGEDIT_PENDING.pop(admin_id, None)
     if not pending:
@@ -2909,6 +2919,8 @@ async def handle_admin_msgedit_text(update: Update, context: ContextTypes.DEFAUL
 
 
 async def handle_admin_add_address_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
     admin_id = update.effective_chat.id
     pending = ADMIN_ADD_ADDRESS_PENDING.get(admin_id)
     if not pending:
@@ -2956,6 +2968,8 @@ async def handle_admin_add_address_text(update: Update, context: ContextTypes.DE
 
 
 async def handle_admin_edit_profile_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
     admin_id = update.effective_chat.id
     pending = ADMIN_EDIT_PROFILE_PENDING.get(admin_id)
     if not pending:
@@ -2963,6 +2977,10 @@ async def handle_admin_edit_profile_text_step(update: Update, context: ContextTy
 
     target_chat_id = pending["target_chat_id"]
     field = pending["single_field"]
+    if field not in PROFILE_EDITABLE_FIELDS:
+        ADMIN_EDIT_PROFILE_PENDING.pop(admin_id, None)
+        logger.warning(f"[SECURITY] Заблоковано підозріле поле {field!r} у handle_admin_edit_profile_text_step")
+        return
     text = update.message.text or ""
 
     if field == "phone":
@@ -2998,6 +3016,10 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
 
     if pending.get("single_field"):
         field = pending["single_field"]
+        if field not in PROFILE_EDITABLE_FIELDS:
+            PROFILE_PENDING.pop(chat_id, None)
+            logger.warning(f"[SECURITY] Заблоковано підозріле поле {field!r} у handle_profile_text_step")
+            return
         text = update.message.text or ""
         if field == "phone":
             if not _is_valid_phone(text):
@@ -6138,6 +6160,8 @@ async def grouporder_delcancel_callback(update: Update, context: ContextTypes.DE
 
 
 async def handle_admin_groupedit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
     admin_id = update.effective_chat.id
     pending = ADMIN_GROUPEDIT_PENDING.pop(admin_id, None)
     if not pending:
