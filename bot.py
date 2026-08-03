@@ -447,6 +447,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("⏭ Ні, пізніше", callback_data="adminprofile_newskip")],
                 ]),
             )
+            await context.bot.send_message(
+                referred_admin_id,
+                "Який ціновий рівень одразу призначити цьому клієнту? (за замовчуванням — Роздріб)",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(t, callback_data=f"newtier:{chat.id}:{t}")] for t in PRICE_TIERS]
+                ),
+            )
         except Exception as e:
             logger.warning(f"Не вдалось надіслати запрошувачу {referred_admin_id}: {e}")
         return
@@ -592,6 +599,30 @@ async def respme_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⏭ Ні, пізніше", callback_data="adminprofile_newskip")],
         ]),
     )
+    await context.bot.send_message(
+        admin_id,
+        "Який ціновий рівень одразу призначити цьому клієнту? (за замовчуванням — Роздріб)",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(t, callback_data=f"newtier:{chat_id}:{t}")] for t in PRICE_TIERS]
+        ),
+    )
+
+
+async def newtier_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін одразу призначає ціновий рівень щойно доданому клієнту."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    _, chat_id_str, tier = query.data.split(":", 2)
+    target_chat_id = int(chat_id_str)
+    conn = db()
+    conn.execute("UPDATE subscribers SET price_tier=? WHERE chat_id=?", (tier, target_chat_id))
+    conn.commit()
+    row = conn.execute("SELECT name FROM subscribers WHERE chat_id=?", (target_chat_id,)).fetchone()
+    conn.close()
+    client_name = row["name"] if row else str(target_chat_id)
+    await query.edit_message_text(f"✅ {client_name} тепер на ціновому рівні «{tier}».")
 
 
 async def pickresp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1290,7 +1321,7 @@ def _client_is_individual_pricing(chat_id: int) -> bool:
     return bool(row and row["is_individual_pricing"])
 
 
-PRICE_TIERS = ["Роздріб", "20 кг", "50 кг", "100 кг"]
+PRICE_TIERS = ["Роздріб", "20 кг", "50 кг", "100 кг", "300 кг"]
 
 
 def _get_client_price_tier(chat_id: int | None) -> str:
@@ -1734,6 +1765,34 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action == "bulk_tier_text":
+        MENU_PENDING.pop(admin_id, None)
+        valid_tiers = set(PRICE_TIERS)
+        updated, failed = 0, []
+        conn = db()
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            m = re.search(r"chat_id:\s*(\d+).*?Тариф:\s*(.+)$", line)
+            if not m:
+                failed.append(line)
+                continue
+            target_chat_id = int(m.group(1))
+            tier = m.group(2).strip()
+            if tier not in valid_tiers:
+                failed.append(line)
+                continue
+            conn.execute("UPDATE subscribers SET price_tier=? WHERE chat_id=?", (tier, target_chat_id))
+            updated += 1
+        conn.commit()
+        conn.close()
+        report = f"✅ Оновлено тарифів: {updated}."
+        if failed:
+            report += f"\n\n⚠️ Не вдалось розпізнати {len(failed)} рядок(-ів) (перевірте назву тарифу):\n" + "\n".join(failed[:10])
+        await update.message.reply_text(report, reply_markup=_menu_back_keyboard())
+        return
+
     if action == "bulk_price_text":
         MENU_PENDING.pop(admin_id, None)
         cat_key = pending["category"]
@@ -1837,6 +1896,7 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎯 Кому давати індивідуальні ціни", callback_data="menu_individualtoggle")],
         [InlineKeyboardButton("💰 Задати індивідуальну ціну клієнту", callback_data="menu_individualprices")],
         [InlineKeyboardButton("🏷 Ціновий рівень клієнта (20/50/100кг)", callback_data="menu_pricetierclient")],
+        [InlineKeyboardButton("📝 Масово: тарифи всіх клієнтів", callback_data="menu_bulktier")],
         [InlineKeyboardButton("🧾 Прайс клієнта (як він його бачить)", callback_data="menu_clientpriceview")],
         [InlineKeyboardButton("📋 Список клієнтів і відповідальних", callback_data="menu_resplist")],
         [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
@@ -2126,6 +2186,26 @@ def _profile_summary_text(profile: dict, addresses: list, for_admin: bool = Fals
     )
 
 
+def _ensure_pickup_address(chat_id: int, phone: str | None = None) -> None:
+    """Якщо клієнт обрав зону доставки «Самовивіз» і в нього ще немає жодної адреси —
+    автоматично додає віртуальну адресу «Самовивіз», щоб не питати її вручну."""
+    conn = db()
+    zone_row = conn.execute("SELECT delivery_zone FROM client_profiles WHERE chat_id=?", (chat_id,)).fetchone()
+    if not zone_row or zone_row["delivery_zone"] != "Самовивіз":
+        conn.close()
+        return
+    existing = conn.execute("SELECT id FROM client_addresses WHERE chat_id=?", (chat_id,)).fetchone()
+    if existing:
+        conn.close()
+        return
+    conn.execute(
+        "INSERT INTO client_addresses (chat_id, address, phone, created_at) VALUES (?, ?, ?, ?)",
+        (chat_id, "Самовивіз", phone, datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
 def _get_client_addresses(chat_id: int) -> list:
     conn = db()
     rows = conn.execute(
@@ -2162,24 +2242,30 @@ def _get_last_order_items(chat_id: int) -> list:
 
 
 def _is_valid_phone(text: str) -> bool:
+    text = text.strip()
+    if text.startswith("@"):
+        return bool(re.fullmatch(r"@[A-Za-z0-9_]{5,32}", text))
     digits = re.sub(r"\D", "", text)
     return 9 <= len(digits) <= 13
 
 
 def _normalize_phone(text: str) -> str:
+    text = text.strip()
+    if text.startswith("@"):
+        return text
     digits = re.sub(r"\D", "", text)
     if digits.startswith("380") and len(digits) == 12:
         return "+" + digits
     if digits.startswith("0") and len(digits) == 10:
         return "+38" + digits
-    return "+" + digits if not text.strip().startswith("+") else text.strip()
+    return "+" + digits if not text.startswith("+") else text
 
 
 PROFILE_STEPS = ["full_name", "point_name", "phone", "fop"]
 PROFILE_STEP_PROMPTS = {
     "full_name": "Напишіть, будь ласка, ваше ім'я:",
     "point_name": "Назва точки (кав'ярні/закладу):",
-    "phone": "Контактний номер телефону (наприклад: +380671234567):",
+    "phone": "Контактний номер телефону (наприклад: +380671234567), або нік у Telegram, починаючи з @:",
     "fop": "ФОП (назва/номер, або «немає», якщо не застосовується):",
 }
 PROFILE_FIELD_LABELS = {
@@ -2673,13 +2759,13 @@ async def handle_admin_new_profile_text_step(update: Update, context: ContextTyp
             pending["address_step"] = "phone"
             profile = _get_client_profile(target_chat_id) or {}
             await update.message.reply_text(
-                "Тепер напишіть номер телефону для зв'язку по цій адресі:",
+                "Тепер напишіть номер телефону (або нік Telegram через @) для зв'язку по цій адресі:",
                 reply_markup=_address_phone_keyboard(profile.get("phone"), "adminprofile_cancelstep"),
             )
             return
         if not _is_valid_phone(text):
             await update.message.reply_text(
-                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+                "Це не схоже на номер телефону чи нік Telegram 🤔 Спробуйте ще раз, наприклад: +380671234567 або @nick"
             )
             return
         phone = _normalize_phone(text)
@@ -2706,7 +2792,7 @@ async def handle_admin_new_profile_text_step(update: Update, context: ContextTyp
     if field == "phone":
         if not _is_valid_phone(text):
             await update.message.reply_text(
-                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+                "Це не схоже на номер телефону чи нік Telegram 🤔 Спробуйте ще раз, наприклад: +380671234567 або @nick"
             )
             return
         text = _normalize_phone(text)
@@ -2734,6 +2820,7 @@ async def handle_admin_new_profile_text_step(update: Update, context: ContextTyp
     )
     conn.commit()
     conn.close()
+    _ensure_pickup_address(target_chat_id, data.get("phone"))
     existing_addresses = _get_client_addresses(target_chat_id)
     if existing_addresses:
         ADMIN_NEW_PROFILE_PENDING.pop(admin_id, None)
@@ -2858,14 +2945,14 @@ async def handle_admin_add_address_text(update: Update, context: ContextTypes.DE
         pending["step"] = "phone"
         profile = _get_client_profile(target_chat_id) or {}
         await update.message.reply_text(
-            "Тепер напишіть номер телефону для зв'язку по цій адресі:",
+            "Тепер напишіть номер телефону (або нік Telegram через @) для зв'язку по цій адресі:",
             reply_markup=_address_phone_keyboard(profile.get("phone"), "adminprofile_cancelstep"),
         )
         return
 
     if not _is_valid_phone(text):
         await update.message.reply_text(
-            "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+            "Це не схоже на номер телефону чи нік Telegram 🤔 Спробуйте ще раз, наприклад: +380671234567 або @nick"
         )
         return
     phone = _normalize_phone(text)
@@ -2905,7 +2992,7 @@ async def handle_admin_edit_profile_text_step(update: Update, context: ContextTy
     if field == "phone":
         if not _is_valid_phone(text):
             await update.message.reply_text(
-                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+                "Це не схоже на номер телефону чи нік Telegram 🤔 Спробуйте ще раз, наприклад: +380671234567 або @nick"
             )
             return
         text = _normalize_phone(text)
@@ -2939,7 +3026,7 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
         if field == "phone":
             if not _is_valid_phone(text):
                 await update.message.reply_text(
-                    "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+                    "Це не схоже на номер телефону чи нік Telegram 🤔 Спробуйте ще раз, наприклад: +380671234567 або @nick"
                 )
                 return
             text = _normalize_phone(text)
@@ -2983,7 +3070,7 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
         # address_step == "phone"
         if not _is_valid_phone(text):
             await update.message.reply_text(
-                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+                "Це не схоже на номер телефону чи нік Telegram 🤔 Спробуйте ще раз, наприклад: +380671234567 або @nick"
             )
             return
         phone = _normalize_phone(text)
@@ -3019,7 +3106,7 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
     if field == "phone":
         if not _is_valid_phone(text):
             await update.message.reply_text(
-                "Це не схоже на номер телефону 🤔 Спробуйте ще раз, наприклад: +380671234567"
+                "Це не схоже на номер телефону чи нік Telegram 🤔 Спробуйте ще раз, наприклад: +380671234567 або @nick"
             )
             return
         text = _normalize_phone(text)
@@ -3047,6 +3134,7 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
     )
     conn.commit()
     conn.close()
+    _ensure_pickup_address(chat_id, data.get("phone"))
     addresses = _get_client_addresses(chat_id)
     if not addresses:
         PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
@@ -3518,6 +3606,7 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_delivery_zone_keyboard("profile_zone"),
         )
         return
+    _ensure_pickup_address(chat_id, profile.get("phone"))
     addresses = _get_client_addresses(chat_id)
     if not addresses:
         PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
@@ -3579,6 +3668,7 @@ async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=_delivery_zone_keyboard("profile_zone"),
         )
         return
+    _ensure_pickup_address(chat_id, profile.get("phone"))
     addresses = _get_client_addresses(chat_id)
     if not addresses:
         PROFILE_PENDING[chat_id] = {"adding_address": True, "address_step": "text", "address_data": {}}
@@ -4033,12 +4123,23 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+ADMIN_BTN_SELFORDER = "☕️ Замовити для себе"
+
+
 def _persistent_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("📋 Меню")]],
+        [[KeyboardButton("📋 Меню")], [KeyboardButton(ADMIN_BTN_SELFORDER)]],
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+async def admin_self_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «☕️ Замовити для себе» - адмін оформлює замовлення на власний chat_id,
+    той самий опитувальник, що й у звичайного клієнта."""
+    if not is_admin(update):
+        return
+    await order_start(update, context)
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4134,6 +4235,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         addresses = _get_client_addresses(target_chat_id)
+        if not addresses:
+            _ensure_pickup_address(target_chat_id, profile.get("phone"))
+            addresses = _get_client_addresses(target_chat_id)
         if not addresses:
             await query.edit_message_text(
                 "У цього клієнта ще немає жодної адреси доставки. Спочатку додайте адресу "
@@ -4572,7 +4676,39 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "menu_clientpriceview":
+    if data == "menu_bulktier":
+        conn = db()
+        rows = conn.execute(
+            "SELECT chat_id, name, username, price_tier FROM subscribers WHERE active=1 ORDER BY joined_at DESC"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
+            return
+        lines = []
+        for r in rows:
+            label = _client_display_label(r["chat_id"], r["name"], r["username"])
+            tier = r["price_tier"] or "Роздріб"
+            lines.append(f"{label} — chat_id: {r['chat_id']} — Тариф: {tier}")
+        text_block = "\n".join(lines)
+        MENU_PENDING[admin_id] = {"action": "bulk_tier_text"}
+        message = (
+            "📝 <b>Тарифи всіх клієнтів</b>\n\n"
+            "Відредагуйте слово після «Тариф:» для потрібних клієнтів (Роздріб / 20 кг / 50 кг / "
+            "100 кг / 300 кг) і надішліть весь текст назад ЦІЛИКОМ — навіть рядки, які не міняли.\n\n"
+            f"<code>{text_block}</code>"
+        )
+        if len(message) > 4000:
+            await query.edit_message_text(
+                "Список клієнтів задовгий для одного повідомлення — зверніться до одиночного "
+                "призначення тарифу («🏷 Ціновий рівень клієнта») для частини клієнтів.",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        await query.edit_message_text(message, parse_mode="HTML")
+        return
+
+
         conn = db()
         rows = conn.execute(
             "SELECT chat_id, name, username, price_tier FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
@@ -6128,6 +6264,141 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+PRICE_LIST_SEED_300 = [
+    ('arabika', 'Без Кофеїну Колумбія', '1 кг', 1364.0, 1010.0, 918.0, 858.1, 818.1),
+    ('arabika', 'Без Кофеїну Колумбія', '250 г', 368.0, 273.0, 245.0, 230.3, 220.1),
+    ('arabika', 'Бразилія Сантос +', '1 кг', 1029.0, 739.0, 726.0, 666.1, 626.1),
+    ('arabika', 'Бразилія Сантос +', '250 г', 284.0, 204.0, 197.0, 182.3, 172.1),
+    ('arabika', 'Бразилія Сантос ++', '1 кг', 1029.0, 739.0, 726.0, 666.1, 626.1),
+    ('arabika', 'Бразилія Сантос ++', '250 г', 284.0, 204.0, 197.0, 182.3, 172.1),
+    ('arabika', 'Бразилія Сантос', '1 кг', 1029.0, 739.0, 726.0, 666.1, 626.1),
+    ('arabika', 'Бразилія Сантос', '250 г', 284.0, 204.0, 197.0, 182.3, 172.1),
+    ('arabika', 'Гватемала Huehuetenango', '1 кг', 1194.0, 885.0, 821.0, 760.7, 720.7),
+    ('arabika', 'Гватемала Huehuetenango', '250 г', 326.0, 241.0, 221.0, 206.0, 195.7),
+    ('arabika', 'Гондурас SHG EP', '1 кг', 1118.0, 828.0, 777.0, 716.9, 676.9),
+    ('arabika', 'Гондурас SHG EP', '250 г', 307.0, 227.0, 210.0, 195.0, 184.8),
+    ('arabika', 'Ефіопія Джима Грейд 5', '1 кг', 871.0, 645.0, 634.0, 573.6, 533.6),
+    ('arabika', 'Ефіопія Джима Грейд 5', '250 г', 245.0, 181.0, 178.0, 162.9, 152.7),
+    ('arabika', 'Ефіопія Йоргачеф', '1 кг', 1254.0, 929.0, 855.0, 795.1, 755.1),
+    ('arabika', 'Ефіопія Йоргачеф', '250 г', 347.0, 257.0, 233.0, 218.3, 208.1),
+    ('arabika', 'Ефіопія Сідамо Грейд 4', '1 кг', 1050.0, 778.0, 738.0, 678.0, 638.0),
+    ('arabika', 'Ефіопія Сідамо Грейд 4', '250 г', 296.0, 219.0, 204.0, 189.1, 178.8),
+    ('arabika', 'Індія Плантейшен', '1 кг', 1158.0, 858.0, 795.0, 735.1, 699.8),
+    ('arabika', 'Індія Плантейшен', '250 г', 317.0, 234.0, 215.0, 199.6, 190.5),
+    ('arabika', 'Колумбія Supremo', '1 кг', 1111.0, 823.0, 773.0, 713.0, 673.0),
+    ('arabika', 'Колумбія Supremo', '250 г', 311.0, 231.0, 213.0, 197.8, 187.5),
+    ('arabika', 'Коста-Ріка SHG EP', '1 кг', 1251.0, 927.0, 854.0, 793.6, 754.0),
+    ('arabika', 'Коста-Ріка SHG EP', '250 г', 346.0, 257.0, 233.0, 217.9, 208.0),
+    ('arabika', 'Перу SHB Gr.1', '1 кг', 1164.0, 862.0, 803.0, 743.2, 703.2),
+    ('arabika', 'Перу SHB Gr.1', '250 г', 318.0, 236.0, 217.0, 201.6, 191.3),
+    ('arabika', 'Сальвадор SHG EP', '1 кг', 1166.0, 863.0, 804.0, 744.2, 704.2),
+    ('arabika', 'Сальвадор SHG EP', '250 г', 325.0, 241.0, 221.0, 205.6, 195.4),
+    ('arabika', 'Уганда Bugisu', '1 кг', 980.0, 726.0, 698.0, 638.0, 598.0),
+    ('arabika', 'Уганда Bugisu', '250 г', 279.0, 206.0, 194.0, 179.0, 169.0),
+    ('arabika', 'Руанда Тропікал Кофі', '1 кг', 1059.0, 785.0, 743.0, 683.0, 643.0),
+    ('arabika', 'Руанда Тропікал Кофі', '250 г', 298.0, 221.0, 205.0, 190.0, 180.0),
+    ('arabika', 'Колумбія Infuse Ripe Cherry', '1 кг', 1331.0, 1005.0, 928.0, 838.0, 753.0),
+    ('arabika', 'Колумбія Infuse Ripe Cherry', '250 г', 368.0, 278.0, 251.0, 229.0, 208.0),
+    ('arabika', 'Коста-Ріка Infuse Apricot Brandy', '1 кг', 1405.0, 1061.0, 938.0, 878.0, 793.0),
+    ('arabika', 'Коста-Ріка Infuse Apricot Brandy', '250 г', 387.0, 292.0, 254.0, 239.0, 218.0),
+    ('palay', 'Палай - Гондурас №34 Montecillos', '1 кг', 1632.0, 1077.0, 970.0, 934.0, 753.0),
+    ('palay', 'Палай - Гондурас №34 Montecillos', '250 г', 466.0, 308.0, 277.0, 267.0, 220.0),
+    ('palay', 'Палай - Руанда №30 Cyato', '1 кг', 1832.0, 1210.0, 1089.0, 1048.0, 841.0),
+    ('palay', 'Палай - Руанда №30 Cyato', '250 г', 516.0, 341.0, 306.0, 295.0, 242.0),
+    ('palay', 'Палай - Бразилія №31 Boa Vista', '1 кг', 1873.0, 1236.0, 1113.0, 1072.0, 859.0),
+    ('palay', 'Палай - Бразилія №31 Boa Vista', '250 г', 526.0, 347.0, 313.0, 301.0, 247.0),
+    ('palay', 'Палай - Ефіопія №32 Gedeo', '1 кг', 1940.0, 1281.0, 1153.0, 1110.0, 889.0),
+    ('palay', 'Палай - Ефіопія №32 Gedeo', '250 г', 543.0, 358.0, 323.0, 311.0, 254.0),
+    ('palay', 'Палай - Гондурас №33 Volcano natural', '1 кг', 1988.0, 1312.0, 1181.0, 1137.0, 910.0),
+    ('palay', 'Палай - Гондурас №33 Volcano natural', '250 г', 555.0, 366.0, 330.0, 317.0, 259.0),
+    ('palay', 'Палай - Мікролот Колумбія №28 Pink Bourbon Mosto Recirculated', '250 г', 1034.0, 690.0, 724.0, 664.0, 546.0),
+    ('palay', 'Палай - Мікролот Колумбія №28 Pink Bourbon Mosto Recirculated', '40 г', 223.0, 149.0, 158.0, 143.0, 125.0),
+    ('palay', 'Палай - Мікролот Колумбія №29 Caturra Mosto Dragon Fruit', '250 г', 1049.0, 700.0, 734.0, 674.0, 554.0),
+    ('palay', 'Палай - Мікролот Колумбія №29 Caturra Mosto Dragon Fruit', '40 г', 226.0, 151.0, 160.0, 145.0, 127.0),
+    ('palay', 'Палай - Колумбія №27 Decaf Cane Sugar', '1 кг', 1831.0, 1177.0, 1101.0, 1086.0, 940.0),
+    ('palay', 'Палай - Колумбія №27 Decaf Cane Sugar', '250 г', 509.0, 327.0, 317.0, 302.0, 267.0),
+    ('palay', 'Палай - Індонезія №24 Gayo', '1 кг', 1619.0, 1041.0, 1021.0, 961.0, 836.0),
+    ('palay', 'Палай - Індонезія №24 Gayo', '250 г', 456.0, 293.0, 286.0, 271.0, 241.0),
+    ('palay', 'Палай - Бурунді №20 MUYINGA', '1 кг', 1399.0, 899.0, 890.0, 830.0, 727.0),
+    ('palay', 'Палай - Бурунді №20 MUYINGA', '250 г', 401.0, 258.0, 253.0, 238.0, 213.0),
+    ('palay', 'Палай - Сальвадор №19 ACALEM', '1 кг', 1925.0, 1237.0, 1202.0, 1142.0, 987.0),
+    ('palay', 'Палай - Сальвадор №19 ACALEM', '250 г', 533.0, 342.0, 331.0, 316.0, 278.0),
+    ('palay', 'Палай - Кенія №22 GAKUYUINI', '1 кг', 1804.0, 1160.0, 1131.0, 1071.0, 927.0),
+    ('palay', 'Палай - Кенія №22 GAKUYUINI', '250 г', 503.0, 323.0, 313.0, 298.0, 263.0),
+    ('palay', 'Палай - Кенія Tiriku', '1 кг', 1480.0, 971.0, 885.0, 854.0, 645.0),
+    ('palay', 'Палай - Кенія Tiriku', '250 г', 435.0, 281.0, 255.0, 246.0, 190.0),
+    ('palay', 'Палай - Танзанія Edelweis Oldeani Est.', '1 кг', 1450.0, 1036.0, 889.0, 829.0, 726.0),
+    ('palay', 'Палай - Танзанія Edelweis Oldeani Est.', '250 г', 430.0, 297.0, 253.0, 238.0, 213.0),
+    ('drip', 'Палай - Дріп Колумбія №26 EL MIRADOR - T-SHOK', 'шт', 42.0, 30.0, 30.0, 26.0, 23.0),
+    ('drip', 'Палай - Дріп Колумбія №26 EL MIRADOR', 'упаковка', 327.0, 230.0, 216.0, 201.0, 179.0),
+    ('drip', 'Палай - Дріп Колумбія №27 Decaf Cane Sugar', 'шт', 37.0, 26.0, 26.0, 23.0, 20.0),
+    ('drip', 'Палай - Дріп Колумбія №27 Decaf Cane Sugar', 'упаковка', 294.0, 207.0, 194.0, 181.0, 164.0),
+    ('drip', 'Палай - Дріп Сальвадор №19 ACALEM', 'шт', 39.0, 27.0, 27.0, 24.0, 21.0),
+    ('drip', 'Палай - Дріп Сальвадор №19 ACALEM', 'упаковка', 381.0, 268.0, 251.0, 235.0, 203.0),
+    ('drip', 'Палай - Дріп Ефіопія №23 Yirgacheffe Idido', 'шт', 37.0, 26.0, 26.0, 23.0, 20.0),
+    ('drip', 'Палай - Дріп Ефіопія №23 Yirgacheffe Idido', 'упаковка', 367.0, 259.0, 242.0, 226.0, 197.0),
+    ('drip', 'Палай - Дріп Кенія №22 GAKUYUINI', 'шт', 38.0, 27.0, 27.0, 23.0, 21.0),
+    ('drip', 'Палай - Дріп Кенія №22 GAKUYUINI', 'упаковка', 370.0, 261.0, 244.0, 228.0, 198.0),
+    ('drip', 'Палай - Мікс Дріп №2', 'упаковка', 292.0, 206.0, 193.0, 180.0, 164.0),
+    ('drip', 'Tvoi - Дріп Сальвадор', 'шт', 34.0, 24.0, 24.0, 21.0, 19.0),
+    ('drip', 'Tvoi - Дріп Сальвадор', 'упаковка', 222.0, 157.0, 147.0, 137.0, 133.0),
+    ('drip', 'Tvoi - Дріп Сідамо', 'шт', 33.0, 23.0, 23.0, 20.0, 18.0),
+    ('drip', 'Tvoi - Дріп Сідамо', 'упаковка', 213.0, 150.0, 140.0, 131.0, 129.0),
+    ('drip', 'Tvoi - Дріп Колумбія', 'шт', 34.0, 24.0, 24.0, 21.0, 19.0),
+    ('drip', 'Tvoi - Дріп Колумбія', 'упаковка', 218.0, 154.0, 144.0, 134.0, 131.0),
+    ('drip', 'Tvoi - Tasting Pack', 'упаковка', 218.0, 153.0, 144.0, 134.0, 131.0),
+    ('blend', 'Бленд Арабіки Diamond', '1 кг', 950.0, 704.0, 681.0, 621.0, 581.0),
+    ('blend', 'Бленд Арабіки Diamond', '250 г', 265.0, 196.0, 186.0, 171.0, 161.0),
+    ('blend', 'Бленд Арабіки Sapphire', '1 кг', 1074.0, 796.0, 752.0, 692.0, 652.0),
+    ('blend', 'Бленд Арабіки Sapphire', '250 г', 296.0, 219.0, 204.0, 189.0, 178.0),
+    ('blend', 'Бленд Арабіки Ruby', '1 кг', 953.0, 706.0, 682.0, 622.0, 582.0),
+    ('blend', 'Бленд Арабіки Ruby', '250 г', 272.0, 201.0, 190.0, 175.0, 165.0),
+    ('blend', 'Бленд Black', '1 кг', 770.0, 549.0, 555.0, 497.0, 457.0),
+    ('blend', 'Бленд Black', '250 г', 218.0, 155.0, 155.0, 140.0, 130.0),
+    ('blend', 'Бленд Black Classic', '1 кг', 770.0, 549.0, 543.0, 497.0, 457.0),
+    ('blend', 'Бленд Black Classic', '250 г', 218.0, 155.0, 151.0, 140.0, 130.0),
+    ('blend', 'Бленд Brown', '1 кг', 879.0, 651.0, 640.0, 580.0, 540.0),
+    ('blend', 'Бленд Brown', '250 г', 247.0, 183.0, 176.0, 161.0, 150.0),
+    ('blend', 'Бленд Brown Classic', '1 кг', 866.0, 642.0, 632.0, 572.0, 532.0),
+    ('blend', 'Бленд Brown Classic', '250 г', 244.0, 180.0, 174.0, 159.0, 149.0),
+    ('blend', 'Бленд Crimson Classic', '1 кг', 786.0, 582.0, 586.0, 526.0, 486.0),
+    ('blend', 'Бленд Crimson Classic', '250 г', 224.0, 166.0, 162.0, 147.0, 137.0),
+    ('blend', 'Бленд Amber', '1 кг', 939.0, 696.0, 674.0, 614.0, 574.0),
+    ('blend', 'Бленд Amber', '250 г', 262.0, 194.0, 184.0, 169.0, 159.0),
+    ('blend', 'Бленд Amber Classic', '1 кг', 929.0, 688.0, 668.0, 608.0, 568.0),
+    ('blend', 'Бленд Amber Classic', '250 г', 259.0, 192.0, 183.0, 168.0, 158.0),
+    ('blend', 'Бленд Velvet', '1 кг', 906.0, 671.0, 655.0, 595.0, 555.0),
+    ('blend', 'Бленд Velvet', '250 г', 254.0, 188.0, 180.0, 165.0, 154.0),
+    ('blend', 'Бленд Velvet Classic', '1 кг', 873.0, 647.0, 636.0, 576.0, 536.0),
+    ('blend', 'Бленд Velvet Classic', '250 г', 245.0, 182.0, 175.0, 160.0, 150.0),
+    ('blend', 'Бленд Ivory', '1 кг', 969.0, 718.0, 692.0, 632.0, 592.0),
+    ('blend', 'Бленд Ivory', '250 г', 269.0, 200.0, 189.0, 174.0, 163.0),
+    ('blend', 'Бленд Ivory Classic', '1 кг', 969.0, 718.0, 692.0, 632.0, 592.0),
+    ('blend', 'Бленд Ivory Classic', '250 г', 269.0, 200.0, 189.0, 174.0, 163.0),
+    ('suputni', 'Хімія рідка "Оптімал" від кавових масел 1 л', 'шт', 220.0, 200.0, 200.0, 200.0, 200.0),
+    ('suputni', 'Хімія рідка "Оптімал" для молочних сис-м 1 л', 'шт', 220.0, 200.0, 200.0, 200.0, 200.0),
+    ('suputni', 'Порошок "Coffein Clean" від кавових масел 900г', 'шт', 319.0, 269.0, 269.0, 269.0, 249.0),
+    ('suputni', 'HARIO BOX V60 паперові фільтри - 01 - 40шт', 'шт', 112.0, 110.0, 110.0, 110.0, 110.0),
+    ('suputni', 'HARIO BOX V60 паперові фільтри - 02 - 40шт', 'шт', 132.0, 110.0, 110.0, 110.0, 100.0),
+    ('suputni', 'HARIO V60 білі фільтри Набір 100 шт - Білий, 02', 'шт', 220.0, 220.0, 220.0, 220.0, 220.0),
+    ('suputni', 'Фільтри Bravilor (Mondo|Novo|Matic) 50 шт.', 'шт', 100.0, 90.0, 90.0, 90.0, 80.0),
+    ('suputni', 'Фільтри Bravilor (Mondo|Novo|Matic) 250 шт.', 'шт', 440.0, 405.0, 405.0, 405.0, 405.0),
+    ('suputni', 'Пітчер для молока, 350 мл, срібний', 'шт', 400.0, 360.0, 360.0, 360.0, 360.0),
+    ('suputni', 'Пітчер для молока, 600 мл, срібний', 'шт', 470.0, 440.0, 440.0, 440.0, 440.0),
+    ('suputni', 'Щітка для чищення групи кавомашини VD, чорна', 'шт', 110.0, 95.0, 95.0, 95.0, 95.0),
+    ('suputni', 'Щітка для чищення групи кавомашини VD big brush', 'шт', 150.0, 135.0, 135.0, 135.0, 135.0),
+    ('suputni', 'Темпер VD Coffee Classic чорний 53 мм', 'шт', 590.0, 530.0, 530.0, 530.0, 530.0),
+    ('suputni', 'Темпер VD Coffee Classic чорний 58 мм', 'шт', 590.0, 530.0, 530.0, 530.0, 530.0),
+    ('suputni', 'Килимок кутовий VD Coffee Small', 'шт', 230.0, 215.0, 215.0, 215.0, 215.0),
+    ('suputni', 'Килимок кутовий VD Coffee', 'шт', 350.0, 310.0, 310.0, 310.0, 310.0),
+    ('suputni', 'Сито сліпе 54-58', 'шт', 100.0, 70.0, 70.0, 70.0, 70.0),
+    ('arabika', "Робуста В'єтнам WP 18", '1 кг', 705.0, 522.0, 525.0, 480.0, 440.0),
+    ('arabika', "Робуста В'єтнам WP 18", '250 г', 203.0, 151.0, 148.0, 136.0, 125.0),
+    ('arabika', 'Робуста Індія Черрі АА', '1 кг', 726.0, 538.0, 537.0, 492.0, 452.0),
+    ('arabika', 'Робуста Індія Черрі АА', '250 г', 209.0, 154.0, 151.0, 139.0, 128.0)
+]
+
+
 PRICE_LIST_SEED = [
     ('arabika', 'Без Кофеїну Колумбія', '1 кг', 1364.0, 1010.0, 918.0, 858.1),
     ('arabika', 'Без Кофеїну Колумбія', '250 г', 368.0, 273.0, 245.0, 230.3),
@@ -6264,13 +6535,29 @@ PRICE_LIST_SEED = [
 
 
 def _seed_item_prices_if_empty():
-    """Одноразово заповнює прайс стартовими цінами з прайс-листа (Роздріб, 20кг, 50кг, 100кг),
+    """Одноразово заповнює прайс стартовими цінами з прайс-листа (Роздріб, 20кг, 50кг, 100кг, 300кг),
     але тільки якщо таблиця ще зовсім порожня - щоб не затирати ручні правки адміна."""
     conn = db()
     conn.execute("UPDATE item_prices SET category='palay' WHERE category='mosto'")
     conn.execute("UPDATE client_item_prices SET category='palay' WHERE category='mosto'")
     conn.execute("UPDATE subscribers SET price_tier='Роздріб' WHERE price_tier IS NULL")
     conn.commit()
+
+    # Окрема одноразова міграція: додає тариф "300 кг", навіть якщо прайс уже був заповнений
+    # раніше (до появи цього тарифу) - не чіпає жодну з інших цін.
+    if _get_setting("price_300_seeded", "") != "1":
+        for cat, base, unit, roz, p20, p50, p100, p300 in PRICE_LIST_SEED_300:
+            if p300 is None:
+                continue
+            conn.execute(
+                "INSERT INTO item_prices (category, item_name, unit, tier, price) VALUES (?, ?, ?, '300 кг', ?) "
+                "ON CONFLICT(category, item_name, unit, tier) DO UPDATE SET price=excluded.price",
+                (cat, base, unit, p300),
+            )
+        conn.commit()
+        _set_setting("price_300_seeded", "1")
+        logger.info(f"[PRICE-SEED-300] Додано тариф 300 кг: {len(PRICE_LIST_SEED_300)} позицій.")
+
     count = conn.execute("SELECT COUNT(*) c FROM item_prices").fetchone()["c"]
     if count > 0:
         conn.close()
@@ -6340,6 +6627,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_INSTRUCTIONS)}$"), client_show_instructions))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_MANAGER)}$"), client_contact_manager))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER)}$"), order_start))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(ADMIN_BTN_SELFORDER)}$"), admin_self_order))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_PROFILE)}$"), profile_show))
     application.add_handler(CallbackQueryHandler(profile_edit_callback, pattern=r"^profile_edit$"))
     application.add_handler(CallbackQueryHandler(profile_editfield_callback, pattern=r"^profile_editfield:"))
@@ -6380,6 +6668,7 @@ def main():
     application.add_handler(CallbackQueryHandler(assign_callback, pattern=r"^assign:"))
     application.add_handler(CallbackQueryHandler(pickresp_callback, pattern=r"^pickresp:"))
     application.add_handler(CallbackQueryHandler(respme_callback, pattern=r"^respme:"))
+    application.add_handler(CallbackQueryHandler(newtier_callback, pattern=r"^newtier:"))
     application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu_"))
     application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^(bc_|bcq_)"))
     application.add_handler(CallbackQueryHandler(qna_order_callback, pattern=r"^qna_order$"))
