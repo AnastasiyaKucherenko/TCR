@@ -1300,22 +1300,17 @@ def _get_client_price_tier(chat_id: int | None) -> str:
     return (row["price_tier"] if row and row["price_tier"] else "Роздріб")
 
 
-def _get_item_price(category: str, item_name: str, unit: str, chat_id: int | None = None) -> float | None:
-    """Повертає ціну позиції в такому пріоритеті:
-    1) індивідуальна ціна клієнта (якщо задана) — найвищий пріоритет;
-    2) ціна для цінового рівня (тарифу) клієнта (20кг/50кг/100кг тощо);
-    3) якщо для тарифу ціни немає — відкат на звичайну роздрібну ціну."""
-    conn = db()
-    if chat_id is not None:
-        row = conn.execute(
-            "SELECT price FROM client_item_prices WHERE chat_id=? AND category=? AND item_name=? AND unit=?",
-            (chat_id, category, item_name, unit),
-        ).fetchone()
-        if row:
-            conn.close()
-            return row["price"]
+def _normalize_item_name(s: str) -> str:
+    s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
 
-    tier = _get_client_price_tier(chat_id)
+
+def _find_price_in_tier(category: str, item_name: str, unit: str, tier: str) -> float | None:
+    """Шукає ціну для тарифу: спочатку точний збіг назви, потім - толерантний
+    (без урахування дужок/регістру/пробілів), щоб дрібні відмінності в написанні
+    (типу "(декаф)") не ламали показ ціни клієнту."""
+    conn = db()
     row = conn.execute(
         "SELECT price FROM item_prices WHERE category=? AND item_name=? AND unit=? AND tier=?",
         (category, item_name, unit, tier),
@@ -1324,15 +1319,48 @@ def _get_item_price(category: str, item_name: str, unit: str, chat_id: int | Non
         conn.close()
         return row["price"]
 
-    if tier != "Роздріб":
-        row = conn.execute(
-            "SELECT price FROM item_prices WHERE category=? AND item_name=? AND unit=? AND tier='Роздріб'",
-            (category, item_name, unit),
-        ).fetchone()
-        if row:
-            conn.close()
-            return row["price"]
+    rows = conn.execute(
+        "SELECT item_name, price FROM item_prices WHERE category=? AND unit=? AND tier=?",
+        (category, unit, tier),
+    ).fetchall()
     conn.close()
+    target = _normalize_item_name(item_name)
+    if not target:
+        return None
+    best = None
+    for r in rows:
+        cand = _normalize_item_name(r["item_name"])
+        if cand == target:
+            return r["price"]
+        if cand and (cand in target or target in cand):
+            best = r["price"]
+    return best
+
+
+def _get_item_price(category: str, item_name: str, unit: str, chat_id: int | None = None) -> float | None:
+    """Повертає ціну позиції в такому пріоритеті:
+    1) індивідуальна ціна клієнта (якщо задана) — найвищий пріоритет;
+    2) ціна для цінового рівня (тарифу) клієнта (20кг/50кг/100кг тощо);
+    3) якщо для тарифу ціни немає — відкат на звичайну роздрібну ціну."""
+    if chat_id is not None:
+        conn = db()
+        row = conn.execute(
+            "SELECT price FROM client_item_prices WHERE chat_id=? AND category=? AND item_name=? AND unit=?",
+            (chat_id, category, item_name, unit),
+        ).fetchone()
+        conn.close()
+        if row:
+            return row["price"]
+
+    tier = _get_client_price_tier(chat_id)
+    price = _find_price_in_tier(category, item_name, unit, tier)
+    if price is not None:
+        return price
+
+    if tier != "Роздріб":
+        price = _find_price_in_tier(category, item_name, unit, "Роздріб")
+        if price is not None:
+            return price
     return None
 
 
@@ -1384,14 +1412,15 @@ def _invoice_toggle_keyboard() -> InlineKeyboardMarkup:
 def _individual_toggle_keyboard() -> InlineKeyboardMarkup:
     conn = db()
     rows = conn.execute(
-        "SELECT chat_id, name, username, is_individual_pricing FROM subscribers WHERE active=1 "
+        "SELECT chat_id, name, username, is_individual_pricing, price_tier FROM subscribers WHERE active=1 "
         "ORDER BY joined_at DESC LIMIT 60"
     ).fetchall()
     conn.close()
     buttons = []
     for r in rows:
         mark = "✅" if r["is_individual_pricing"] else "⬜"
-        label = f"{mark} {_client_display_label(r['chat_id'], r['name'], r['username'])}"
+        tier_note = f" ({r['price_tier']})" if r["is_individual_pricing"] and r["price_tier"] else ""
+        label = f"{mark} {_client_display_label(r['chat_id'], r['name'], r['username'])}{tier_note}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"menu_individualtoggle2:{r['chat_id']}")])
     buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
     return InlineKeyboardMarkup(buttons)
@@ -1893,7 +1922,6 @@ ASSORTMENT_CATEGORIES = [
     ("arabika", "🌰 Арабіка"),
     ("blend", "🔥 Бленд"),
     ("palay", "✨ Палай"),
-    ("mosto", "💫 Мосто"),
     ("drip", "💧 Дріп"),
     ("suputni", "🧰 Супутні товари"),
     ("school", "🎓 Школа бариста"),
@@ -1905,8 +1933,7 @@ ORDER_CATEGORIES = [c for c in ASSORTMENT_CATEGORIES if c[0] != "school"]
 CATEGORY_UNITS = {
     "arabika": ["250 г", "1 кг"],
     "blend": ["250 г", "1 кг"],
-    "palay": ["250 г", "1 кг"],
-    "mosto": ["40 г", "250 г"],
+    "palay": ["40 г", "250 г", "1 кг"],
     "drip": ["шт", "упаковка"],
     "suputni": ["шт"],
 }
@@ -3009,7 +3036,7 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
 
 ORDER_WEIGHTS = ["1 кг", "0,5 кг", "0,25 кг"]
 ORDER_QUANTITIES = ["1", "5", "10"]
-COFFEE_CATEGORIES = ("arabika", "palay", "blend", "mosto")
+COFFEE_CATEGORIES = ("arabika", "palay", "blend")
 
 
 def _item_line_total(item: dict) -> float | None:
@@ -3063,13 +3090,11 @@ def _order_category_keyboard(back_callback: str | None = None) -> InlineKeyboard
     return InlineKeyboardMarkup(buttons)
 
 
-def _order_weight_keyboard(cat_key: str, item_text: str, chat_id: int | None = None) -> InlineKeyboardMarkup:
-    units = CATEGORY_UNITS.get(cat_key, ORDER_WEIGHTS)
+def _order_unit_keyboard(cat_key: str) -> InlineKeyboardMarkup:
+    units = CATEGORY_UNITS.get(cat_key, ["шт"])
     buttons, row = [], []
     for u in units:
-        price = _get_item_price(cat_key, item_text, u, chat_id)
-        label = f"{u} — {price:g} грн" if price is not None else u
-        row.append(InlineKeyboardButton(label, callback_data=f"order_weight:{u}"))
+        row.append(InlineKeyboardButton(u, callback_data=f"order_pickunit:{u}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -3079,7 +3104,29 @@ def _order_weight_keyboard(cat_key: str, item_text: str, chat_id: int | None = N
     return InlineKeyboardMarkup(buttons)
 
 
-def _order_qty_keyboard(back_callback: str = "order_back_to_weight") -> InlineKeyboardMarkup:
+def _order_itemlist_screen(order: dict, chat_id: int | None = None):
+    cur = order.get("current_item", {})
+    cat_key = cur.get("category", "")
+    unit = cur.get("weight", "")
+    label = dict(ORDER_CATEGORIES).get(cat_key, cat_key)
+    choices = order.get("current_item_choices", [])
+    buttons, row = [], []
+    for i, m in enumerate(choices):
+        price = _get_item_price(cat_key, m, unit, chat_id)
+        btn_label = f"{m} — {price:g} грн" if price is not None else m
+        row.append(InlineKeyboardButton(btn_label, callback_data=f"order_pick_item:{i}"))
+        if len(row) == 1:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    back_cb = "order_back_to_unit" if len(CATEGORY_UNITS.get(cat_key, ["шт"])) > 1 else "order_back_to_cat"
+    buttons.append(_order_cancel_row(back_cb))
+    text = f"{label}, {unit}\n\nОберіть позицію:"
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _order_qty_keyboard(back_callback: str = "order_back_to_itemlist") -> InlineKeyboardMarkup:
     row = [InlineKeyboardButton(q, callback_data=f"order_qty:{q}") for q in ORDER_QUANTITIES]
     return InlineKeyboardMarkup([
         row,
@@ -3091,7 +3138,7 @@ def _order_qty_keyboard(back_callback: str = "order_back_to_weight") -> InlineKe
 PACKAGING_OPTIONS = ["Крафт", "Бренд", "Білий не бренд", "Чорний"]
 
 
-def _order_packaging_keyboard(back_callback: str = "order_back_to_weight") -> InlineKeyboardMarkup:
+def _order_packaging_keyboard(back_callback: str = "order_back_to_itemlist") -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(p, callback_data=f"order_packaging:{p}")] for p in PACKAGING_OPTIONS]
     buttons.append(_order_cancel_row(back_callback))
     return InlineKeyboardMarkup(buttons)
@@ -3189,7 +3236,7 @@ def _order_grind_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🌰 Зерно", callback_data="order_grind:Зерно"),
             InlineKeyboardButton("⚙️ Молоте", callback_data="order_grind:Молоте"),
         ],
-        _order_cancel_row("order_back_to_weight"),
+        _order_cancel_row("order_back_to_itemlist"),
     ])
 
 
@@ -3671,16 +3718,17 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         order["current_item"] = {"category": cat_key}
         order["current_item_choices"] = items[:80]
-        buttons, row = [], []
-        for i, m in enumerate(order["current_item_choices"]):
-            row.append(InlineKeyboardButton(m, callback_data=f"order_pick_item:{i}"))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-        buttons.append(_order_cancel_row("order_back_to_cat"))
-        await query.edit_message_text(f"{label}\n\nОберіть позицію:", reply_markup=InlineKeyboardMarkup(buttons))
+        units = CATEGORY_UNITS.get(cat_key, ["шт"])
+        if len(units) == 1:
+            order["current_item"]["weight"] = units[0]
+            order["step"] = "itemlist"
+            text, kb = _order_itemlist_screen(order, target_chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+        order["step"] = "unit"
+        await query.edit_message_text(
+            f"{label}\n\nОберіть вагу/фасування:", reply_markup=_order_unit_keyboard(cat_key)
+        )
         return
 
     if data == "order_back_to_cat":
@@ -3692,6 +3740,30 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("order_pickunit:"):
+        _, unit = data.split(":", 1)
+        order["current_item"]["weight"] = unit
+        order["step"] = "itemlist"
+        text, kb = _order_itemlist_screen(order, target_chat_id)
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if data == "order_back_to_unit":
+        cur = order.get("current_item", {})
+        cat_key = cur.get("category", "")
+        label = dict(ORDER_CATEGORIES).get(cat_key, cat_key)
+        order["step"] = "unit"
+        await query.edit_message_text(
+            f"{label}\n\nОберіть вагу/фасування:", reply_markup=_order_unit_keyboard(cat_key)
+        )
+        return
+
+    if data == "order_back_to_itemlist":
+        order["step"] = "itemlist"
+        text, kb = _order_itemlist_screen(order, target_chat_id)
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
     if data.startswith("order_pick_item:"):
         _, idx_str = data.split(":", 1)
         idx = int(idx_str)
@@ -3699,50 +3771,29 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx >= len(choices):
             await query.answer("Ця позиція вже неактуальна, спробуйте ще раз.", show_alert=True)
             return
-        order["current_item"]["item_text"] = choices[idx]
-        cat_key = order["current_item"]["category"]
+        cur = order["current_item"]
+        cur["item_text"] = choices[idx]
+        cat_key = cur["category"]
+        unit = cur.get("weight")
+        price = _get_item_price(cat_key, choices[idx], unit, target_chat_id)
+        cur["price"] = price
+        price_line = f" — {price:g} грн/{unit}" if price is not None else f" — {unit}"
         if cat_key in NO_WEIGHT_CATEGORIES:
-            unit = CATEGORY_UNITS.get(cat_key, ["шт"])[0]
-            order["current_item"]["weight"] = unit
-            price = _get_item_price(cat_key, choices[idx], unit, target_chat_id)
-            order["current_item"]["price"] = price
             order["step"] = "qty"
-            price_line = f" — {price:g} грн/{unit}" if price is not None else ""
             await query.edit_message_text(
                 f"Обрано: {choices[idx]}{price_line}\n\nЯка кількість?",
-                reply_markup=_order_qty_keyboard("order_back_to_cat"),
+                reply_markup=_order_qty_keyboard("order_back_to_itemlist"),
             )
-        else:
-            order["step"] = "weight"
-            await query.edit_message_text(
-                f"Обрано: {choices[idx]}\n\nОберіть вагу/фасування:",
-                reply_markup=_order_weight_keyboard(cat_key, choices[idx], target_chat_id),
-            )
-        return
-
-    if data.startswith("order_weight:"):
-        _, weight = data.split(":", 1)
-        order["current_item"]["weight"] = weight
-        cat_key = order["current_item"]["category"]
-        order["current_item"]["price"] = _get_item_price(
-            cat_key, order["current_item"]["item_text"], weight, target_chat_id
-        )
-        if cat_key in COFFEE_CATEGORIES:
+        elif cat_key in COFFEE_CATEGORIES:
             order["step"] = "grind"
-            await query.edit_message_text("Зерно чи молоте?", reply_markup=_order_grind_keyboard())
+            await query.edit_message_text(
+                f"Обрано: {choices[idx]}{price_line}\n\nЗерно чи молоте?",
+                reply_markup=_order_grind_keyboard(),
+            )
         else:
-            next_step, next_text, next_kb = _next_after_options(chat_id, "order_back_to_weight")
+            next_step, next_text, next_kb = _next_after_options(chat_id, "order_back_to_itemlist")
             order["step"] = next_step
-            await query.edit_message_text(next_text, reply_markup=next_kb)
-        return
-
-    if data == "order_back_to_weight":
-        order["step"] = "weight"
-        cur = order.get("current_item", {})
-        await query.edit_message_text(
-            "Оберіть вагу/фасування:",
-            reply_markup=_order_weight_keyboard(cur.get("category", ""), cur.get("item_text", ""), target_chat_id),
-        )
+            await query.edit_message_text(f"Обрано: {choices[idx]}{price_line}\n\n{next_text}", reply_markup=next_kb)
         return
 
     if data.startswith("order_grind:"):
@@ -3751,7 +3802,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if grind == "Молоте":
             await query.edit_message_text("На який помел?", reply_markup=_order_grind_type_keyboard())
         else:
-            next_step, next_text, next_kb = _next_after_options(chat_id, "order_back_to_weight")
+            next_step, next_text, next_kb = _next_after_options(chat_id, "order_back_to_itemlist")
             order["step"] = next_step
             await query.edit_message_text(next_text, reply_markup=next_kb)
         return
@@ -3773,7 +3824,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, packaging = data.split(":", 1)
         order["current_item"]["packaging"] = packaging
         order["step"] = "qty"
-        back_to = "order_back_to_grind" if order["current_item"].get("grind") else "order_back_to_weight"
+        back_to = "order_back_to_grind" if order["current_item"].get("grind") else "order_back_to_itemlist"
         await query.edit_message_text("Яка кількість?", reply_markup=_order_qty_keyboard(back_to))
         return
 
@@ -4397,7 +4448,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_individualtoggle":
         await query.edit_message_text(
             "Оберіть клієнтів, яким давати індивідуальні ціни "
-            "(тап додає/прибирає позначку, зберігається одразу):",
+            "(тап додає/прибирає позначку, зберігається одразу).\n\n"
+            "При увімкненні клієнт автоматично отримує базу як тариф «20 кг» на всі товари — "
+            "а окремі позиції потім можна перевизначити через «💰 Задати індивідуальну ціну клієнту».",
             reply_markup=_individual_toggle_keyboard(),
         )
         return
@@ -4408,7 +4461,15 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = db()
         row = conn.execute("SELECT is_individual_pricing FROM subscribers WHERE chat_id=?", (target_chat_id,)).fetchone()
         new_val = 0 if (row and row["is_individual_pricing"]) else 1
-        conn.execute("UPDATE subscribers SET is_individual_pricing=? WHERE chat_id=?", (new_val, target_chat_id))
+        if new_val == 1:
+            # Індивідуальний клієнт за замовчуванням отримує базу як тариф "20 кг",
+            # а конкретні позиції можна далі перевизначити окремо через "💰 Задати індивідуальну ціну клієнту"
+            conn.execute(
+                "UPDATE subscribers SET is_individual_pricing=1, price_tier='20 кг' WHERE chat_id=?",
+                (target_chat_id,),
+            )
+        else:
+            conn.execute("UPDATE subscribers SET is_individual_pricing=0 WHERE chat_id=?", (target_chat_id,))
         conn.commit()
         conn.close()
         await query.edit_message_reply_markup(reply_markup=_individual_toggle_keyboard())
@@ -5983,10 +6044,10 @@ PRICE_LIST_SEED = [
     ('palay', 'Палай - Ефіопія №32 Gedeo', '250 г', 543.0, 358.0, 323.0, 311.0),
     ('palay', 'Палай - Гондурас №33 Volcano natural', '1 кг', 1988.0, 1312.0, 1181.0, 1137.0),
     ('palay', 'Палай - Гондурас №33 Volcano natural', '250 г', 555.0, 366.0, 330.0, 317.0),
-    ('mosto', 'Палай - Мікролот Колумбія №28 Pink Bourbon Mosto Recirculated', '250 г', 1034.0, 690.0, 724.0, 664.0),
-    ('mosto', 'Палай - Мікролот Колумбія №28 Pink Bourbon Mosto Recirculated', '40 г', 223.0, 149.0, 158.0, 143.0),
-    ('mosto', 'Палай - Мікролот Колумбія №29 Caturra Mosto Dragon Fruit', '250 г', 1049.0, 700.0, 734.0, 674.0),
-    ('mosto', 'Палай - Мікролот Колумбія №29 Caturra Mosto Dragon Fruit', '40 г', 226.0, 151.0, 160.0, 145.0),
+    ('palay', 'Палай - Мікролот Колумбія №28 Pink Bourbon Mosto Recirculated', '250 г', 1034.0, 690.0, 724.0, 664.0),
+    ('palay', 'Палай - Мікролот Колумбія №28 Pink Bourbon Mosto Recirculated', '40 г', 223.0, 149.0, 158.0, 143.0),
+    ('palay', 'Палай - Мікролот Колумбія №29 Caturra Mosto Dragon Fruit', '250 г', 1049.0, 700.0, 734.0, 674.0),
+    ('palay', 'Палай - Мікролот Колумбія №29 Caturra Mosto Dragon Fruit', '40 г', 226.0, 151.0, 160.0, 145.0),
     ('palay', 'Палай - Колумбія №27 Decaf Cane Sugar', '1 кг', 1831.0, 1177.0, 1101.0, 1086.0),
     ('palay', 'Палай - Колумбія №27 Decaf Cane Sugar', '250 г', 509.0, 327.0, 317.0, 302.0),
     ('palay', 'Палай - Індонезія №24 Gayo', '1 кг', 1619.0, 1041.0, 1021.0, 961.0),
@@ -6075,6 +6136,10 @@ def _seed_item_prices_if_empty():
     """Одноразово заповнює прайс стартовими цінами з прайс-листа (Роздріб, 20кг, 50кг, 100кг),
     але тільки якщо таблиця ще зовсім порожня - щоб не затирати ручні правки адміна."""
     conn = db()
+    conn.execute("UPDATE item_prices SET category='palay' WHERE category='mosto'")
+    conn.execute("UPDATE client_item_prices SET category='palay' WHERE category='mosto'")
+    conn.execute("UPDATE subscribers SET price_tier='Роздріб' WHERE price_tier IS NULL")
+    conn.commit()
     count = conn.execute("SELECT COUNT(*) c FROM item_prices").fetchone()["c"]
     if count > 0:
         conn.close()
