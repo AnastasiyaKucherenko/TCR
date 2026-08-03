@@ -961,8 +961,10 @@ def _clients_with_admin_text(max_len: int = 3500) -> str:
     for r in rows:
         admin_label = r["admin_name"] if r["admin_name"] else "❓ не призначено"
         display = _client_display_label(r["chat_id"], r["name"], r["username"])
+        real_name = f"{r['name']} (@{r['username'] or '—'})"
+        name_part = f"{display} — {real_name}" if display != real_name else display
         line = (
-            f"• {display} — chat_id: {r['chat_id']}\n"
+            f"• {name_part} — chat_id: {r['chat_id']}\n"
             f"   Група: {r['segment'] or 'немає'} | Відповідальний: {admin_label}\n"
         )
         if len(header) + len(body) + len(line) + len(footer) > max_len:
@@ -1732,6 +1734,33 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action == "bulk_price_text":
+        MENU_PENDING.pop(admin_id, None)
+        cat_key = pending["category"]
+        tier = pending["tier"]
+        updated, failed = 0, []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) != 3:
+                failed.append(line)
+                continue
+            item_name, unit, price_str = parts
+            try:
+                price = float(price_str.replace(",", "."))
+            except ValueError:
+                failed.append(line)
+                continue
+            _set_item_price(cat_key, item_name, unit, tier, price)
+            updated += 1
+        report = f"✅ Оновлено цін: {updated}."
+        if failed:
+            report += f"\n\n⚠️ Не вдалось розпізнати {len(failed)} рядок(-ів):\n" + "\n".join(failed[:10])
+        await update.message.reply_text(report, reply_markup=_menu_back_keyboard())
+        return
+
     if action == "bc_name":
         MENU_PENDING.pop(admin_id, None)
         pending = BC_PENDING.setdefault(admin_id, {})
@@ -1808,6 +1837,7 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎯 Кому давати індивідуальні ціни", callback_data="menu_individualtoggle")],
         [InlineKeyboardButton("💰 Задати індивідуальну ціну клієнту", callback_data="menu_individualprices")],
         [InlineKeyboardButton("🏷 Ціновий рівень клієнта (20/50/100кг)", callback_data="menu_pricetierclient")],
+        [InlineKeyboardButton("🧾 Прайс клієнта (як він його бачить)", callback_data="menu_clientpriceview")],
         [InlineKeyboardButton("📋 Список клієнтів і відповідальних", callback_data="menu_resplist")],
         [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
         [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
@@ -4219,12 +4249,57 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         context.chat_data["price_items"] = items
+        label = dict(ORDER_CATEGORIES).get(cat_key, cat_key)
         buttons = [
+            [InlineKeyboardButton("📝 Масово текстом (швидко для багатьох позицій)", callback_data=f"menu_pricebulk:{cat_key}")],
+        ]
+        buttons += [
             [InlineKeyboardButton(m[:60], callback_data=f"menu_priceitem:{cat_key}:{i}")]
             for i, m in enumerate(items[:80])
         ]
         buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
-        await query.edit_message_text("Оберіть позицію:", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text(
+            f"{label} — оберіть позицію окремо, або відредагуйте все масово текстом:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("menu_pricebulk:"):
+        _, cat_key = data.split(":", 1)
+        buttons = [[InlineKeyboardButton(t, callback_data=f"menu_pricebulktier:{cat_key}:{t}")] for t in PRICE_TIERS]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "Для якого цінового рівня масово відредагувати ціни?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("menu_pricebulktier:"):
+        _, cat_key, tier = data.split(":", 2)
+        items = _parse_assortment_items(cat_key)
+        units = CATEGORY_UNITS.get(cat_key, ["шт"])
+        lines = []
+        for item_name in items:
+            for unit in units:
+                price = _find_price_in_tier(cat_key, item_name, unit, tier)
+                price_str = f"{price:g}" if price is not None else "0"
+                lines.append(f"{item_name} | {unit} | {price_str}")
+        text_block = "\n".join(lines)
+        label = dict(ORDER_CATEGORIES).get(cat_key, cat_key)
+        MENU_PENDING[admin_id] = {"action": "bulk_price_text", "category": cat_key, "tier": tier}
+        message = (
+            f"📝 <b>{label}, тариф «{tier}»</b>\n\n"
+            f"Відредагуйте потрібні цифри нижче і надішліть текст назад ЦІЛИКОМ (весь список, "
+            f"навіть рядки, які не міняли) — формат кожного рядка: <code>Назва | Одиниця | Ціна</code>\n\n"
+            f"<code>{text_block}</code>"
+        )
+        if len(message) > 4000:
+            await query.edit_message_text(
+                "Для цієї категорії список зависокий для одного повідомлення. "
+                "Відредагуйте, будь ласка, по одній позиції окремо.",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        await query.edit_message_text(message, parse_mode="HTML")
         return
 
     if data.startswith("menu_priceitem:"):
@@ -4495,6 +4570,62 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "Кому призначити ціновий рівень? (в дужках — поточний рівень)", reply_markup=InlineKeyboardMarkup(buttons)
         )
+        return
+
+    if data == "menu_clientpriceview":
+        conn = db()
+        rows = conn.execute(
+            "SELECT chat_id, name, username, price_tier FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
+            return
+        buttons = [
+            [InlineKeyboardButton(
+                f"{_client_display_label(r['chat_id'], r['name'], r['username'])} ({r['price_tier'] or 'Роздріб'})",
+                callback_data=f"menu_clientpriceviewpick:{r['chat_id']}",
+            )]
+            for r in rows
+        ]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "Прайс якого клієнта переглянути? (так, як його бачить саме він)",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("menu_clientpriceviewpick:"):
+        _, target_chat_id_str = data.split(":", 1)
+        buttons = [
+            [InlineKeyboardButton(label, callback_data=f"menu_clientpriceviewcat:{target_chat_id_str}:{key}")]
+            for key, label in ORDER_CATEGORIES
+        ]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text("Яку категорію показати?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("menu_clientpriceviewcat:"):
+        _, target_chat_id_str, cat_key = data.split(":", 2)
+        target_chat_id = int(target_chat_id_str)
+        items = _parse_assortment_items(cat_key)
+        units = CATEGORY_UNITS.get(cat_key, ["шт"])
+        label = dict(ORDER_CATEGORIES).get(cat_key, cat_key)
+        conn = db()
+        client_row = conn.execute("SELECT name, username, price_tier FROM subscribers WHERE chat_id=?", (target_chat_id,)).fetchone()
+        conn.close()
+        client_label = _client_display_label(target_chat_id, client_row["name"], client_row["username"]) if client_row else str(target_chat_id)
+        tier = client_row["price_tier"] if client_row else "Роздріб"
+        lines = [f"🧾 <b>{_esc(client_label)}</b> (тариф: {tier})\n<b>{label}</b>\n"]
+        for item_name in items:
+            for unit in units:
+                price = _get_item_price(cat_key, item_name, unit, target_chat_id)
+                price_str = f"{price:g} грн" if price is not None else "—"
+                lines.append(f"{_esc(item_name)} — {unit}: {price_str}")
+        text_block = "\n".join(lines)
+        if len(text_block) > 4000:
+            text_block = text_block[:3980] + "\n\n…(список задовгий, показано частково)"
+        await query.edit_message_text(text_block, parse_mode="HTML", reply_markup=_menu_back_keyboard())
         return
 
     if data.startswith("menu_pricetierpick:"):
