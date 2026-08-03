@@ -101,6 +101,9 @@ BC_CANCEL_SELECTIONS: dict[int, set[int]] = {}
 # Поточний текст повідомлення замовлення в групі (щоб відновити його при скасуванні видалення)
 GROUP_ORDER_TEXT: dict[tuple[int, int], str] = {}
 
+# Місця, де показане замовлення з кнопкою "забрав/не забрав" - щоб синхронно оновлювати всі копії
+PICKUP_MESSAGE_LOCATIONS: dict[int, list] = {}
+
 # Адмін пише новий текст для замовлення в групі: admin_chat_id -> {"group_chat_id":..., "message_id":...}
 ADMIN_GROUPEDIT_PENDING: dict[int, dict] = {}
 
@@ -3419,15 +3422,18 @@ def _order_client_summary_text(order: dict, profile: dict) -> str:
 
 
 def _order_summary_text(order: dict, profile: dict) -> str:
+    is_pickup = profile.get("delivery_zone") == "Самовивіз"
     lines = [
         "🆕 <b>НОВЕ ЗАМОВЛЕННЯ</b> 🆕",
         f"📅 <b>Дата виконання: {_esc(order.get('date') or '—')}</b>",
         "",
         f"👤 Клієнт: <b>{_esc(profile.get('full_name') or '—')}</b>",
         f"🏪 Точка: <b>{_esc(profile.get('point_name') or '—')}</b>",
-        f"🗺 Зона доставки: {_esc(profile.get('delivery_zone') or '—')}",
+        f"🚚 Спосіб доставки: {_esc(profile.get('delivery_zone') or '—')}",
+    ] + ([] if is_pickup else [
         f"📍 Адреса: {_esc(order.get('address') or '—')}",
         f"📞 Телефон для доставки: {_esc(order.get('contact_phone') or '—')}",
+    ]) + [
         f"📞 Телефон: {_esc(profile.get('phone') or '—')}",
         f"🏢 ФОП: {_esc(profile.get('fop') or '—')}",
         f"💳 Оплата: {_esc(order.get('payment_method') or '—')}",
@@ -3700,6 +3706,14 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text or ""
 
     if step == "qty_other":
+        if "review_edit_idx" in order:
+            idx = order.pop("review_edit_idx")
+            if 0 <= idx < len(order.get("items", [])):
+                order["items"][idx]["qty"] = text
+            order["review_idx"] = idx + 1
+            text_out, kb = _order_review_step_screen(order)
+            await update.message.reply_text(text_out, reply_markup=kb)
+            return
         order["current_item"]["qty"] = text
         order["items"].append(order.pop("current_item"))
         order["step"] = "addmore"
@@ -4083,11 +4097,16 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             client_full_name = client.full_name
             client_username = client.username or ""
         target_admin = _resolve_target_admin(target_chat_id)
+        from_line = f"\n\nВід: {_esc(client_full_name)} (@{_esc(client_username or '—')}, chat_id: {target_chat_id})"
         if is_self_order:
-            await query.edit_message_text(
-                "🔥 Ваше особисте замовлення оформлено!",
-                reply_markup=_pickup_toggle_keyboard(order_id, False),
+            full_text = summary + from_line
+            sent_own = await query.edit_message_text(
+                full_text, reply_markup=_pickup_toggle_keyboard(order_id, False), parse_mode="HTML"
             )
+            locations = PICKUP_MESSAGE_LOCATIONS.setdefault(order_id, [])
+            if sent_own is not None:
+                locations.append((chat_id, sent_own.message_id))
+                GROUP_ORDER_TEXT[(chat_id, sent_own.message_id)] = full_text
         else:
             await query.edit_message_text(
                 "🔥 Замовлення оформлено за клієнта!" if on_behalf else "🔥 Замовлення оформлено!"
@@ -4102,25 +4121,38 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 sent = await context.bot.send_message(
                     target_admin,
-                    f"{summary}\n\nВід: {_esc(client_full_name)} (@{_esc(client_username or '—')}, chat_id: {target_chat_id})\n\n"
-                    f"Щоб відповісти клієнту — зробіть Reply на це повідомлення.",
+                    summary + from_line + "\n\nЩоб відповісти клієнту — зробіть Reply на це повідомлення.",
                     parse_mode="HTML",
+                    reply_markup=_pickup_toggle_keyboard(order_id, False) if is_self_order else None,
                 )
                 FORWARD_MAP[(target_admin, sent.message_id)] = target_chat_id
+                if is_self_order:
+                    locations = PICKUP_MESSAGE_LOCATIONS.setdefault(order_id, [])
+                    locations.append((target_admin, sent.message_id))
+                    GROUP_ORDER_TEXT[(target_admin, sent.message_id)] = summary + from_line
             except Exception as e:
                 logger.warning(f"Не вдалось переслати замовлення адміну: {e}")
 
         orders_group_id = _get_orders_group_id()
         if orders_group_id:
             try:
-                group_text = f"{summary}\n\nВід: {_esc(client_full_name)} (@{_esc(client_username or '—')}, chat_id: {target_chat_id})"
+                group_text = summary + from_line
                 sent_group = await context.bot.send_message(orders_group_id, group_text, parse_mode="HTML")
                 GROUP_ORDER_TEXT[(orders_group_id, sent_group.message_id)] = group_text
-                await context.bot.edit_message_reply_markup(
-                    chat_id=orders_group_id,
-                    message_id=sent_group.message_id,
-                    reply_markup=_group_order_buttons(sent_group.message_id),
-                )
+                if is_self_order:
+                    locations = PICKUP_MESSAGE_LOCATIONS.setdefault(order_id, [])
+                    locations.append((orders_group_id, sent_group.message_id))
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=orders_group_id,
+                        message_id=sent_group.message_id,
+                        reply_markup=_pickup_toggle_keyboard(order_id, False),
+                    )
+                else:
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=orders_group_id,
+                        message_id=sent_group.message_id,
+                        reply_markup=_group_order_buttons(sent_group.message_id),
+                    )
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати замовлення в групу замовлень: {e}")
         return
@@ -5975,7 +6007,8 @@ def _pickup_toggle_keyboard(order_id: int, picked_up: bool) -> InlineKeyboardMar
 
 
 async def pickup_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Адмін відмічає, чи вже забрав своє особисте замовлення (самовивіз)."""
+    """Адмін відмічає, чи вже забрав своє особисте замовлення (самовивіз) -
+    оновлює одразу всі копії цього замовлення (в себе, у відповідального і в групі)."""
     query = update.callback_query
     if not is_admin(update):
         await query.answer("Тільки адміністратор може це відмічати.", show_alert=True)
@@ -5989,7 +6022,14 @@ async def pickup_toggle_callback(update: Update, context: ContextTypes.DEFAULT_T
     conn.commit()
     conn.close()
     await query.answer("Позначено як забране ✅" if new_val else "Позначено як не забране 📦")
-    await query.edit_message_reply_markup(reply_markup=_pickup_toggle_keyboard(order_id, bool(new_val)))
+    new_kb = _pickup_toggle_keyboard(order_id, bool(new_val))
+    for loc_chat_id, loc_message_id in PICKUP_MESSAGE_LOCATIONS.get(order_id, []):
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=loc_chat_id, message_id=loc_message_id, reply_markup=new_kb
+            )
+        except Exception as e:
+            logger.warning(f"Не вдалось оновити копію замовлення {loc_chat_id}/{loc_message_id}: {e}")
 
 
 def _group_order_buttons(message_id: int) -> InlineKeyboardMarkup:
