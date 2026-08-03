@@ -292,6 +292,9 @@ def init_db():
             UNIQUE(chat_id, category, item_name, unit)
         )
     """)
+    order_cols = [r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
+    if "picked_up" not in order_cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN picked_up INTEGER DEFAULT 0")
     if "is_individual_pricing" not in existing_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN is_individual_pricing INTEGER DEFAULT 0")
     if "price_tier" not in existing_cols:
@@ -2186,16 +2189,18 @@ def _get_client_addresses(chat_id: int) -> list:
     return [dict(r) for r in rows]
 
 
-def _save_completed_order(chat_id: int, order: dict) -> None:
+def _save_completed_order(chat_id: int, order: dict) -> int:
     conn = db()
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO orders (chat_id, address, contact_phone, payment_method, items_json, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (chat_id, order.get("address"), order.get("contact_phone"), order.get("payment_method"),
          json.dumps(order.get("items", []), ensure_ascii=False), datetime.now(TZ).isoformat()),
     )
+    order_id = cur.lastrowid
     conn.commit()
     conn.close()
+    return order_id
 
 
 def _get_last_order_items(chat_id: int) -> list:
@@ -4038,10 +4043,11 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Це замовлення вже неактуальне.")
             return
         cancel_order_confirm_reminder(context.application, chat_id)
-        _save_completed_order(target_chat_id, order)
+        order_id = _save_completed_order(target_chat_id, order)
         profile = _get_client_profile(target_chat_id) or {}
         summary = _order_summary_text(order, profile)
         on_behalf = order.get("on_behalf_of")
+        is_self_order = (not on_behalf) and (target_chat_id in ADMIN_IDS)
         if on_behalf:
             conn = db()
             client_row = conn.execute(
@@ -4055,15 +4061,21 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             client_full_name = client.full_name
             client_username = client.username or ""
         target_admin = _resolve_target_admin(target_chat_id)
-        await query.edit_message_text(
-            "🔥 Замовлення оформлено за клієнта!" if on_behalf else "🔥 Замовлення оформлено!"
-        )
-        await context.bot.send_message(
-            target_chat_id,
-            "Дякуємо! ☕️ Ваше замовлення передано менеджеру, скоро з вами зв'яжуться 🧡\n\n"
-            "👇 Кнопки внизу завжди тут, якщо треба щось інше.",
-            reply_markup=_keyboard_for_recipient(target_chat_id),
-        )
+        if is_self_order:
+            await query.edit_message_text(
+                "🔥 Ваше особисте замовлення оформлено!",
+                reply_markup=_pickup_toggle_keyboard(order_id, False),
+            )
+        else:
+            await query.edit_message_text(
+                "🔥 Замовлення оформлено за клієнта!" if on_behalf else "🔥 Замовлення оформлено!"
+            )
+            await context.bot.send_message(
+                target_chat_id,
+                "Дякуємо! ☕️ Ваше замовлення передано менеджеру, скоро з вами зв'яжуться 🧡\n\n"
+                "👇 Кнопки внизу завжди тут, якщо треба щось інше.",
+                reply_markup=_keyboard_for_recipient(target_chat_id),
+            )
         if target_admin and target_admin != chat_id:
             try:
                 sent = await context.bot.send_message(
@@ -5932,6 +5944,32 @@ async def clearordersgroup_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text("✅ Групу для замовлень відв'язано. Замовлення більше не дублюватимуться туди.")
 
 
+def _pickup_toggle_keyboard(order_id: int, picked_up: bool) -> InlineKeyboardMarkup:
+    if picked_up:
+        label = "✅ Забрав (тисніть, щоб скасувати)"
+    else:
+        label = "📦 Ще не забрав (тисніть, коли заберете)"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"pickup_toggle:{order_id}")]])
+
+
+async def pickup_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін відмічає, чи вже забрав своє особисте замовлення (самовивіз)."""
+    query = update.callback_query
+    if not is_admin(update):
+        await query.answer("Тільки адміністратор може це відмічати.", show_alert=True)
+        return
+    _, order_id_str = query.data.split(":", 1)
+    order_id = int(order_id_str)
+    conn = db()
+    row = conn.execute("SELECT picked_up FROM orders WHERE id=?", (order_id,)).fetchone()
+    new_val = 0 if (row and row["picked_up"]) else 1
+    conn.execute("UPDATE orders SET picked_up=? WHERE id=?", (new_val, order_id))
+    conn.commit()
+    conn.close()
+    await query.answer("Позначено як забране ✅" if new_val else "Позначено як не забране 📦")
+    await query.edit_message_reply_markup(reply_markup=_pickup_toggle_keyboard(order_id, bool(new_val)))
+
+
 def _group_order_buttons(message_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -6627,6 +6665,7 @@ def main():
     application.add_handler(CallbackQueryHandler(pickresp_callback, pattern=r"^pickresp:"))
     application.add_handler(CallbackQueryHandler(respme_callback, pattern=r"^respme:"))
     application.add_handler(CallbackQueryHandler(newtier_callback, pattern=r"^newtier:"))
+    application.add_handler(CallbackQueryHandler(pickup_toggle_callback, pattern=r"^pickup_toggle:"))
     application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu_"))
     application.add_handler(CallbackQueryHandler(bc_router, pattern=r"^(bc_|bcq_)"))
     application.add_handler(CallbackQueryHandler(qna_order_callback, pattern=r"^qna_order$"))
