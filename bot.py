@@ -1765,34 +1765,6 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if action == "bulk_tier_text":
-        MENU_PENDING.pop(admin_id, None)
-        valid_tiers = set(PRICE_TIERS)
-        updated, failed = 0, []
-        conn = db()
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            m = re.search(r"chat_id:\s*(\d+).*?Тариф:\s*(.+)$", line)
-            if not m:
-                failed.append(line)
-                continue
-            target_chat_id = int(m.group(1))
-            tier = m.group(2).strip()
-            if tier not in valid_tiers:
-                failed.append(line)
-                continue
-            conn.execute("UPDATE subscribers SET price_tier=? WHERE chat_id=?", (tier, target_chat_id))
-            updated += 1
-        conn.commit()
-        conn.close()
-        report = f"✅ Оновлено тарифів: {updated}."
-        if failed:
-            report += f"\n\n⚠️ Не вдалось розпізнати {len(failed)} рядок(-ів) (перевірте назву тарифу):\n" + "\n".join(failed[:10])
-        await update.message.reply_text(report, reply_markup=_menu_back_keyboard())
-        return
-
     if action == "bulk_price_text":
         MENU_PENDING.pop(admin_id, None)
         cat_key = pending["category"]
@@ -1896,7 +1868,6 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎯 Кому давати індивідуальні ціни", callback_data="menu_individualtoggle")],
         [InlineKeyboardButton("💰 Задати індивідуальну ціну клієнту", callback_data="menu_individualprices")],
         [InlineKeyboardButton("🏷 Ціновий рівень клієнта (20/50/100кг)", callback_data="menu_pricetierclient")],
-        [InlineKeyboardButton("📝 Масово: тарифи всіх клієнтів", callback_data="menu_bulktier")],
         [InlineKeyboardButton("🧾 Прайс клієнта (як він його бачить)", callback_data="menu_clientpriceview")],
         [InlineKeyboardButton("📋 Список клієнтів і відповідальних", callback_data="menu_resplist")],
         [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
@@ -4676,39 +4647,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "menu_bulktier":
-        conn = db()
-        rows = conn.execute(
-            "SELECT chat_id, name, username, price_tier FROM subscribers WHERE active=1 ORDER BY joined_at DESC"
-        ).fetchall()
-        conn.close()
-        if not rows:
-            await query.edit_message_text("Поки немає активних підписників.", reply_markup=_menu_back_keyboard())
-            return
-        lines = []
-        for r in rows:
-            label = _client_display_label(r["chat_id"], r["name"], r["username"])
-            tier = r["price_tier"] or "Роздріб"
-            lines.append(f"{label} — chat_id: {r['chat_id']} — Тариф: {tier}")
-        text_block = "\n".join(lines)
-        MENU_PENDING[admin_id] = {"action": "bulk_tier_text"}
-        message = (
-            "📝 <b>Тарифи всіх клієнтів</b>\n\n"
-            "Відредагуйте слово після «Тариф:» для потрібних клієнтів (Роздріб / 20 кг / 50 кг / "
-            "100 кг / 300 кг) і надішліть весь текст назад ЦІЛИКОМ — навіть рядки, які не міняли.\n\n"
-            f"<code>{text_block}</code>"
-        )
-        if len(message) > 4000:
-            await query.edit_message_text(
-                "Список клієнтів задовгий для одного повідомлення — зверніться до одиночного "
-                "призначення тарифу («🏷 Ціновий рівень клієнта») для частини клієнтів.",
-                reply_markup=_menu_back_keyboard(),
-            )
-            return
-        await query.edit_message_text(message, parse_mode="HTML")
-        return
 
 
+    if data == "menu_clientpriceview":
         conn = db()
         rows = conn.execute(
             "SELECT chat_id, name, username, price_tier FROM subscribers WHERE active=1 ORDER BY joined_at DESC LIMIT 50"
@@ -6543,6 +6484,20 @@ def _seed_item_prices_if_empty():
     conn.execute("UPDATE subscribers SET price_tier='Роздріб' WHERE price_tier IS NULL")
     conn.commit()
 
+    count = conn.execute("SELECT COUNT(*) c FROM item_prices").fetchone()["c"]
+    if count == 0:
+        for cat, base, unit, roz, p20, p50, p100 in PRICE_LIST_SEED:
+            for tier, price in (("Роздріб", roz), ("20 кг", p20), ("50 кг", p50), ("100 кг", p100)):
+                if price is None:
+                    continue
+                conn.execute(
+                    "INSERT INTO item_prices (category, item_name, unit, tier, price) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(category, item_name, unit, tier) DO UPDATE SET price=excluded.price",
+                    (cat, base, unit, tier, price),
+                )
+        conn.commit()
+        logger.info(f"[PRICE-SEED] Заповнено стартовий прайс: {len(PRICE_LIST_SEED)} позицій.")
+
     # Окрема одноразова міграція: додає тариф "300 кг", навіть якщо прайс уже був заповнений
     # раніше (до появи цього тарифу) - не чіпає жодну з інших цін.
     if _get_setting("price_300_seeded", "") != "1":
@@ -6558,22 +6513,7 @@ def _seed_item_prices_if_empty():
         _set_setting("price_300_seeded", "1")
         logger.info(f"[PRICE-SEED-300] Додано тариф 300 кг: {len(PRICE_LIST_SEED_300)} позицій.")
 
-    count = conn.execute("SELECT COUNT(*) c FROM item_prices").fetchone()["c"]
-    if count > 0:
-        conn.close()
-        return
-    for cat, base, unit, roz, p20, p50, p100 in PRICE_LIST_SEED:
-        for tier, price in (("Роздріб", roz), ("20 кг", p20), ("50 кг", p50), ("100 кг", p100)):
-            if price is None:
-                continue
-            conn.execute(
-                "INSERT INTO item_prices (category, item_name, unit, tier, price) VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(category, item_name, unit, tier) DO UPDATE SET price=excluded.price",
-                (cat, base, unit, tier, price),
-            )
-    conn.commit()
     conn.close()
-    logger.info(f"[PRICE-SEED] Заповнено стартовий прайс: {len(PRICE_LIST_SEED)} позицій.")
 
 
 async def load_all_on_startup(application: Application):
