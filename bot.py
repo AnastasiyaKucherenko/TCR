@@ -4106,10 +4106,28 @@ def _persistent_menu_keyboard() -> ReplyKeyboardMarkup:
 
 
 async def admin_self_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка «☕️ Замовити для себе» - адмін оформлює замовлення на власний chat_id,
-    той самий опитувальник, що й у звичайного клієнта."""
+    """Кнопка «☕️ Замовити для себе» - адмін оформлює замовлення на власний chat_id.
+    Для особистого замовлення не питаємо точку/адресу/ФОП - одразу створюємо мінімальний
+    профіль (самовивіз) і переходимо до вибору категорії товару."""
     if not is_admin(update):
         return
+    chat_id = update.effective_chat.id
+    profile = _get_client_profile(chat_id)
+    if not profile:
+        user = update.effective_user
+        conn = db()
+        conn.execute(
+            "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, delivery_zone, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id) DO NOTHING",
+            (
+                chat_id, user.full_name, "Особисте замовлення",
+                f"@{user.username}" if user.username else "—", "немає", "Самовивіз",
+                datetime.now(TZ).isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        _ensure_pickup_address(chat_id, None)
     await order_start(update, context)
 
 
