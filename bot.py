@@ -1954,7 +1954,7 @@ async def client_assortment_back_callback(update: Update, context: ContextTypes.
 
 CLIENT_INSTRUCTIONS_TEXT = (
     "📖 <b>Як користуватись ботом</b>\n\n"
-    "<b>🪪 Моя картка</b> — заповніть один раз: зона доставки, ім'я, точка, телефон, ФОП/ІПН "
+    "<b>🪪 Моя картка</b> — заповніть один раз: зона доставки, ім'я, точка, телефон, ФОП "
     "(або «немає») та хоча б одну адресу. Якщо для адреси номер такий самий, як основний — "
     "не передруковуйте, тисніть кнопку «📞 Такий самий».\n\n"
     "<b>📝 Замовити</b>:\n"
@@ -2064,8 +2064,7 @@ def _profile_summary_text(profile: dict, addresses: list, for_admin: bool = Fals
         f"Ім'я: {profile.get('full_name') or '—'}\n"
         f"Назва точки: {profile.get('point_name') or '—'}\n"
         f"Контактний номер: {profile.get('phone') or '—'}\n"
-        f"ФОП: {profile.get('fop') or '—'}\n"
-        f"ІПН: {profile.get('ipn') or '—'}\n\n"
+        f"ФОП: {profile.get('fop') or '—'}\n\n"
         f"Адреси:\n{addr_lines}"
     )
 
@@ -2119,13 +2118,12 @@ def _normalize_phone(text: str) -> str:
     return "+" + digits if not text.strip().startswith("+") else text.strip()
 
 
-PROFILE_STEPS = ["full_name", "point_name", "phone", "fop", "ipn"]
+PROFILE_STEPS = ["full_name", "point_name", "phone", "fop"]
 PROFILE_STEP_PROMPTS = {
     "full_name": "Напишіть, будь ласка, ваше ім'я:",
     "point_name": "Назва точки (кав'ярні/закладу):",
     "phone": "Контактний номер телефону (наприклад: +380671234567):",
     "fop": "ФОП (назва/номер, або «немає», якщо не застосовується):",
-    "ipn": "ІПН (або «немає», якщо не застосовується):",
 }
 PROFILE_FIELD_LABELS = {
     "delivery_zone": "🗺 Зона доставки",
@@ -2133,9 +2131,8 @@ PROFILE_FIELD_LABELS = {
     "point_name": "Назва точки",
     "phone": "Телефон",
     "fop": "ФОП",
-    "ipn": "ІПН",
 }
-PROFILE_EDITABLE_FIELDS = ["delivery_zone", "full_name", "point_name", "phone", "fop", "ipn"]
+PROFILE_EDITABLE_FIELDS = ["delivery_zone", "full_name", "point_name", "phone", "fop"]
 
 
 def _adminprofile_field_picker_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
@@ -2670,13 +2667,13 @@ async def handle_admin_new_profile_text_step(update: Update, context: ContextTyp
     data = pending["data"]
     conn = db()
     conn.execute(
-        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, ipn, delivery_zone, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, delivery_zone, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
-        "phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, delivery_zone=excluded.delivery_zone, "
+        "phone=excluded.phone, fop=excluded.fop, delivery_zone=excluded.delivery_zone, "
         "updated_at=excluded.updated_at",
         (target_chat_id, data["full_name"], data["point_name"], data["phone"], data["fop"],
-         data["ipn"], data.get("delivery_zone"), datetime.now(TZ).isoformat()),
+         data.get("delivery_zone"), datetime.now(TZ).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -2983,13 +2980,13 @@ async def handle_profile_text_step(update: Update, context: ContextTypes.DEFAULT
     data = PROFILE_PENDING.pop(chat_id)["data"]
     conn = db()
     conn.execute(
-        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, ipn, delivery_zone, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO client_profiles (chat_id, full_name, point_name, phone, fop, delivery_zone, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET full_name=excluded.full_name, point_name=excluded.point_name, "
-        "phone=excluded.phone, fop=excluded.fop, ipn=excluded.ipn, delivery_zone=excluded.delivery_zone, "
+        "phone=excluded.phone, fop=excluded.fop, delivery_zone=excluded.delivery_zone, "
         "updated_at=excluded.updated_at",
         (chat_id, data["full_name"], data["point_name"], data["phone"], data["fop"],
-         data["ipn"], data.get("delivery_zone"), datetime.now(TZ).isoformat()),
+         data.get("delivery_zone"), datetime.now(TZ).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -3104,7 +3101,7 @@ def _after_address_screen(order: dict):
     """Після вибору адреси: якщо позиції вже скопійовані (повторне замовлення) — на перегляд,
     інакше — як завжди, на вибір категорії."""
     if order.get("items"):
-        return _order_review_screen(order)
+        return _order_review_step_screen(order)
     return "Яку категорію товару додати до замовлення?", _order_category_keyboard("order_back_to_date")
 
 
@@ -3269,7 +3266,7 @@ def _order_summary_text(order: dict, profile: dict) -> str:
         f"📍 Адреса: {_esc(order.get('address') or '—')}",
         f"📞 Телефон для доставки: {_esc(order.get('contact_phone') or '—')}",
         f"📞 Телефон: {_esc(profile.get('phone') or '—')}",
-        f"🏢 ФОП: {_esc(profile.get('fop') or '—')}  |  ІПН: {_esc(profile.get('ipn') or '—')}",
+        f"🏢 ФОП: {_esc(profile.get('fop') or '—')}",
         f"💳 Оплата: {_esc(order.get('payment_method') or '—')}",
     ] + ([f"🧾 Накладна: {_esc(order.get('invoice'))}"] if "invoice" in order else []) + [
         "",
