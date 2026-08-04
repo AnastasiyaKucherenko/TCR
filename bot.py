@@ -6096,15 +6096,19 @@ async def grouporder_edit_callback(update: Update, context: ContextTypes.DEFAULT
     _, msg_id_str = query.data.split(":", 1)
     message_id = int(msg_id_str)
     group_chat_id = update.effective_chat.id
-    prompt = await context.bot.send_message(
-        group_chat_id,
-        f"✏️ {user.full_name}, зробіть Reply на ЦЕ повідомлення з новим повним текстом замовлення "
-        f"(повністю замінить те, що зараз написано вище).",
-        reply_to_message_id=message_id,
-    )
-    GROUP_EDIT_PROMPTS[(group_chat_id, prompt.message_id)] = {
-        "target_message_id": message_id, "mode": "replace",
+    ADMIN_GROUPEDIT_PENDING[user.id] = {
+        "group_chat_id": group_chat_id, "message_id": message_id, "mode": "replace",
     }
+    try:
+        await context.bot.send_message(
+            user.id,
+            "Напишіть новий повний текст цього замовлення — повністю замінить те, що зараз у групі:",
+        )
+    except Exception as e:
+        logger.warning(f"Не вдалось написати адміну в особисті для редагування замовлення: {e}")
+        await query.answer(
+            "Спочатку напишіть боту в особисті хоча б /start, потім спробуйте ще раз.", show_alert=True
+        )
 
 
 async def grouporder_append_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6117,56 +6121,20 @@ async def grouporder_append_callback(update: Update, context: ContextTypes.DEFAU
     _, msg_id_str = query.data.split(":", 1)
     message_id = int(msg_id_str)
     group_chat_id = update.effective_chat.id
-    prompt = await context.bot.send_message(
-        group_chat_id,
-        f"➕ {user.full_name}, зробіть Reply на ЦЕ повідомлення з текстом, який треба ДОДАТИ "
-        f"до замовлення (допишеться окремим рядком знизу, решта тексту лишиться як є).",
-        reply_to_message_id=message_id,
-    )
-    GROUP_EDIT_PROMPTS[(group_chat_id, prompt.message_id)] = {
-        "target_message_id": message_id, "mode": "append",
+    ADMIN_GROUPEDIT_PENDING[user.id] = {
+        "group_chat_id": group_chat_id, "message_id": message_id, "mode": "append",
     }
-
-
-async def handle_group_order_edit_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробляє Reply прямо в групі на запит редагування/дописування замовлення."""
-    message = update.message
-    if not message or not message.reply_to_message or not message.text:
-        return
-    chat_id = update.effective_chat.id
-    key = (chat_id, message.reply_to_message.message_id)
-    pending = GROUP_EDIT_PROMPTS.pop(key, None)
-    if not pending:
-        return
-    user = update.effective_user
-    if not user or user.id not in ADMIN_IDS:
-        return
-
-    target_message_id = pending["target_message_id"]
-    mode = pending["mode"]
-    current_text = GROUP_ORDER_TEXT.get((chat_id, target_message_id), "")
-
-    if mode == "append":
-        new_text = current_text + f"\n\n➕ <b>Додано:</b> {_esc(message.text)}"
-    else:
-        new_text = message.text
-
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=target_message_id,
-            text=new_text,
-            parse_mode="HTML",
-            reply_markup=_group_order_buttons(target_message_id),
+        await context.bot.send_message(
+            user.id,
+            "Напишіть текст, який треба ДОДАТИ до цього замовлення (допишеться окремим рядком знизу, "
+            "решта тексту лишиться як є):",
         )
-        GROUP_ORDER_TEXT[(chat_id, target_message_id)] = new_text
-        await message.reply_text("✅ Оновлено.")
     except Exception as e:
-        await message.reply_text(f"Не вдалось оновити повідомлення: {e}")
-    try:
-        await context.bot.delete_message(chat_id, message.reply_to_message.message_id)
-    except Exception:
-        pass
+        logger.warning(f"Не вдалось написати адміну в особисті для дописування замовлення: {e}")
+        await query.answer(
+            "Спочатку напишіть боту в особисті хоча б /start, потім спробуйте ще раз.", show_alert=True
+        )
 
 
 async def grouporder_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6216,7 +6184,11 @@ async def handle_admin_groupedit_text(update: Update, context: ContextTypes.DEFA
         return
     group_chat_id = pending["group_chat_id"]
     message_id = pending["message_id"]
+    mode = pending.get("mode", "replace")
     new_text = update.message.text or ""
+    if mode == "append":
+        current_text = GROUP_ORDER_TEXT.get((group_chat_id, message_id), "")
+        new_text = current_text + f"\n\n➕ <b>Додано:</b> {_esc(new_text)}"
     try:
         await context.bot.edit_message_text(
             chat_id=group_chat_id,
@@ -6750,9 +6722,6 @@ def main():
     application.add_handler(CallbackQueryHandler(qna_router, pattern=r"^qna_"))
     application.add_handler(CallbackQueryHandler(wg_router, pattern=r"^wg_"))
     application.add_handler(CallbackQueryHandler(order_router, pattern=r"^order_"))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, handle_group_order_edit_reply)
-    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_text))
 
     logger.info("Бот запущено")
