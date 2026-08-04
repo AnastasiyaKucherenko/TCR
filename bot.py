@@ -1921,6 +1921,14 @@ CLIENT_BTN_ORDER = "☕️ Замовити"
 CLIENT_BTN_PROFILE = "🪪 Моя картка"
 CLIENT_BTN_INSTRUCTIONS = "✨ Інструкція"
 
+# Старі варіанти назв кнопок (до оновлення теми) - деякі клієнти ще мають застарілу
+# клавіатуру, поки бот не надішле їм нове повідомлення, тож ці варіанти теж мають працювати.
+CLIENT_BTN_ASSORTMENT_OLD = "☕ Асортимент"
+CLIENT_BTN_MANAGER_OLD = "💬 Зв'язок з менеджером"
+CLIENT_BTN_DELIVERY_OLD = "🚚 Умови доставки"
+CLIENT_BTN_ORDER_OLD = "📝 Замовити"
+CLIENT_BTN_INSTRUCTIONS_OLD = "ℹ️ Інструкція"
+
 DELIVERY_COMMON_TAIL = (
     "\n\nЗамовлення прийняті до 09:00 - можуть бути доставлені КУР'ЄРОМ в той самий день.\n\n"
     "Замовлення новою поштою прийняті до 11:00 - відправляються у той самий день.\n\n"
@@ -6683,10 +6691,15 @@ def main():
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(MessageHandler(filters.Regex("^📋 Меню$"), menu_command))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ASSORTMENT)}$"), client_show_assortment))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ASSORTMENT_OLD)}$"), client_show_assortment))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_DELIVERY)}$"), client_show_delivery))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_DELIVERY_OLD)}$"), client_show_delivery))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_INSTRUCTIONS)}$"), client_show_instructions))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_INSTRUCTIONS_OLD)}$"), client_show_instructions))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_MANAGER)}$"), client_contact_manager))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_MANAGER_OLD)}$"), client_contact_manager))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER)}$"), order_start))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER_OLD)}$"), order_start))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(ADMIN_BTN_SELFORDER)}$"), admin_self_order))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_PROFILE)}$"), profile_show))
     application.add_handler(CallbackQueryHandler(profile_edit_callback, pattern=r"^profile_edit$"))
