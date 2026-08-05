@@ -5805,29 +5805,14 @@ async def send_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
     if row["kind"] != "once":
         today_weekday = datetime.now(TZ).weekday()
         if row["weekday"] != today_weekday:
-            created_by = row["created_by"] if "created_by" in row.keys() else None
-            bc_name = row["name"] if "name" in row.keys() else None
             conn.close()
-            logger.warning(
-                f"[BCAST-GUARD] bcast_{broadcast_id} заблоковано: заплановано на "
-                f"{WEEKDAYS_UA.get(row['weekday'], row['weekday'])}, а зараз "
-                f"{WEEKDAYS_UA.get(today_weekday, today_weekday)}. Розсилку НЕ надіслано, "
-                f"розклад залишається на наступний правильний день."
+            # Це очікувана щоденна поведінка (спрацьовує 6 з 7 днів і мовчки пропускає) -
+            # відколи ми прибрали ненадійний фільтр дня тижня з самої бібліотеки планування.
+            # Сповіщати адміна щодня про це більше не потрібно, лишаємо тільки тихий лог.
+            logger.info(
+                f"[BCAST-GUARD] bcast_{broadcast_id}: сьогодні {WEEKDAYS_UA.get(today_weekday, today_weekday)}, "
+                f"заплановано на {WEEKDAYS_UA.get(row['weekday'], row['weekday'])} - пропускаємо."
             )
-            notify_target = created_by or (ADMIN_IDS[0] if ADMIN_IDS else None)
-            if notify_target:
-                name_line = f"«{bc_name}» " if bc_name else ""
-                try:
-                    await context.bot.send_message(
-                        notify_target,
-                        f"⚠️ Розсилку {name_line}не надіслано сьогодні — захист виявив "
-                        f"розбіжність: у розкладі стоїть {WEEKDAYS_UA.get(row['weekday'], row['weekday'])}, "
-                        f"а сьогодні {WEEKDAYS_UA.get(today_weekday, today_weekday)}. "
-                        f"Перевірте розклад цієї розсилки (📅 Заплановано → 📖 Заплановані) — можливо, "
-                        f"варто скасувати і створити заново з правильним днем.",
-                    )
-                except Exception as e:
-                    logger.warning(f"Не вдалось сповістити адміна про заблоковану розсилку: {e}")
             return
 
     is_question = bool(row["is_question"]) if "is_question" in row.keys() else False
@@ -5915,10 +5900,14 @@ def schedule_broadcast_job(application: Application, row) -> None:
         )
     else:
         hh, mm = map(int, row["hhmm"].split(":"))
+        # ВАЖЛИВО: свідомо НЕ передаємо days=(...) у run_daily - фільтр дня тижня всередині
+        # бібліотеки планування (APScheduler) виявився ненадійним (спостерігались випадки
+        # спрацювання на день раніше). Замість цього завдання запускається щодня о заданій
+        # годині, а правильний день перевіряє наш власний, вже перевірений захист
+        # усередині send_scheduled_broadcast ([BCAST-GUARD]) - він і вирішує, надсилати чи ні.
         new_job = application.job_queue.run_daily(
             send_scheduled_broadcast,
             time=time(hour=hh, minute=mm, tzinfo=TZ),
-            days=(row["weekday"],),
             name=name,
             data={"broadcast_id": row["id"]},
         )
