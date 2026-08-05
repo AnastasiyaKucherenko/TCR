@@ -107,6 +107,9 @@ PICKUP_MESSAGE_LOCATIONS: dict[int, list] = {}
 # Адмін пише новий текст для замовлення в групі: admin_chat_id -> {"group_chat_id":..., "message_id":...}
 ADMIN_GROUPEDIT_PENDING: dict[int, dict] = {}
 
+# Адмін пише примітку до клієнта: admin_chat_id -> target_chat_id
+ADMIN_NOTE_PENDING: dict[int, int] = {}
+
 # Reply-редагування прямо в групі: (group_chat_id, prompt_message_id) -> {"target_message_id":..., "mode": "replace"/"append"}
 GROUP_EDIT_PROMPTS: dict[tuple[int, int], dict] = {}
 
@@ -222,6 +225,8 @@ def init_db():
         conn.execute("ALTER TABLE client_profiles ADD COLUMN payment_method TEXT")
     if "delivery_zone" not in profile_cols:
         conn.execute("ALTER TABLE client_profiles ADD COLUMN delivery_zone TEXT")
+    if "notes" not in profile_cols:
+        conn.execute("ALTER TABLE client_profiles ADD COLUMN notes TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS client_addresses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1590,6 +1595,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or chat_id in ADMIN_NEW_PROFILE_PENDING
         or chat_id in ADMIN_MSGEDIT_PENDING
         or chat_id in ADMIN_GROUPEDIT_PENDING
+        or chat_id in ADMIN_NOTE_PENDING
         or chat_id in MENU_PENDING
         or chat_id in SENDTO_AWAITING_TEXT
         or reply_matches_forward
@@ -1629,6 +1635,10 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if admin_id in ADMIN_GROUPEDIT_PENDING:
         await handle_admin_groupedit_text(update, context)
+        return
+
+    if admin_id in ADMIN_NOTE_PENDING:
+        await handle_admin_note_text(update, context)
         return
 
     # 0) Якщо адмін відповідає (Reply) на переслане повідомлення клієнта — надсилаємо відповідь клієнту
@@ -1996,7 +2006,7 @@ def _keyboard_for_recipient(chat_id: int) -> ReplyKeyboardMarkup:
 ASSORTMENT_CATEGORIES = [
     ("arabika", "🌰 Арабіка"),
     ("blend", "🔥 Бленд"),
-    ("palay", "✨ Палай"),
+    ("palay", "✨ Палай (фільтр)"),
     ("drip", "💧 Дріп"),
     ("suputni", "🧰 Супутні товари"),
     ("school", "🎓 Школа бариста"),
@@ -2160,6 +2170,7 @@ def _profile_summary_text(profile: dict, addresses: list, for_admin: bool = Fals
         f"   {i+1}. {a['address']} — 📞 {a.get('phone') or '—'}" for i, a in enumerate(addresses)
     ) if addresses else "   (адрес ще немає)"
     title = "🪪 Картка клієнта:" if for_admin else "🪪 Ваша картка:"
+    notes_line = f"\n\n📝 Примітка (бачать тільки адміни): {profile.get('notes')}" if for_admin and profile.get("notes") else ""
     return (
         f"{title}\n\n"
         f"Зона доставки: {profile.get('delivery_zone') or '—'}\n"
@@ -2168,6 +2179,7 @@ def _profile_summary_text(profile: dict, addresses: list, for_admin: bool = Fals
         f"Контактний номер: {profile.get('phone') or '—'}\n"
         f"ФОП: {profile.get('fop') or '—'}\n\n"
         f"Адреси:\n{addr_lines}"
+        f"{notes_line}"
     )
 
 
@@ -2666,6 +2678,7 @@ def _adminprofile_manage_keyboard(target_chat_id: int, addresses: list) -> Inlin
         [InlineKeyboardButton("🧾 Заповнити всі дані одразу", callback_data=f"adminprofile_newwizard:{target_chat_id}")],
         [InlineKeyboardButton("✏️ Редагувати дані", callback_data=f"adminprofile_edit:{target_chat_id}")],
         [InlineKeyboardButton("➕ Додати адресу", callback_data=f"adminprofile_addaddr:{target_chat_id}")],
+        [InlineKeyboardButton("📝 Примітка (для менеджерів)", callback_data=f"adminprofile_note:{target_chat_id}")],
         [InlineKeyboardButton("💬 Історія повідомлень", callback_data=f"adminmsglog:{target_chat_id}")],
     ]
     for a in addresses:
@@ -2675,6 +2688,49 @@ def _adminprofile_manage_keyboard(target_chat_id: int, addresses: list) -> Inlin
         ])
     buttons.append([InlineKeyboardButton("✅ Готово / До меню", callback_data="menu_back")])
     return InlineKeyboardMarkup(buttons)
+
+
+async def adminprofile_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін/менеджер пише або редагує внутрішню примітку до клієнта (клієнт її не бачить)."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    _, target_chat_id_str = query.data.split(":", 1)
+    target_chat_id = int(target_chat_id_str)
+    profile = _get_client_profile(target_chat_id) or {}
+    current = profile.get("notes")
+    ADMIN_NOTE_PENDING[admin_id] = target_chat_id
+    current_line = f"\n\nЗараз написано: «{current}»" if current else "\n\nПоки що приміток немає."
+    await query.edit_message_text(
+        f"Напишіть примітку для цього клієнта (бачать тільки адміни, клієнт її не побачить). "
+        f"Щоб прибрати примітку — напишіть «немає».{current_line}",
+        reply_markup=_adminprofile_cancel_keyboard(),
+    )
+
+
+async def handle_admin_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    admin_id = update.effective_chat.id
+    target_chat_id = ADMIN_NOTE_PENDING.pop(admin_id, None)
+    if not target_chat_id:
+        return
+    text = (update.message.text or "").strip()
+    value = None if text.lower() in ("немає", "нема", "-") else text
+    conn = db()
+    conn.execute(
+        "INSERT INTO client_profiles (chat_id, notes, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET notes=excluded.notes, updated_at=excluded.updated_at",
+        (target_chat_id, value, datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        "✅ Примітку збережено." if value else "✅ Примітку прибрано.",
+        reply_markup=_menu_back_keyboard(),
+    )
 
 
 async def adminprofile_deladdr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3431,27 +3487,27 @@ def _order_client_summary_text(order: dict, profile: dict) -> str:
 
 def _order_summary_text(order: dict, profile: dict) -> str:
     is_pickup = profile.get("delivery_zone") == "Самовивіз"
+    contact_phone = order.get("contact_phone") or profile.get("phone")
     lines = [
         "🆕 <b>НОВЕ ЗАМОВЛЕННЯ</b> 🆕",
         f"📅 <b>Дата виконання: {_esc(order.get('date') or '—')}</b>",
         "",
-        f"👤 Клієнт: <b>{_esc(profile.get('full_name') or '—')}</b>",
-        f"🏪 Точка: <b>{_esc(profile.get('point_name') or '—')}</b>",
+        f"👤 Ім'я: <b>{_esc(profile.get('full_name') or '—')}</b>",
+        f"☕ Кав'ярня: <b>{_esc(profile.get('point_name') or '—')}</b>",
         f"🚚 Спосіб доставки: {_esc(profile.get('delivery_zone') or '—')}",
     ] + ([] if is_pickup else [
         f"📍 Адреса: {_esc(order.get('address') or '—')}",
-        f"📞 Телефон для доставки: {_esc(order.get('contact_phone') or '—')}",
     ]) + [
-        f"📞 Телефон: {_esc(profile.get('phone') or '—')}",
-        f"🏢 ФОП: {_esc(profile.get('fop') or '—')}",
-        f"💳 Оплата: {_esc(order.get('payment_method') or '—')}",
+        f"📞 Контактний номер: {_esc(contact_phone or '—')}",
+        f"💳 Оплата: <b>{_esc(order.get('payment_method') or '—')}</b>",
     ] + ([f"🧾 Накладна: {_esc(order.get('invoice'))}"] if "invoice" in order else []) + [
         "",
-        "📦 <b>Позиції для складу:</b>",
+        "━━━━━━━━━━━━━━━",
+        "🛒 <b>ЗАМОВЛЕННЯ:</b>",
+        "━━━━━━━━━━━━━━━",
         "",
     ]
     for i, item in enumerate(order.get("items", []), 1):
-        cat_label = dict(ORDER_CATEGORIES).get(item.get("category"), item.get("category"))
         grind_line = ""
         if item.get("grind"):
             grind_line = f"    Помел: {_esc(item['grind'])}"
@@ -3469,14 +3525,17 @@ def _order_summary_text(order: dict, profile: dict) -> str:
         lines.append(
             f"<b>{i}) {_esc(item.get('item_text') or '—')} — {_esc(item.get('weight') or '—')} "
             f"× {_esc(item.get('qty') or '—')}</b>\n"
-            f"    Категорія: {_esc(cat_label)}\n"
             f"{grind_line}"
             f"{packaging_line}"
             f"{price_line}"
         )
     order_total = sum(t for t in (_item_line_total(i) for i in order.get("items", [])) if t is not None)
     if order_total:
-        lines.append(f"\n💰 <b>Разом: {order_total:g} грн</b>")
+        lines.append(f"💰 <b>Разом: {order_total:g} грн</b>")
+    note = profile.get("notes")
+    if note:
+        lines.append("")
+        lines.append(f"📝 Примітка: {_esc(note)}")
     return "\n".join(lines)
 
 
@@ -4156,10 +4215,11 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=_pickup_toggle_keyboard(order_id, False),
                     )
                 else:
+                    show_np = profile.get("delivery_zone") == "НП (Нова Пошта)"
                     await context.bot.edit_message_reply_markup(
                         chat_id=orders_group_id,
                         message_id=sent_group.message_id,
-                        reply_markup=_group_order_buttons(sent_group.message_id),
+                        reply_markup=_group_order_buttons(sent_group.message_id, show_np_buttons=show_np),
                     )
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати замовлення в групу замовлень: {e}")
@@ -6029,8 +6089,8 @@ async def pickup_toggle_callback(update: Update, context: ContextTypes.DEFAULT_T
             logger.warning(f"Не вдалось оновити копію замовлення {loc_chat_id}/{loc_message_id}: {e}")
 
 
-def _group_order_buttons(message_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _group_order_buttons(message_id: int, show_np_buttons: bool = False) -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton("✅ Прийняти", callback_data=f"grouporder_accept:{message_id}"),
             InlineKeyboardButton("✏️ Редагувати", callback_data=f"grouporder_edit:{message_id}"),
@@ -6039,7 +6099,13 @@ def _group_order_buttons(message_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("➕ Дописати", callback_data=f"grouporder_append:{message_id}"),
             InlineKeyboardButton("🗑 Видалити", callback_data=f"grouporder_del:{message_id}"),
         ],
-    ])
+    ]
+    if show_np_buttons:
+        rows.append([
+            InlineKeyboardButton("📦 НП: за наш рахунок", callback_data=f"grouporder_np:{message_id}:our"),
+            InlineKeyboardButton("📦 НП: за рахунок отримувача", callback_data=f"grouporder_np:{message_id}:recipient"),
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
 def _group_order_confirm_del_buttons(message_id: int) -> InlineKeyboardMarkup:
@@ -6047,6 +6113,37 @@ def _group_order_confirm_del_buttons(message_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("✅ Так, видалити для всіх", callback_data=f"grouporder_delconfirm:{message_id}"),
         InlineKeyboardButton("❌ Скасувати", callback_data=f"grouporder_delcancel:{message_id}"),
     ]])
+
+
+async def grouporder_np_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Менеджер обирає, за чий рахунок доставка Новою Поштою - додає виділений рядок у текст замовлення."""
+    query = update.callback_query
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        await query.answer("Тільки адміністратор може це обирати.", show_alert=True)
+        return
+    _, msg_id_str, choice = query.data.split(":", 2)
+    message_id = int(msg_id_str)
+    group_chat_id = update.effective_chat.id
+    label = "за наш рахунок" if choice == "our" else "за рахунок отримувача"
+    await query.answer(f"НП: {label}")
+
+    current_text = GROUP_ORDER_TEXT.get((group_chat_id, message_id), query.message.text or "")
+    # прибираємо попередній вибір НП, якщо вже був обраний, щоб не дублювати рядок
+    lines = [ln for ln in current_text.split("\n") if "Оплата доставки НП" not in ln]
+    new_text = "\n".join(lines).rstrip() + f"\n\n📦 <b>Оплата доставки НП: {label}</b>"
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=group_chat_id,
+            message_id=message_id,
+            text=new_text,
+            parse_mode="HTML",
+            reply_markup=_group_order_buttons(message_id, show_np_buttons=True),
+        )
+        GROUP_ORDER_TEXT[(group_chat_id, message_id)] = new_text
+    except Exception as e:
+        logger.warning(f"Не вдалось оновити вибір НП: {e}")
 
 
 async def grouporder_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6207,6 +6304,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ADMIN_NEW_PROFILE_PENDING.pop(chat_id, None) is not None,
         ADMIN_MSGEDIT_PENDING.pop(chat_id, None) is not None,
         ADMIN_GROUPEDIT_PENDING.pop(chat_id, None) is not None,
+        ADMIN_NOTE_PENDING.pop(chat_id, None) is not None,
         SENDTO_AWAITING_TEXT.pop(chat_id, None) is not None,
         SENDTO_SELECTIONS.pop(chat_id, None) is not None,
         BC_PENDING.pop(chat_id, None) is not None,
@@ -6678,6 +6776,7 @@ def main():
     application.add_handler(CallbackQueryHandler(adminprofile_zonefield_callback, pattern=r"^adminprofile_zonefield:"))
     application.add_handler(CallbackQueryHandler(adminprofile_addaddr_callback, pattern=r"^adminprofile_addaddr:"))
     application.add_handler(CallbackQueryHandler(adminprofile_deladdr_callback, pattern=r"^adminprofile_deladdr:"))
+    application.add_handler(CallbackQueryHandler(adminprofile_note_callback, pattern=r"^adminprofile_note:"))
     application.add_handler(CallbackQueryHandler(adminprofile_newwizard_callback, pattern=r"^adminprofile_newwizard:"))
     application.add_handler(CallbackQueryHandler(adminprofile_newzone_callback, pattern=r"^adminprofile_newzone:"))
     application.add_handler(CallbackQueryHandler(adminprofile_newskip_callback, pattern=r"^adminprofile_newskip$"))
@@ -6687,6 +6786,7 @@ def main():
     application.add_handler(CallbackQueryHandler(grouporder_edit_callback, pattern=r"^grouporder_edit:"))
     application.add_handler(CallbackQueryHandler(grouporder_append_callback, pattern=r"^grouporder_append:"))
     application.add_handler(CallbackQueryHandler(grouporder_accept_callback, pattern=r"^grouporder_accept:"))
+    application.add_handler(CallbackQueryHandler(grouporder_np_callback, pattern=r"^grouporder_np:"))
     application.add_handler(CallbackQueryHandler(grouporder_del_callback, pattern=r"^grouporder_del:"))
     application.add_handler(CallbackQueryHandler(grouporder_delconfirm_callback, pattern=r"^grouporder_delconfirm:"))
     application.add_handler(CallbackQueryHandler(grouporder_delcancel_callback, pattern=r"^grouporder_delcancel:"))
