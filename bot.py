@@ -3482,6 +3482,8 @@ def _order_client_summary_text(order: dict, profile: dict) -> str:
     lines.append(f"💳 Оплата: {_esc(order.get('payment_method') or '—')}")
     if "invoice" in order:
         lines.append(f"🧾 Накладна: {_esc(order.get('invoice'))}")
+    if order.get("client_comment"):
+        lines.append(f"💬 Коментар: {_esc(order['client_comment'])}")
     return "\n".join(lines)
 
 
@@ -3500,7 +3502,9 @@ def _order_summary_text(order: dict, profile: dict) -> str:
     ]) + [
         f"📞 Контактний номер: {_esc(contact_phone or '—')}",
         f"💳 Оплата: <b>{_esc(order.get('payment_method') or '—')}</b>",
-    ] + ([f"🧾 Накладна: {_esc(order.get('invoice'))}"] if "invoice" in order else []) + [
+    ] + ([f"🧾 Накладна: {_esc(order.get('invoice'))}"] if "invoice" in order else []) + (
+        [f"\n💬 <b>Коментар клієнта: {_esc(order['client_comment'])}</b>"] if order.get("client_comment") else []
+    ) + [
         "",
         "━━━━━━━━━━━━━━━",
         "🛒 <b>ЗАМОВЛЕННЯ:</b>",
@@ -3640,13 +3644,23 @@ async def pending_orders_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(_pending_orders_text())
 
 
-async def _order_go_to_confirm_or_invoice(query, context, chat_id: int, order: dict):
-    """Показує клієнту питання «Потрібна накладна?» (тільки якщо адмін позначив цього клієнта),
-    інакше одразу показує підсумок замовлення з кнопками Змінити/Підтвердити."""
+async def _order_go_to_confirm_or_invoice(send_func, context, chat_id: int, order: dict):
+    """Показує клієнту крок коментаря (якщо ще не питали), потім питання «Потрібна накладна?»
+    (тільки якщо адмін позначив цього клієнта), інакше одразу показує підсумок замовлення
+    з кнопками Змінити/Підтвердити. send_func — query.edit_message_text або message.reply_text."""
     target_chat_id = order.get("on_behalf_of", chat_id)
+    if "client_comment" not in order:
+        order["step"] = "comment"
+        await send_func(
+            "Чи є коментар до цього замовлення? (наприклад: завезти раніше, зателефонувати "
+            "перед доставкою, лишити на рецепції тощо)\n\n"
+            "Напишіть текст, або натисніть «⏭ Пропустити», якщо коментар не потрібен.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Пропустити", callback_data="order_skipcomment")]]),
+        )
+        return
     if _client_needs_invoice_choice(target_chat_id) and "invoice" not in order:
         order["step"] = "invoice"
-        await query.edit_message_text(
+        await send_func(
             "Чи потрібна вам товарна накладна на це замовлення?",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Так", callback_data="order_invoice:Так")],
@@ -3662,7 +3676,7 @@ async def _order_go_to_confirm_or_invoice(query, context, chat_id: int, order: d
         [InlineKeyboardButton("✏️ Змінити", callback_data="order_editagain")],
         [InlineKeyboardButton("✅ Підтвердити замовлення", callback_data="order_confirm")],
     ])
-    await query.edit_message_text(summary, reply_markup=buttons, parse_mode="HTML")
+    await send_func(summary, reply_markup=buttons, parse_mode="HTML")
 
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3771,6 +3785,11 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
         return
     step = order.get("step")
     text = update.message.text or ""
+
+    if step == "comment":
+        order["client_comment"] = text.strip()
+        await _order_go_to_confirm_or_invoice(update.message.reply_text, context, chat_id, order)
+        return
 
     if step == "qty_other":
         if "review_edit_idx" in order:
@@ -4076,7 +4095,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         if order.get("payment_method"):
-            await _order_go_to_confirm_or_invoice(query, context, chat_id, order)
+            await _order_go_to_confirm_or_invoice(query.edit_message_text, context, chat_id, order)
             return
         order["step"] = "payment"
         await query.edit_message_text(
@@ -4122,13 +4141,18 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("order_payment:"):
         _, method = data.split(":", 1)
         order["payment_method"] = method
-        await _order_go_to_confirm_or_invoice(query, context, chat_id, order)
+        await _order_go_to_confirm_or_invoice(query.edit_message_text, context, chat_id, order)
         return
 
     if data.startswith("order_invoice:"):
         _, answer = data.split(":", 1)
         order["invoice"] = answer
-        await _order_go_to_confirm_or_invoice(query, context, chat_id, order)
+        await _order_go_to_confirm_or_invoice(query.edit_message_text, context, chat_id, order)
+        return
+
+    if data == "order_skipcomment":
+        order["client_comment"] = None
+        await _order_go_to_confirm_or_invoice(query.edit_message_text, context, chat_id, order)
         return
 
     if data == "order_editagain":
