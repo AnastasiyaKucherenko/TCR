@@ -1346,6 +1346,8 @@ def _get_client_price_tier(chat_id: int | None) -> str:
 
 def _normalize_item_name(s: str) -> str:
     s = re.sub(r"\([^)]*\)", "", s)
+    s = s.replace("—", "-").replace("–", "-")  # різні тире -> звичайний дефіс
+    s = re.sub(r"\s*-\s*", " - ", s)  # єдиний пробіл навколо дефіса
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
