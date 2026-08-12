@@ -1383,20 +1383,45 @@ def _find_price_in_tier(category: str, item_name: str, unit: str, tier: str) -> 
     return best
 
 
+def _find_client_price_fuzzy(chat_id: int, category: str, item_name: str, unit: str) -> float | None:
+    """Шукає індивідуальну ціну клієнта: спочатку точний збіг, потім - толерантний
+    (без урахування дужок/тире/регістру/пробілів), так само як і для загального прайсу."""
+    conn = db()
+    row = conn.execute(
+        "SELECT price FROM client_item_prices WHERE chat_id=? AND category=? AND item_name=? AND unit=?",
+        (chat_id, category, item_name, unit),
+    ).fetchone()
+    if row:
+        conn.close()
+        return row["price"]
+
+    rows = conn.execute(
+        "SELECT item_name, price FROM client_item_prices WHERE chat_id=? AND category=? AND unit=?",
+        (chat_id, category, unit),
+    ).fetchall()
+    conn.close()
+    target = _normalize_item_name(item_name)
+    if not target:
+        return None
+    best = None
+    for r in rows:
+        cand = _normalize_item_name(r["item_name"])
+        if cand == target:
+            return r["price"]
+        if cand and (cand in target or target in cand):
+            best = r["price"]
+    return best
+
+
 def _get_item_price(category: str, item_name: str, unit: str, chat_id: int | None = None) -> float | None:
     """Повертає ціну позиції в такому пріоритеті:
     1) індивідуальна ціна клієнта (якщо задана) — найвищий пріоритет;
     2) ціна для цінового рівня (тарифу) клієнта (20кг/50кг/100кг тощо);
     3) якщо для тарифу ціни немає — відкат на звичайну роздрібну ціну."""
     if chat_id is not None:
-        conn = db()
-        row = conn.execute(
-            "SELECT price FROM client_item_prices WHERE chat_id=? AND category=? AND item_name=? AND unit=?",
-            (chat_id, category, item_name, unit),
-        ).fetchone()
-        conn.close()
-        if row:
-            return row["price"]
+        price = _find_client_price_fuzzy(chat_id, category, item_name, unit)
+        if price is not None:
+            return price
 
     tier = _get_client_price_tier(chat_id)
     price = _find_price_in_tier(category, item_name, unit, tier)
@@ -4316,6 +4341,13 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     admin_id = update.effective_chat.id
     data = query.data
+    # Адмін свідомо тисне кнопку меню - будь-який старий незавершений текстовий "візард"
+    # (заповнення картки нового клієнта, редагування чужого поля, додавання адреси) вже
+    # неактуальний, інакше він міг би помилково "з'їсти" наступний введений текст
+    # (напр., замість ціни отримати "595" як ім'я клієнта зі старого візарда).
+    ADMIN_NEW_PROFILE_PENDING.pop(admin_id, None)
+    ADMIN_EDIT_PROFILE_PENDING.pop(admin_id, None)
+    ADMIN_ADD_ADDRESS_PENDING.pop(admin_id, None)
 
     if data == "menu_back":
         MENU_PENDING.pop(admin_id, None)
