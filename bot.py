@@ -1979,6 +1979,7 @@ CLIENT_BTN_DELIVERY = "📦 Умови доставки"
 CLIENT_BTN_ORDER = "☕️ Замовити"
 CLIENT_BTN_PROFILE = "🪪 Моя картка"
 CLIENT_BTN_INSTRUCTIONS = "✨ Інструкція"
+CLIENT_BTN_DETAILS = "📋 Деталі"
 
 # Старі варіанти назв кнопок (до оновлення теми) - деякі клієнти ще мають застарілу
 # клавіатуру, поки бот не надішле їм нове повідомлення, тож ці варіанти теж мають працювати.
@@ -2036,8 +2037,7 @@ def _client_persistent_keyboard() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton(CLIENT_BTN_ORDER)],
             [KeyboardButton(CLIENT_BTN_MANAGER)],
-            [KeyboardButton(CLIENT_BTN_ASSORTMENT), KeyboardButton(CLIENT_BTN_DELIVERY)],
-            [KeyboardButton(CLIENT_BTN_PROFILE), KeyboardButton(CLIENT_BTN_INSTRUCTIONS)],
+            [KeyboardButton(CLIENT_BTN_DETAILS)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -2117,9 +2117,11 @@ async def client_assortment_back_callback(update: Update, context: ContextTypes.
 
 CLIENT_INSTRUCTIONS_TEXT = (
     "📖 <b>Як користуватись ботом</b>\n\n"
-    "<b>🪪 Моя картка</b> — заповніть один раз: зона доставки, ім'я, точка, телефон, ФОП "
-    "(або «немає») та хоча б одну адресу. Якщо для адреси номер такий самий, як основний — "
-    "не передруковуйте, тисніть кнопку «📞 Такий самий».\n\n"
+    "Внизу екрана — три кнопки: <b>☕️ Замовити</b>, <b>🧡 Зв'язок з менеджером</b> "
+    "і <b>📋 Деталі</b> (там сховані Асортимент, Умови доставки, Моя картка та ця інструкція).\n\n"
+    "<b>🪪 Моя картка</b> (у «📋 Деталі») — заповніть один раз: зона доставки, ім'я, точка, "
+    "телефон, ФОП (або «немає») та хоча б одну адресу. Якщо для адреси номер такий самий, "
+    "як основний — не передруковуйте, тисніть кнопку «📞 Такий самий».\n\n"
     "<b>☕️ Замовити</b>:\n"
     "• Якщо це перше замовлення — оберете дату, категорію, позицію, вагу, зерно/молоте "
     "(і тип помелу), кількість. Можна додати кілька позицій.\n"
@@ -2128,8 +2130,8 @@ CLIENT_INSTRUCTIONS_TEXT = (
     "• В кінці — дата, спосіб оплати і короткий підсумок для перевірки.\n\n"
     "⚠️ <b>Важливо:</b> замовлення потрапляє менеджеру тільки після кнопки "
     "«✅ Підтвердити замовлення» на фінальному екрані! До того можна натиснути «✏️ Змінити».\n\n"
-    "<b>🔥 Асортимент</b> — поточний перелік кави за категоріями.\n"
-    "<b>📦 Умови доставки</b> — окремо для роздрібу і гурту.\n"
+    "<b>🔥 Асортимент</b> (у «📋 Деталі») — поточний перелік кави за категоріями.\n"
+    "<b>📦 Умови доставки</b> (у «📋 Деталі») — окремо для роздрібу і гурту.\n"
     "<b>🧡 Зв'язок з менеджером</b> — пряме посилання на вашого відповідального менеджера.\n\n"
     "Якщо на якомусь кроці бот не реагує — просто натисніть потрібну кнопку ще раз і повторіть крок."
 )
@@ -2169,6 +2171,60 @@ async def client_delivery_back_callback(update: Update, context: ContextTypes.DE
         "🚚 Які умови доставки вас цікавлять?",
         reply_markup=_delivery_category_keyboard("clientdelivery"),
     )
+
+
+async def client_show_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _group_guard_ok(update):
+        return
+    buttons = [
+        [InlineKeyboardButton(CLIENT_BTN_ASSORTMENT, callback_data="clientdetails_assortment")],
+        [InlineKeyboardButton(CLIENT_BTN_DELIVERY, callback_data="clientdetails_delivery")],
+        [InlineKeyboardButton(CLIENT_BTN_INSTRUCTIONS, callback_data="clientdetails_instructions")],
+        [InlineKeyboardButton(CLIENT_BTN_PROFILE, callback_data="clientdetails_profile")],
+    ]
+    await update.message.reply_text("📋 Оберіть, що вас цікавить:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def clientdetails_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not _group_guard_ok(update):
+        return
+    data = query.data
+    chat_id = update.effective_chat.id
+
+    if data == "clientdetails_assortment":
+        await query.edit_message_text(
+            "☕ Оберіть категорію:", reply_markup=_assortment_category_keyboard("clientassort")
+        )
+        return
+
+    if data == "clientdetails_delivery":
+        await query.edit_message_text(
+            "🚚 Які умови доставки вас цікавлять?",
+            reply_markup=_delivery_category_keyboard("clientdelivery"),
+        )
+        return
+
+    if data == "clientdetails_instructions":
+        await query.edit_message_text(CLIENT_INSTRUCTIONS_TEXT, parse_mode="HTML")
+        return
+
+    if data == "clientdetails_profile":
+        profile = _get_client_profile(chat_id)
+        if not profile:
+            PROFILE_PENDING[chat_id] = {"awaiting_zone": True, "data": {}}
+            await query.edit_message_text(
+                "Картка ще не заповнена. Заповнімо її зараз — це знадобиться для замовлень.\n\n"
+                "Спочатку — оберіть зону доставки:",
+                reply_markup=_delivery_zone_keyboard("profile_zone"),
+            )
+            return
+        addresses = _get_client_addresses(chat_id)
+        await query.edit_message_text(
+            _profile_summary_text(profile, addresses), reply_markup=_profile_manage_keyboard(addresses)
+        )
+        return
 
 
 async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7048,6 +7104,8 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_ORDER_OLD)}$"), order_start))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(ADMIN_BTN_SELFORDER)}$"), admin_self_order))
     application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_PROFILE)}$"), profile_show))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLIENT_BTN_DETAILS)}$"), client_show_details))
+    application.add_handler(CallbackQueryHandler(clientdetails_router, pattern=r"^clientdetails_"))
     application.add_handler(CallbackQueryHandler(profile_edit_callback, pattern=r"^profile_edit$"))
     application.add_handler(CallbackQueryHandler(profile_editfield_callback, pattern=r"^profile_editfield:"))
     application.add_handler(CallbackQueryHandler(profile_zonefield_callback, pattern=r"^profile_zonefield:"))
