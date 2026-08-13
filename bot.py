@@ -6488,6 +6488,28 @@ async def handle_admin_groupedit_text(update: Update, context: ContextTypes.DEFA
 
 
 
+async def shop_group_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Коли до вже підключеної групи-кав'ярні приєднується новий учасник (чи навіть сам бот) -
+    надсилаємо клавіатуру ще раз, щоб вона одразу з'явилась і для нього."""
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        return
+    if not _is_registered_client_group(chat.id):
+        return
+    new_members = update.message.new_chat_members if update.message else []
+    bot_id = context.bot.id
+    if any(m.id == bot_id for m in new_members):
+        return  # це саме бота додали - вітання вже надсилає /addshopgroup
+    try:
+        await context.bot.send_message(
+            chat.id,
+            "👋 Раді бачити нового учасника! Кнопки для замовлення вже тут, знизу екрана.",
+            reply_markup=_keyboard_for_recipient(chat.id),
+        )
+    except Exception as e:
+        logger.warning(f"Не вдалось оновити клавіатуру для нового учасника групи {chat.id}: {e}")
+
+
 async def addshopgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Адмін пише цю команду ВСЕРЕДИНІ групи кав'ярні, щоб підключити її як клієнта бота -
     після цього будь-хто в цій групі зможе замовляти, бачити асортимент тощо."""
@@ -7094,6 +7116,32 @@ async def load_all_on_startup(application: Application):
     await load_broadcasts_on_startup(application)
 
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Ловить УСІ необроблені помилки в будь-якому обробнику бота. Без цього помилка була б
+    повністю "тихою" - ні адмін, ні клієнт нічого не бачили б, окрім рядка в логах Railway."""
+    logger.error("Необроблена помилка в обробнику:", exc_info=context.error)
+    error_text = f"{type(context.error).__name__}: {context.error}"
+    if ADMIN_IDS:
+        try:
+            chat_info = ""
+            if isinstance(update, Update) and update.effective_chat:
+                chat_info = f"\nchat_id: {update.effective_chat.id}"
+            await context.bot.send_message(
+                ADMIN_IDS[0],
+                f"⚠️ У боті сталася помилка при обробці повідомлення:{chat_info}\n\n{error_text}",
+            )
+        except Exception:
+            pass
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "Ой, щось пішло не так 🙈 Спробуйте, будь ласка, ще раз, або напишіть /cancel і "
+                "повторіть з початку."
+            )
+    except Exception:
+        pass
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано BOT_TOKEN у .env")
@@ -7108,6 +7156,7 @@ def main():
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("addshopgroup", addshopgroup_command))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, shop_group_new_members))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("addsegment", addsegment))
     application.add_handler(CommandHandler("segments", segments_list))
@@ -7201,6 +7250,8 @@ def main():
     application.add_handler(CallbackQueryHandler(wg_router, pattern=r"^wg_"))
     application.add_handler(CallbackQueryHandler(order_router, pattern=r"^order_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.PRIVATE | filters.ChatType.GROUPS), handle_admin_text))
+
+    application.add_error_handler(global_error_handler)
 
     logger.info("Бот запущено")
     application.run_polling()
