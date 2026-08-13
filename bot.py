@@ -6488,6 +6488,45 @@ async def handle_admin_groupedit_text(update: Update, context: ContextTypes.DEFA
 
 
 
+async def handle_chat_migration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Коли Telegram автоматично 'підвищує' звичайну групу до супергрупи, chat_id групи
+    МІНЯЄТЬСЯ - і всі старі прив'язки (група-клієнт, замовлення, адреси, група замовлень)
+    стають недійсними без видимої помилки. Ловимо цю подію й самі оновлюємо всі записи."""
+    msg = update.message
+    if not msg:
+        return
+    old_id = msg.migrate_from_chat_id
+    new_id = msg.migrate_to_chat_id
+    if new_id:
+        old_chat_id, new_chat_id = update.effective_chat.id, new_id
+    elif old_id:
+        old_chat_id, new_chat_id = old_id, update.effective_chat.id
+    else:
+        return
+
+    conn = db()
+    for table in ("subscribers", "client_profiles", "client_addresses", "orders", "client_item_prices"):
+        try:
+            conn.execute(f"UPDATE {table} SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
+        except Exception as e:
+            logger.warning(f"[MIGRATE] Не вдалось оновити {table}: {e}")
+    conn.commit()
+    conn.close()
+
+    if _get_orders_group_id() == old_chat_id:
+        _set_setting("orders_group_chat_id", str(new_chat_id))
+
+    logger.info(f"[MIGRATE] Групу {old_chat_id} автоматично мігровано в {new_chat_id}")
+    try:
+        await context.bot.send_message(
+            new_chat_id,
+            "🔄 Telegram технічно оновив цю групу (перетворив на супергрупу) - бот сам все "
+            "перепідключив, нічого робити не треба, все й далі працює як раніше.",
+        )
+    except Exception:
+        pass
+
+
 async def shop_group_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Коли до вже підключеної групи-кав'ярні приєднується новий учасник (чи навіть сам бот) -
     надсилаємо клавіатуру ще раз, щоб вона одразу з'явилась і для нього."""
@@ -7157,6 +7196,7 @@ def main():
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("addshopgroup", addshopgroup_command))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, shop_group_new_members))
+    application.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handle_chat_migration))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("addsegment", addsegment))
     application.add_handler(CommandHandler("segments", segments_list))
