@@ -3569,13 +3569,17 @@ def _esc(value) -> str:
 
 
 def _order_client_summary_text(order: dict, profile: dict) -> str:
-    """Коротка версія підсумку — тільки те, що потрібно клієнту перед підтвердженням:
-    назва кав'ярні, дата, самі позиції (з помелом/зерном) та спосіб оплати."""
+    """Коротка версія підсумку — тільки те, що потрібно клієнту перед підтвердженням і після нього:
+    ім'я, назва кав'ярні, адреса (якщо не самовивіз), дата, самі позиції (з помелом/зерном), оплата."""
+    is_pickup = profile.get("delivery_zone") == "Самовивіз"
     lines = [
+        f"👤 {_esc(profile.get('full_name') or '—')}",
         f"🏪 <b>{_esc(profile.get('point_name') or '—')}</b>",
-        f"📅 Дата: {_esc(order.get('date') or '—')}",
-        "",
     ]
+    if not is_pickup:
+        lines.append(f"📍 {_esc(order.get('address') or '—')}")
+    lines.append(f"📅 Дата: {_esc(order.get('date') or '—')}")
+    lines.append("")
     for i, item in enumerate(order.get("items", []), 1):
         grind_part = ""
         if item.get("grind"):
@@ -4321,10 +4325,12 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 "🔥 Замовлення оформлено за клієнта!" if on_behalf else "🔥 Замовлення оформлено!"
             )
+            client_summary = _order_client_summary_text(order, profile)
             await context.bot.send_message(
                 target_chat_id,
-                "Дякуємо! ☕️ Ваше замовлення передано менеджеру, скоро з вами зв'яжуться 🧡\n\n"
-                "👇 Кнопки внизу завжди тут, якщо треба щось інше.",
+                "✅ <b>Дякуємо! Ваше замовлення прийнято:</b>\n\n" + client_summary +
+                "\n\n🧡 Скоро з вами зв'яжуться.\n👇 Кнопки внизу завжди тут, якщо треба щось інше.",
+                parse_mode="HTML",
                 reply_markup=_keyboard_for_recipient(target_chat_id),
             )
         if target_admin and target_admin != chat_id:
@@ -4366,6 +4372,18 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати замовлення в групу замовлень: {e}")
+                notify_target = target_admin or (ADMIN_IDS[0] if ADMIN_IDS else None)
+                if notify_target:
+                    try:
+                        await context.bot.send_message(
+                            notify_target,
+                            f"⚠️ Не вдалось надіслати це замовлення в групу замовлень (можливо, "
+                            f"застаріле ID групи — наприклад, якщо групу колись перетворили на "
+                            f"супергрупу). Перевірте, будь ласка, і за потреби заново прив'яжіть "
+                            f"групу командою /setordersgroup прямо в ній.\n\nПомилка: {e}",
+                        )
+                    except Exception:
+                        pass
         return
 
 
@@ -6178,6 +6196,31 @@ def _get_orders_group_id() -> int | None:
         return None
 
 
+async def testordersgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Надсилає тестове повідомлення в поточну прив'язану групу замовлень, щоб одразу
+    перевірити, чи справді працює надсилання (напр., якщо ID групи застарів)."""
+    if not is_admin(update):
+        return
+    orders_group_id = _get_orders_group_id()
+    if not orders_group_id:
+        await update.message.reply_text(
+            "Група замовлень ще не прив'язана. Зайдіть у потрібну групу і напишіть там "
+            "/setordersgroup, щоб прив'язати."
+        )
+        return
+    try:
+        await context.bot.send_message(
+            orders_group_id, "✅ Тестове повідомлення від бота — якщо ви це бачите, група налаштована правильно."
+        )
+        await update.message.reply_text(f"✅ Успішно надіслано в групу (ID: {orders_group_id}).")
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Не вдалось надіслати в групу (ID: {orders_group_id}).\n\nПомилка: {e}\n\n"
+            f"Ймовірно, ID застарів (наприклад, групу перетворили на супергрупу, і ID змінився). "
+            f"Зайдіть у потрібну групу і заново напишіть там /setordersgroup."
+        )
+
+
 async def setordersgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Прив'язує поточний чат (запускати ВСЕРЕДИНІ групи з замовленнями) як місце,
     куди дублюватимуться всі підтверджені замовлення клієнтів."""
@@ -7085,6 +7128,7 @@ def main():
     application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CommandHandler("diagorders", diag_orders))
     application.add_handler(CommandHandler("setordersgroup", setordersgroup_command))
+    application.add_handler(CommandHandler("testordersgroup", testordersgroup_command))
     application.add_handler(CommandHandler("clearordersgroup", clearordersgroup_command))
     application.add_handler(CommandHandler("pendingorders", pending_orders_command))
     application.add_handler(CommandHandler("invite", invite_command))
