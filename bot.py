@@ -6243,10 +6243,14 @@ async def grouporder_edit_callback(update: Update, context: ContextTypes.DEFAULT
     ADMIN_GROUPEDIT_PENDING[user.id] = {
         "group_chat_id": group_chat_id, "message_id": message_id, "mode": "replace",
     }
+    current_text = GROUP_ORDER_TEXT.get((group_chat_id, message_id)) or (query.message.text if query.message else "") or ""
     try:
         await context.bot.send_message(
             user.id,
-            "Напишіть новий повний текст цього замовлення — повністю замінить те, що зараз у групі:",
+            "Ось повний поточний текст замовлення (тисніть на нього, щоб скопіювати) — скопіюйте, "
+            "підправте що треба і надішліть назад цілком, це повністю замінить те, що зараз у групі:\n\n"
+            f"<code>{_esc(current_text)}</code>",
+            parse_mode="HTML",
         )
     except Exception as e:
         logger.warning(f"Не вдалось написати адміну в особисті для редагування замовлення: {e}")
