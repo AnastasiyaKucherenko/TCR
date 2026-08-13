@@ -327,6 +327,26 @@ def init_db():
     conn.close()
 
 
+def _is_registered_client_group(chat_id: int) -> bool:
+    """Чи підключена ця група як клієнт бота (кав'ярня) - тільки такі групи можуть
+    користуватись клієнтськими функціями бота (замовлення, асортимент тощо)."""
+    if chat_id >= 0:
+        return False
+    conn = db()
+    row = conn.execute("SELECT chat_id FROM subscribers WHERE chat_id=? AND active=1", (chat_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def _group_guard_ok(update: Update) -> bool:
+    """Повертає True, якщо повідомлення можна обробляти як клієнтське: це або приватний чат,
+    або група, яку адмін явно підключив командою /addshopgroup."""
+    chat = update.effective_chat
+    if chat.type == "private":
+        return True
+    return _is_registered_client_group(chat.id)
+
+
 def is_admin(update: Update) -> bool:
     chat_id = update.effective_chat.id
     if chat_id not in ADMIN_IDS:
@@ -1607,6 +1627,8 @@ async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if update.effective_chat.type != "private" and not _is_registered_client_group(chat_id):
+        return
 
     # Якщо в адміна зараз є активна АДМІНСЬКА дія (крок меню, редагування чужої картки,
     # очікування тексту розсилки тощо) — вона має пріоритет над старим незавершеним
@@ -2062,6 +2084,8 @@ def _assortment_category_keyboard(prefix: str) -> InlineKeyboardMarkup:
 
 
 async def client_show_assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _group_guard_ok(update):
+        return
     await update.message.reply_text(
         "☕ Оберіть категорію:", reply_markup=_assortment_category_keyboard("clientassort")
     )
@@ -2112,10 +2136,14 @@ CLIENT_INSTRUCTIONS_TEXT = (
 
 
 async def client_show_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _group_guard_ok(update):
+        return
     await update.message.reply_text(CLIENT_INSTRUCTIONS_TEXT, parse_mode="HTML")
 
 
 async def client_show_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _group_guard_ok(update):
+        return
     await update.message.reply_text(
         "🚚 Які умови доставки вас цікавлять?",
         reply_markup=_delivery_category_keyboard("clientdelivery"),
@@ -2144,6 +2172,8 @@ async def client_delivery_back_callback(update: Update, context: ContextTypes.DE
 
 
 async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _group_guard_ok(update):
+        return
     chat_id = update.effective_chat.id
     conn = db()
     row = conn.execute("SELECT responsible_admin FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
@@ -2331,6 +2361,8 @@ def _profile_manage_keyboard(addresses: list) -> InlineKeyboardMarkup:
 
 
 async def profile_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _group_guard_ok(update):
+        return
     chat_id = update.effective_chat.id
     profile = _get_client_profile(chat_id)
     if not profile:
@@ -3707,6 +3739,8 @@ async def _order_go_to_confirm_or_invoice(send_func, context, chat_id: int, orde
 
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _group_guard_ok(update):
+        return
     chat_id = update.effective_chat.id
     PROFILE_PENDING.pop(chat_id, None)
     profile = _get_client_profile(chat_id)
@@ -3766,6 +3800,8 @@ async def qna_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _group_guard_ok(update):
+        return
     """Кнопка «📝 Замовити прямо тут» у запитанні так/ні — запускає той самий опитувальник замовлення."""
     query = update.callback_query
     await query.answer()
@@ -6353,6 +6389,48 @@ async def handle_admin_groupedit_text(update: Update, context: ContextTypes.DEFA
 
 
 
+async def addshopgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін пише цю команду ВСЕРЕДИНІ групи кав'ярні, щоб підключити її як клієнта бота -
+    після цього будь-хто в цій групі зможе замовляти, бачити асортимент тощо."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text(
+            "Цю команду потрібно написати ВСЕРЕДИНІ групи кав'ярні (додайте туди бота і напишіть "
+            "/addshopgroup прямо в тій групі), а не в приватних повідомленнях з ботом."
+        )
+        return
+    if not user or user.id not in ADMIN_IDS:
+        await update.message.reply_text("Тільки адміністратор може підключити групу.")
+        return
+    chat_id = chat.id
+    conn = db()
+    existing = conn.execute("SELECT chat_id FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
+    if existing:
+        conn.execute("UPDATE subscribers SET active=1 WHERE chat_id=?", (chat_id,))
+    else:
+        conn.execute(
+            "INSERT INTO subscribers (chat_id, name, username, active, joined_at) VALUES (?, ?, ?, 1, ?)",
+            (chat_id, chat.title or "Група", "", datetime.now(TZ).isoformat()),
+        )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        "✅ Цю групу підключено до бота! Тепер будь-хто в цій групі може тиснути кнопки нижче, "
+        "щоб оформити замовлення, побачити асортимент чи умови доставки - все спільне для всієї "
+        "групи (одна картка, одна історія замовлень на всіх).\n\n"
+        "⚠️ Важливо: якщо кілька людей одночасно щось відповідають боту в цій групі, це може "
+        "переплутати кроки - тож краще, щоб замовлення оформляла одна людина за раз.",
+        reply_markup=_keyboard_for_recipient(chat_id),
+    )
+    if not _get_client_profile(chat_id):
+        PROFILE_PENDING[chat_id] = {"awaiting_zone": True, "data": {}}
+        await update.message.reply_text(
+            "Заповнимо картку цієї кав'ярні одразу? Оберіть зону доставки:",
+            reply_markup=_delivery_zone_keyboard("profile_zone"),
+        )
+
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Скидає будь-який незавершений крок (заповнення картки, замовлення, дію меню тощо)
     для цього чату — універсальний «аварійний вихід», якщо щось застрягло."""
@@ -6930,6 +7008,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("addshopgroup", addshopgroup_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("addsegment", addsegment))
     application.add_handler(CommandHandler("segments", segments_list))
@@ -7019,7 +7098,7 @@ def main():
     application.add_handler(CallbackQueryHandler(qna_router, pattern=r"^qna_"))
     application.add_handler(CallbackQueryHandler(wg_router, pattern=r"^wg_"))
     application.add_handler(CallbackQueryHandler(order_router, pattern=r"^order_"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_text))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & (filters.ChatType.PRIVATE | filters.ChatType.GROUPS), handle_admin_text))
 
     logger.info("Бот запущено")
     application.run_polling()
