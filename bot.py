@@ -338,13 +338,25 @@ def _is_registered_client_group(chat_id: int) -> bool:
     return row is not None
 
 
-def _group_guard_ok(update: Update) -> bool:
+async def _group_guard_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Повертає True, якщо повідомлення можна обробляти як клієнтське: це або приватний чат,
-    або група, яку адмін явно підключив командою /addshopgroup."""
+    або група, яку адмін явно підключив командою /addshopgroup. Якщо група НЕ підключена -
+    один раз на повідомлення пояснює причину замість того, щоб мовчати без жодної підказки."""
     chat = update.effective_chat
     if chat.type == "private":
         return True
-    return _is_registered_client_group(chat.id)
+    if _is_registered_client_group(chat.id):
+        return True
+    try:
+        await context.bot.send_message(
+            chat.id,
+            "🤖 Цю групу ще не підключено до бота (або підключення технічно не вдалось).\n\n"
+            "Попросіть, будь ласка, адміністратора написати тут команду /addshopgroup, "
+            "щоб можна було замовляти.",
+        )
+    except Exception as e:
+        logger.warning(f"Не вдалось пояснити непідключеній групі {chat.id}: {e}")
+    return False
 
 
 def is_admin(update: Update) -> bool:
@@ -2084,7 +2096,7 @@ def _assortment_category_keyboard(prefix: str) -> InlineKeyboardMarkup:
 
 
 async def client_show_assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _group_guard_ok(update):
+    if not await _group_guard_ok(update, context):
         return
     await update.message.reply_text(
         "☕ Оберіть категорію:", reply_markup=_assortment_category_keyboard("clientassort")
@@ -2138,13 +2150,13 @@ CLIENT_INSTRUCTIONS_TEXT = (
 
 
 async def client_show_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _group_guard_ok(update):
+    if not await _group_guard_ok(update, context):
         return
     await update.message.reply_text(CLIENT_INSTRUCTIONS_TEXT, parse_mode="HTML")
 
 
 async def client_show_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _group_guard_ok(update):
+    if not await _group_guard_ok(update, context):
         return
     await update.message.reply_text(
         "🚚 Які умови доставки вас цікавлять?",
@@ -2174,7 +2186,7 @@ async def client_delivery_back_callback(update: Update, context: ContextTypes.DE
 
 
 async def client_show_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _group_guard_ok(update):
+    if not await _group_guard_ok(update, context):
         return
     buttons = [
         [InlineKeyboardButton(CLIENT_BTN_ASSORTMENT, callback_data="clientdetails_assortment")],
@@ -2188,7 +2200,7 @@ async def client_show_details(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def clientdetails_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not _group_guard_ok(update):
+    if not await _group_guard_ok(update, context):
         return
     data = query.data
     chat_id = update.effective_chat.id
@@ -2228,7 +2240,7 @@ async def clientdetails_router(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def client_contact_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _group_guard_ok(update):
+    if not await _group_guard_ok(update, context):
         return
     chat_id = update.effective_chat.id
     conn = db()
@@ -2417,7 +2429,7 @@ def _profile_manage_keyboard(addresses: list) -> InlineKeyboardMarkup:
 
 
 async def profile_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _group_guard_ok(update):
+    if not await _group_guard_ok(update, context):
         return
     chat_id = update.effective_chat.id
     profile = _get_client_profile(chat_id)
@@ -3799,7 +3811,7 @@ async def _order_go_to_confirm_or_invoice(send_func, context, chat_id: int, orde
 
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _group_guard_ok(update):
+    if not await _group_guard_ok(update, context):
         return
     chat_id = update.effective_chat.id
     PROFILE_PENDING.pop(chat_id, None)
@@ -3860,7 +3872,7 @@ async def qna_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _group_guard_ok(update):
+    if not await _group_guard_ok(update, context):
         return
     """Кнопка «📝 Замовити прямо тут» у запитанні так/ні — запускає той самий опитувальник замовлення."""
     query = update.callback_query
