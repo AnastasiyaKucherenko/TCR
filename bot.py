@@ -7170,8 +7170,15 @@ async def load_all_on_startup(application: Application):
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Ловить УСІ необроблені помилки в будь-якому обробнику бота. Без цього помилка була б
     повністю "тихою" - ні адмін, ні клієнт нічого не бачили б, окрім рядка в логах Railway."""
-    logger.error("Необроблена помилка в обробнику:", exc_info=context.error)
     error_text = f"{type(context.error).__name__}: {context.error}"
+
+    # "Message is not modified" - нешкідлива помилка Telegram, коли хтось двічі швидко тисне
+    # ту саму кнопку (подвійний тап). Нічого не зламано, нікого не турбуємо через це.
+    if "Message is not modified" in str(context.error):
+        logger.info(f"[IGNORED] Подвійний тап (нешкідливо): {error_text}")
+        return
+
+    logger.error("Необроблена помилка в обробнику:", exc_info=context.error)
     if ADMIN_IDS:
         try:
             chat_info = ""
