@@ -1060,6 +1060,74 @@ async def resplist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не вдалось завантажити список (тимчасова помилка). Спробуйте ще раз.")
 
 
+async def findclient_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пошук клієнта за chat_id (наприклад, тим, що прийшов у повідомленні про помилку).
+    Використання: /findclient 434510545
+    Також можна шукати частину імені чи юзернейма: /findclient Ростислав"""
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Використання: /findclient chat_id\n"
+            "Або за іменем/юзернеймом: /findclient частина_імені\n\n"
+            "Приклад: /findclient 434510545"
+        )
+        return
+    query_str = " ".join(context.args).strip()
+
+    conn = db()
+    if query_str.lstrip("-").isdigit():
+        rows = conn.execute(
+            "SELECT s.*, a.name as admin_name FROM subscribers s "
+            "LEFT JOIN admins a ON s.responsible_admin = a.chat_id "
+            "WHERE s.chat_id = ?",
+            (int(query_str),),
+        ).fetchall()
+    else:
+        like = f"%{query_str}%"
+        rows = conn.execute(
+            "SELECT s.*, a.name as admin_name FROM subscribers s "
+            "LEFT JOIN admins a ON s.responsible_admin = a.chat_id "
+            "WHERE s.name LIKE ? OR s.username LIKE ? "
+            "ORDER BY s.joined_at DESC LIMIT 15",
+            (like, like),
+        ).fetchall()
+
+    if not rows:
+        conn.close()
+        await update.message.reply_text(
+            f"Клієнта з chat_id/іменем «{query_str}» не знайдено серед підписників бота."
+        )
+        return
+
+    parts = []
+    for r in rows:
+        profile = conn.execute(
+            "SELECT point_name, address, phone FROM client_profiles WHERE chat_id=?",
+            (r["chat_id"],),
+        ).fetchone()
+        admin_label = r["admin_name"] if r["admin_name"] else "❓ не призначено"
+        status = "активний" if r["active"] else "⛔ неактивний (заблокував бота або вийшов)"
+        lines = [
+            f"👤 {r['name']} (@{r['username'] or '—'})",
+            f"chat_id: {r['chat_id']}",
+            f"Статус: {status}",
+            f"Група: {r['segment'] or 'немає'}",
+            f"Відповідальний: {admin_label}",
+        ]
+        if profile:
+            if profile["point_name"]:
+                lines.append(f"Назва точки: {profile['point_name']}")
+            if profile["address"]:
+                lines.append(f"Адреса: {profile['address']}")
+            if profile["phone"]:
+                lines.append(f"Телефон: {profile['phone']}")
+        parts.append("\n".join(lines))
+    conn.close()
+
+    await update.message.reply_text("\n\n".join(parts))
+
+
 async def bulkresp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Швидко призначає одного адміна відповідальним одразу для кількох клієнтів або цілої групи.
     Використання: /bulkresp @юзернейм id1,id2,id3
@@ -3935,6 +4003,14 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
             text_out, kb = _order_review_step_screen(order)
             await update.message.reply_text(text_out, reply_markup=kb)
             return
+        if "current_item" not in order:
+            order["step"] = "category"
+            await update.message.reply_text(
+                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
+                "Оберіть категорію ще раз:",
+                reply_markup=_order_category_keyboard("order_back_to_date"),
+            )
+            return
         order["current_item"]["qty"] = text
         order["items"].append(order.pop("current_item"))
         order["step"] = "addmore"
@@ -4095,6 +4171,14 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_pickunit:"):
         _, unit = data.split(":", 1)
+        if "current_item" not in order:
+            order["step"] = "category"
+            await query.edit_message_text(
+                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
+                "Оберіть категорію ще раз:",
+                reply_markup=_order_category_keyboard("order_back_to_date"),
+            )
+            return
         order["current_item"]["weight"] = unit
         order["step"] = "itemlist"
         text, kb = _order_itemlist_screen(order, target_chat_id)
@@ -4121,8 +4205,13 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, idx_str = data.split(":", 1)
         idx = int(idx_str)
         choices = order.get("current_item_choices", [])
-        if idx >= len(choices):
-            await query.answer("Ця позиція вже неактуальна, спробуйте ще раз.", show_alert=True)
+        if idx >= len(choices) or "current_item" not in order:
+            order["step"] = "category"
+            await query.edit_message_text(
+                "Ця позиція вже неактуальна (можливо, бот перезапускався). "
+                "Оберіть категорію ще раз:",
+                reply_markup=_order_category_keyboard("order_back_to_date"),
+            )
             return
         cur = order["current_item"]
         cur["item_text"] = choices[idx]
@@ -4151,6 +4240,14 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_grind:"):
         _, grind = data.split(":", 1)
+        if "current_item" not in order:
+            order["step"] = "category"
+            await query.edit_message_text(
+                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
+                "Оберіть категорію ще раз:",
+                reply_markup=_order_category_keyboard("order_back_to_date"),
+            )
+            return
         order["current_item"]["grind"] = grind
         if grind == "Молоте":
             await query.edit_message_text("На який помел?", reply_markup=_order_grind_type_keyboard())
@@ -4167,6 +4264,14 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("order_grindtype:"):
         _, idx_str = data.split(":", 1)
         idx = int(idx_str)
+        if "current_item" not in order:
+            order["step"] = "category"
+            await query.edit_message_text(
+                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
+                "Оберіть категорію ще раз:",
+                reply_markup=_order_category_keyboard("order_back_to_date"),
+            )
+            return
         order["current_item"]["grind_type"] = GRIND_TYPE_OPTIONS[idx]
         next_step, next_text, next_kb = _next_after_options(chat_id, "order_back_to_grind")
         order["step"] = next_step
@@ -4175,6 +4280,14 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_packaging:"):
         _, packaging = data.split(":", 1)
+        if "current_item" not in order:
+            order["step"] = "category"
+            await query.edit_message_text(
+                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
+                "Оберіть категорію ще раз:",
+                reply_markup=_order_category_keyboard("order_back_to_date"),
+            )
+            return
         order["current_item"]["packaging"] = packaging
         order["step"] = "qty"
         back_to = "order_back_to_grind" if order["current_item"].get("grind") else "order_back_to_itemlist"
@@ -4190,6 +4303,14 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order["review_idx"] = idx + 1
             text, kb = _order_review_step_screen(order)
             await query.edit_message_text(text, reply_markup=kb)
+            return
+        if "current_item" not in order:
+            order["step"] = "category"
+            await query.edit_message_text(
+                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
+                "Оберіть категорію ще раз:",
+                reply_markup=_order_category_keyboard("order_back_to_date"),
+            )
             return
         order["current_item"]["qty"] = qty
         order["items"].append(order.pop("current_item"))
@@ -7227,6 +7348,7 @@ def main():
     application.add_handler(CommandHandler("setmsg", setmsg))
     application.add_handler(CommandHandler("clients", clients_list))
     application.add_handler(CommandHandler("resplist", resplist_command))
+    application.add_handler(CommandHandler("findclient", findclient_command))
     application.add_handler(CommandHandler("bulkresp", bulkresp_command))
     application.add_handler(CommandHandler("setsegment", setsegment))
     application.add_handler(CommandHandler("broadcast", broadcast))
