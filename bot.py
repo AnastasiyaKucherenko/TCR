@@ -1706,6 +1706,12 @@ async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        # Це не нове повідомлення, а, наприклад, РЕДАГУВАННЯ вже надісланого (Telegram
+        # надсилає такі апдейти як edited_message, і update.message тоді дорівнює None).
+        # Раніше через це бот падав з AttributeError: 'NoneType' object has no attribute
+        # 'reply_to_message', щойно хтось (клієнт чи адмін) виправляв текст свого повідомлення.
+        return
     chat_id = update.effective_chat.id
     if update.effective_chat.type != "private" and not _is_registered_client_group(chat_id):
         return
