@@ -1060,74 +1060,6 @@ async def resplist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не вдалось завантажити список (тимчасова помилка). Спробуйте ще раз.")
 
 
-async def findclient_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пошук клієнта за chat_id (наприклад, тим, що прийшов у повідомленні про помилку).
-    Використання: /findclient 434510545
-    Також можна шукати частину імені чи юзернейма: /findclient Ростислав"""
-    if not is_admin(update):
-        return
-    if not context.args:
-        await update.message.reply_text(
-            "Використання: /findclient chat_id\n"
-            "Або за іменем/юзернеймом: /findclient частина_імені\n\n"
-            "Приклад: /findclient 434510545"
-        )
-        return
-    query_str = " ".join(context.args).strip()
-
-    conn = db()
-    if query_str.lstrip("-").isdigit():
-        rows = conn.execute(
-            "SELECT s.*, a.name as admin_name FROM subscribers s "
-            "LEFT JOIN admins a ON s.responsible_admin = a.chat_id "
-            "WHERE s.chat_id = ?",
-            (int(query_str),),
-        ).fetchall()
-    else:
-        like = f"%{query_str}%"
-        rows = conn.execute(
-            "SELECT s.*, a.name as admin_name FROM subscribers s "
-            "LEFT JOIN admins a ON s.responsible_admin = a.chat_id "
-            "WHERE s.name LIKE ? OR s.username LIKE ? "
-            "ORDER BY s.joined_at DESC LIMIT 15",
-            (like, like),
-        ).fetchall()
-
-    if not rows:
-        conn.close()
-        await update.message.reply_text(
-            f"Клієнта з chat_id/іменем «{query_str}» не знайдено серед підписників бота."
-        )
-        return
-
-    parts = []
-    for r in rows:
-        profile = conn.execute(
-            "SELECT point_name, address, phone FROM client_profiles WHERE chat_id=?",
-            (r["chat_id"],),
-        ).fetchone()
-        admin_label = r["admin_name"] if r["admin_name"] else "❓ не призначено"
-        status = "активний" if r["active"] else "⛔ неактивний (заблокував бота або вийшов)"
-        lines = [
-            f"👤 {r['name']} (@{r['username'] or '—'})",
-            f"chat_id: {r['chat_id']}",
-            f"Статус: {status}",
-            f"Група: {r['segment'] or 'немає'}",
-            f"Відповідальний: {admin_label}",
-        ]
-        if profile:
-            if profile["point_name"]:
-                lines.append(f"Назва точки: {profile['point_name']}")
-            if profile["address"]:
-                lines.append(f"Адреса: {profile['address']}")
-            if profile["phone"]:
-                lines.append(f"Телефон: {profile['phone']}")
-        parts.append("\n".join(lines))
-    conn.close()
-
-    await update.message.reply_text("\n\n".join(parts))
-
-
 async def bulkresp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Швидко призначає одного адміна відповідальним одразу для кількох клієнтів або цілої групи.
     Використання: /bulkresp @юзернейм id1,id2,id3
@@ -1706,12 +1638,6 @@ async def sendto_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        # Це не нове повідомлення, а, наприклад, РЕДАГУВАННЯ вже надісланого (Telegram
-        # надсилає такі апдейти як edited_message, і update.message тоді дорівнює None).
-        # Раніше через це бот падав з AttributeError: 'NoneType' object has no attribute
-        # 'reply_to_message', щойно хтось (клієнт чи адмін) виправляв текст свого повідомлення.
-        return
     chat_id = update.effective_chat.id
     if update.effective_chat.type != "private" and not _is_registered_client_group(chat_id):
         return
@@ -4009,14 +3935,6 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
             text_out, kb = _order_review_step_screen(order)
             await update.message.reply_text(text_out, reply_markup=kb)
             return
-        if "current_item" not in order:
-            order["step"] = "category"
-            await update.message.reply_text(
-                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
-                "Оберіть категорію ще раз:",
-                reply_markup=_order_category_keyboard("order_back_to_date"),
-            )
-            return
         order["current_item"]["qty"] = text
         order["items"].append(order.pop("current_item"))
         order["step"] = "addmore"
@@ -4177,14 +4095,6 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_pickunit:"):
         _, unit = data.split(":", 1)
-        if "current_item" not in order:
-            order["step"] = "category"
-            await query.edit_message_text(
-                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
-                "Оберіть категорію ще раз:",
-                reply_markup=_order_category_keyboard("order_back_to_date"),
-            )
-            return
         order["current_item"]["weight"] = unit
         order["step"] = "itemlist"
         text, kb = _order_itemlist_screen(order, target_chat_id)
@@ -4211,13 +4121,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, idx_str = data.split(":", 1)
         idx = int(idx_str)
         choices = order.get("current_item_choices", [])
-        if idx >= len(choices) or "current_item" not in order:
-            order["step"] = "category"
-            await query.edit_message_text(
-                "Ця позиція вже неактуальна (можливо, бот перезапускався). "
-                "Оберіть категорію ще раз:",
-                reply_markup=_order_category_keyboard("order_back_to_date"),
-            )
+        if idx >= len(choices):
+            await query.answer("Ця позиція вже неактуальна, спробуйте ще раз.", show_alert=True)
             return
         cur = order["current_item"]
         cur["item_text"] = choices[idx]
@@ -4246,14 +4151,6 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_grind:"):
         _, grind = data.split(":", 1)
-        if "current_item" not in order:
-            order["step"] = "category"
-            await query.edit_message_text(
-                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
-                "Оберіть категорію ще раз:",
-                reply_markup=_order_category_keyboard("order_back_to_date"),
-            )
-            return
         order["current_item"]["grind"] = grind
         if grind == "Молоте":
             await query.edit_message_text("На який помел?", reply_markup=_order_grind_type_keyboard())
@@ -4270,14 +4167,6 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("order_grindtype:"):
         _, idx_str = data.split(":", 1)
         idx = int(idx_str)
-        if "current_item" not in order:
-            order["step"] = "category"
-            await query.edit_message_text(
-                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
-                "Оберіть категорію ще раз:",
-                reply_markup=_order_category_keyboard("order_back_to_date"),
-            )
-            return
         order["current_item"]["grind_type"] = GRIND_TYPE_OPTIONS[idx]
         next_step, next_text, next_kb = _next_after_options(chat_id, "order_back_to_grind")
         order["step"] = next_step
@@ -4286,14 +4175,6 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("order_packaging:"):
         _, packaging = data.split(":", 1)
-        if "current_item" not in order:
-            order["step"] = "category"
-            await query.edit_message_text(
-                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
-                "Оберіть категорію ще раз:",
-                reply_markup=_order_category_keyboard("order_back_to_date"),
-            )
-            return
         order["current_item"]["packaging"] = packaging
         order["step"] = "qty"
         back_to = "order_back_to_grind" if order["current_item"].get("grind") else "order_back_to_itemlist"
@@ -4309,14 +4190,6 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order["review_idx"] = idx + 1
             text, kb = _order_review_step_screen(order)
             await query.edit_message_text(text, reply_markup=kb)
-            return
-        if "current_item" not in order:
-            order["step"] = "category"
-            await query.edit_message_text(
-                "Сесія вибору товару застаріла (можливо, бот перезапускався). "
-                "Оберіть категорію ще раз:",
-                reply_markup=_order_category_keyboard("order_back_to_date"),
-            )
             return
         order["current_item"]["qty"] = qty
         order["items"].append(order.pop("current_item"))
@@ -4925,11 +4798,69 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("menu_indivpick:"):
         _, target_chat_id_str = data.split(":", 1)
         buttons = [
+            [InlineKeyboardButton("👀 Показати всі поточні індивідуальні ціни", callback_data=f"menu_indivshow:{target_chat_id_str}")],
+        ]
+        buttons += [
             [InlineKeyboardButton(label, callback_data=f"menu_indivcat:{target_chat_id_str}:{key}")]
             for key, label in ORDER_CATEGORIES
         ]
         buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
-        await query.edit_message_text("Оберіть категорію:", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("Що зробити з індивідуальними цінами цього клієнта?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("menu_indivshow:"):
+        _, target_chat_id_str = data.split(":", 1)
+        target_chat_id = int(target_chat_id_str)
+        conn = db()
+        rows = conn.execute(
+            "SELECT id, category, item_name, unit, price FROM client_item_prices WHERE chat_id=? ORDER BY category, item_name",
+            (target_chat_id,),
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text(
+                "У цього клієнта немає жодної індивідуальної ціни — усі товари рахуються за його тарифом.",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        buttons = [
+            [InlineKeyboardButton(f"❌ {r['item_name']} ({r['unit']}) — {r['price']:g} грн", callback_data=f"menu_indivdel:{target_chat_id}:{r['id']}")]
+            for r in rows
+        ]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "Поточні індивідуальні ціни цього клієнта (тисніть, щоб прибрати конкретну):",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("menu_indivdel:"):
+        _, target_chat_id_str, price_id_str = data.split(":", 2)
+        target_chat_id = int(target_chat_id_str)
+        conn = db()
+        conn.execute("DELETE FROM client_item_prices WHERE id=?", (int(price_id_str),))
+        conn.commit()
+        rows = conn.execute(
+            "SELECT id, category, item_name, unit, price FROM client_item_prices WHERE chat_id=? ORDER BY category, item_name",
+            (target_chat_id,),
+        ).fetchall()
+        conn.close()
+        await query.answer("Прибрано ✅")
+        if not rows:
+            await query.edit_message_text(
+                "Готово. У цього клієнта більше немає жодної індивідуальної ціни.",
+                reply_markup=_menu_back_keyboard(),
+            )
+            return
+        buttons = [
+            [InlineKeyboardButton(f"❌ {r['item_name']} ({r['unit']}) — {r['price']:g} грн", callback_data=f"menu_indivdel:{target_chat_id}:{r['id']}")]
+            for r in rows
+        ]
+        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+        await query.edit_message_text(
+            "Поточні індивідуальні ціни цього клієнта (тисніть, щоб прибрати конкретну):",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
         return
 
     if data.startswith("menu_indivcat:"):
@@ -6764,6 +6695,39 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def pricecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перевіряє КОЖНУ позицію з асортименту (по всіх категоріях) на наявність роздрібної ціни -
+    щоб знайти реальні 'дірки' в прайсі, а не тільки в засіяних стартових даних."""
+    if not is_admin(update):
+        return
+    lines = ["🔍 <b>Перевірка прайсу</b>\n"]
+    total_checked, total_missing = 0, 0
+    for cat_key, cat_label in ORDER_CATEGORIES:
+        items = _parse_assortment_items(cat_key)
+        if not items:
+            continue
+        units = CATEGORY_UNITS.get(cat_key, ["шт"])
+        cat_missing = []
+        for item_name in items:
+            for unit in units:
+                total_checked += 1
+                price = _get_item_price(cat_key, item_name, unit, None)
+                if price is None:
+                    cat_missing.append(f"«{item_name}» — {unit}")
+                    total_missing += 1
+        if cat_missing:
+            lines.append(f"\n<b>{cat_label}</b> — без ціни ({len(cat_missing)}):")
+            for m in cat_missing[:30]:
+                lines.append(f"  • {_esc(m)}")
+    lines.append(f"\n\n📊 Перевірено: {total_checked}, без ціни: {total_missing}")
+    if total_missing == 0:
+        lines.append("\n✅ Дірок немає — у всіх позицій асортименту є роздрібна ціна.")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3980] + "\n\n…(список задовгий, показано частково)"
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 async def diag_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Діагностика: показує останні збережені замовлення в базі (для перевірки функції «Повторити»)."""
     if not is_admin(update):
@@ -6990,8 +6954,6 @@ PRICE_LIST_SEED_300 = [
     ('arabika', 'Перу SHB Gr.1', '250 г', 318.0, 236.0, 217.0, 201.6, 191.3),
     ('arabika', 'Сальвадор SHG EP', '1 кг', 1166.0, 863.0, 804.0, 744.2, 704.2),
     ('arabika', 'Сальвадор SHG EP', '250 г', 325.0, 241.0, 221.0, 205.6, 195.4),
-    ('arabika', 'Уганда Bugisu', '1 кг', 980.0, 726.0, 698.0, 638.0, 598.0),
-    ('arabika', 'Уганда Bugisu', '250 г', 279.0, 206.0, 194.0, 179.0, 169.0),
     ('arabika', 'Руанда Тропікал Кофі', '1 кг', 1059.0, 785.0, 743.0, 683.0, 643.0),
     ('arabika', 'Руанда Тропікал Кофі', '250 г', 298.0, 221.0, 205.0, 190.0, 180.0),
     ('arabika', 'Колумбія Infuse Ripe Cherry', '1 кг', 1331.0, 1005.0, 928.0, 838.0, 753.0),
@@ -7125,8 +7087,6 @@ PRICE_LIST_SEED = [
     ('arabika', 'Перу SHB Gr.1', '250 г', 318.0, 236.0, 217.0, 201.6),
     ('arabika', 'Сальвадор SHG EP', '1 кг', 1166.0, 863.0, 804.0, 744.2),
     ('arabika', 'Сальвадор SHG EP', '250 г', 325.0, 241.0, 221.0, 205.6),
-    ('arabika', 'Уганда Bugisu', '1 кг', 980.0, 726.0, 698.0, 638.0),
-    ('arabika', 'Уганда Bugisu', '250 г', 279.0, 206.0, 194.0, 179.0),
     ('arabika', 'Руанда Тропікал Кофі', '1 кг', 1059.0, 785.0, 743.0, 683.0),
     ('arabika', 'Руанда Тропікал Кофі', '250 г', 298.0, 221.0, 205.0, 190.0),
     ('arabika', 'Колумбія Infuse Ripe Cherry', '1 кг', 1331.0, 1005.0, 928.0, 838.0),
@@ -7285,6 +7245,14 @@ def _seed_item_prices_if_empty():
         _set_setting("price_update_20260811", "1")
         logger.info(f"[PRICE-UPDATE-20260811] Оновлено ціни: {len(PRICE_UPDATE_20260811)} позицій (тільки item_prices).")
 
+    # Одноразове видалення позиції "Уганда Bugisu" - товар прибрано з асортименту.
+    if _get_setting("removed_uganda_bugisu", "") != "1":
+        conn.execute("DELETE FROM item_prices WHERE category='arabika' AND item_name='Уганда Bugisu'")
+        conn.execute("DELETE FROM client_item_prices WHERE category='arabika' AND item_name='Уганда Bugisu'")
+        conn.commit()
+        _set_setting("removed_uganda_bugisu", "1")
+        logger.info("[PRICE-REMOVE] Прибрано 'Уганда Bugisu' з прайсу.")
+
     conn.close()
 
 
@@ -7305,15 +7273,26 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         logger.info(f"[IGNORED] Подвійний тап (нешкідливо): {error_text}")
         return
 
+    # Мережеві збої (моментна нестабільність з'єднання з Telegram чи хостингом) - НЕ помилка
+    # в логіці бота. Позначаємо окремо, щоб не плутати зі справжніми проблемами в коді.
+    is_network_error = any(
+        marker in error_text
+        for marker in ("NetworkError", "ConnectError", "Bad Gateway", "TimedOut", "ReadTimeout", "ConnectTimeout")
+    )
+
     logger.error("Необроблена помилка в обробнику:", exc_info=context.error)
     if ADMIN_IDS:
         try:
             chat_info = ""
             if isinstance(update, Update) and update.effective_chat:
                 chat_info = f"\nchat_id: {update.effective_chat.id}"
+            if is_network_error:
+                header = "🌐 Тимчасовий збій з'єднання (не проблема в самому боті, зазвичай минає само)"
+            else:
+                header = "⚠️ У боті сталася помилка при обробці повідомлення"
             await context.bot.send_message(
                 ADMIN_IDS[0],
-                f"⚠️ У боті сталася помилка при обробці повідомлення:{chat_info}\n\n{error_text}",
+                f"{header}:{chat_info}\n\n{error_text}",
             )
         except Exception:
             pass
@@ -7354,7 +7333,6 @@ def main():
     application.add_handler(CommandHandler("setmsg", setmsg))
     application.add_handler(CommandHandler("clients", clients_list))
     application.add_handler(CommandHandler("resplist", resplist_command))
-    application.add_handler(CommandHandler("findclient", findclient_command))
     application.add_handler(CommandHandler("bulkresp", bulkresp_command))
     application.add_handler(CommandHandler("setsegment", setsegment))
     application.add_handler(CommandHandler("broadcast", broadcast))
@@ -7363,6 +7341,7 @@ def main():
     )
     application.add_handler(CommandHandler("jobs", jobs_list))
     application.add_handler(CommandHandler("diagorders", diag_orders))
+    application.add_handler(CommandHandler("pricecheck", pricecheck_command))
     application.add_handler(CommandHandler("setordersgroup", setordersgroup_command))
     application.add_handler(CommandHandler("testordersgroup", testordersgroup_command))
     application.add_handler(CommandHandler("clearordersgroup", clearordersgroup_command))
