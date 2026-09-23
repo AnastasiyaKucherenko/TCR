@@ -6723,8 +6723,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pricecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перевіряє КОЖНУ позицію з асортименту (по всіх категоріях) на наявність роздрібної ціни -
-    щоб знайти реальні 'дірки' в прайсі, а не тільки в засіяних стартових даних."""
+    """Перевіряє КОЖНУ позицію з асортименту (по всіх категоріях) - показує тільки товари, які
+    ПОВНІСТЮ без ціни в жодному розмірі. Якщо для товару є ціна хоча б в одному розмірі, а в
+    іншому немає (напр. лише 250г і 1кг, без 40г) - це нормально, бот сам ховає той розмір при
+    замовленні, тож така "часткова" відсутність ціни тут не позначається як проблема."""
     if not is_admin(update):
         return
     lines = ["🔍 <b>Перевірка прайсу</b>\n"]
@@ -6736,19 +6738,18 @@ async def pricecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         units = CATEGORY_UNITS.get(cat_key, ["шт"])
         cat_missing = []
         for item_name in items:
-            for unit in units:
-                total_checked += 1
-                price = _get_item_price(cat_key, item_name, unit, None)
-                if price is None:
-                    cat_missing.append(f"«{item_name}» — {unit}")
-                    total_missing += 1
+            total_checked += 1
+            prices = [_get_item_price(cat_key, item_name, unit, None) for unit in units]
+            if all(p is None for p in prices):
+                cat_missing.append(item_name)
+                total_missing += 1
         if cat_missing:
-            lines.append(f"\n<b>{cat_label}</b> — без ціни ({len(cat_missing)}):")
+            lines.append(f"\n<b>{cat_label}</b> — без жодної ціни ({len(cat_missing)}):")
             for m in cat_missing[:30]:
                 lines.append(f"  • {_esc(m)}")
-    lines.append(f"\n\n📊 Перевірено: {total_checked}, без ціни: {total_missing}")
+    lines.append(f"\n\n📊 Перевірено товарів: {total_checked}, повністю без ціни: {total_missing}")
     if total_missing == 0:
-        lines.append("\n✅ Дірок немає — у всіх позицій асортименту є роздрібна ціна.")
+        lines.append("\n✅ Усі товари в асортименті мають ціну хоча б в одному розмірі.")
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:3980] + "\n\n…(список задовгий, показано частково)"
