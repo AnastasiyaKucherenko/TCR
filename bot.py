@@ -7505,6 +7505,33 @@ def _seed_item_prices_if_empty():
         _set_setting("remove_unpriced_assortment_v1", "1")
         logger.info("[ASSORTMENT-CLEANUP] Прибрано позиції без ціни з тексту асортименту.")
 
+    # Повертаємо «Бленд "Нermit"» в асортимент БЕЗ загальної ціни: ціни для нього задаються
+    # індивідуально кожному клієнту (👥 Клієнти → 💰 Задати індивідуальну ціну). Клієнти без
+    # індивідуальної ціни цю позицію при замовленні не бачать (позиції без ціни ховаються).
+    if _get_setting("restore_hermit_v1", "") != "1":
+        current_blend = _get_setting("assortment_blend", "")
+        if current_blend.strip():
+            existing = [ln.strip() for ln in current_blend.split("\n")]
+            if 'Бленд "Нermit"' not in existing:
+                _set_setting("assortment_blend", 'Бленд "Нermit"\n' + current_blend.lstrip("\n"))
+        _set_setting("restore_hermit_v1", "1")
+        logger.info("[ASSORTMENT-RESTORE] Повернено Бленд Hermit в асортимент (без ціни).")
+
+    # Піднімаємо «Бленд "Нermit"» на самий верх списку блендів (одноразово). Працює і тоді, коли
+    # позиція вже була додана внизу попередньою версією, і коли її ще немає взагалі.
+    if _get_setting("hermit_to_top_v1", "") != "1":
+        current_blend = _get_setting("assortment_blend", "")
+        if current_blend.strip():
+            hermit = 'Бленд "Нermit"'
+            all_lines = current_blend.split("\n")
+            first_nonempty = next((ln.strip() for ln in all_lines if ln.strip()), "")
+            if first_nonempty != hermit:
+                rest = [ln for ln in all_lines if ln.strip() != hermit]
+                rest_text = "\n".join(rest).lstrip("\n")
+                _set_setting("assortment_blend", hermit + "\n" + rest_text)
+        _set_setting("hermit_to_top_v1", "1")
+        logger.info("[ASSORTMENT-RESTORE] Бленд Hermit піднято нагору списку блендів.")
+
     conn.close()
 
 
