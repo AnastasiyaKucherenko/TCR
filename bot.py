@@ -6,6 +6,7 @@ Telegram-бот для ростерії: збір клієнтів через /s
 Автор: згенеровано Claude для конкретного кейсу ростерії.
 """
 
+import asyncio
 import logging
 import os
 import html
@@ -17,9 +18,11 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -55,6 +58,9 @@ logger = logging.getLogger(__name__)
 # Тимчасовий стан для інтерактивного вибору отримувачів команди /sendto
 # (тримається в пам'яті, скидається при перезапуску бота — це нормально для цього сценарію)
 SENDTO_SELECTIONS: dict[int, set[int]] = {}
+
+# Результат останньої перевірки «хто видалив бота»: admin_chat_id -> [chat_id, ...] (для підтвердження)
+INACTIVE_SCAN: dict[int, list] = {}
 SENDTO_AWAITING_TEXT: dict[int, list[int]] = {}
 
 # Стан для кроків меню з кнопками (наприклад, очікування тексту після вибору дії)
@@ -1970,6 +1976,7 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧾 Прайс клієнта (як він його бачить)", callback_data="menu_clientpriceview")],
         [InlineKeyboardButton("📋 Список клієнтів і відповідальних", callback_data="menu_resplist")],
         [InlineKeyboardButton("👤 Переглянути клієнтів", callback_data="menu_viewclients")],
+        [InlineKeyboardButton("🧹 Прибрати тих, хто видалив бота", callback_data="menu_inactivescan")],
         [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
     ])
 
@@ -2385,6 +2392,24 @@ def _get_last_order_items(chat_id: int) -> list:
         return json.loads(row["items_json"])
     except (json.JSONDecodeError, TypeError):
         return []
+
+
+def _refresh_order_prices(items: list, chat_id: int) -> list:
+    """Оновлює ціни позицій замовлення на АКТУАЛЬНІ для цього клієнта (індивідуальна ціна,
+    тариф, поточний прайс). Потрібно, бо позиції з «Повторити попереднє» несуть ціни з минулого
+    замовлення - вони могли застаріти або взагалі не зберегтись.
+    Повертає список позицій, для яких ціни зараз немає взагалі."""
+    missing = []
+    for it in items:
+        cat, name, unit = it.get("category"), it.get("item_text"), it.get("weight")
+        if not (cat and name and unit):
+            continue
+        price = _get_item_price(cat, name, unit, chat_id)
+        if price is not None:
+            it["price"] = price
+        else:
+            missing.append(it)
+    return missing
 
 
 def _is_valid_phone(text: str) -> bool:
@@ -3828,6 +3853,7 @@ async def _order_go_to_confirm_or_invoice(send_func, context, chat_id: int, orde
         return
     order["awaiting_confirm"] = True
     schedule_order_confirm_reminder(context.application, chat_id)
+    _refresh_order_prices(order.get("items", []), target_chat_id)
     profile = _get_client_profile(target_chat_id) or {}
     summary = _order_client_summary_text(order, profile)
     buttons = InlineKeyboardMarkup([
@@ -4002,11 +4028,28 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "order_repeat":
         last_items = _get_last_order_items(target_chat_id)
-        order = ORDER_PENDING[chat_id] = {"step": "review", "items": last_items, "review_idx": 0, "on_behalf_of": order.get("on_behalf_of") if order else None}
-        if not order.get("on_behalf_of"):
-            order.pop("on_behalf_of", None)
+        # Перераховуємо ціни за актуальними даними клієнта; позиції, яких уже нема в прайсі
+        # (напр. закінчились), у повтор не додаємо - і чесно про це повідомляємо.
+        missing = _refresh_order_prices(last_items, target_chat_id)
+        missing_ids = {id(m) for m in missing}
+        available = [it for it in last_items if id(it) not in missing_ids]
+        note = ""
+        if missing:
+            names = ", ".join(f"{m.get('item_text', '—')} ({m.get('weight', '—')})" for m in missing)
+            note = f"⚠️ Ці позиції з попереднього замовлення зараз недоступні, їх не додано: {names}\n\n"
+        prev_on_behalf = order.get("on_behalf_of") if order else None
+        if not available:
+            new_order = {"step": "date", "items": []}
+            if prev_on_behalf:
+                new_order["on_behalf_of"] = prev_on_behalf
+            ORDER_PENDING[chat_id] = new_order
+            await query.edit_message_text(note + "На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+            return
+        order = ORDER_PENDING[chat_id] = {"step": "review", "items": available, "review_idx": 0}
+        if prev_on_behalf:
+            order["on_behalf_of"] = prev_on_behalf
         text, kb = _order_review_step_screen(order)
-        await query.edit_message_text(text, reply_markup=kb)
+        await query.edit_message_text(note + text, reply_markup=kb)
         return
 
     if not order:
@@ -4332,6 +4375,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Це замовлення вже неактуальне.")
             return
         cancel_order_confirm_reminder(context.application, chat_id)
+        _refresh_order_prices(order.get("items", []), target_chat_id)
         order_id = _save_completed_order(target_chat_id, order)
         profile = _get_client_profile(target_chat_id) or {}
         summary = _order_summary_text(order, profile)
@@ -4602,6 +4646,58 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_clients":
         await query.edit_message_text("👥 Клієнти:", reply_markup=_menu_clients_keyboard())
+        return
+
+    if data == "menu_inactivescan":
+        await query.edit_message_text("🔎 Перевіряю, хто з клієнтів видалив або заблокував бота (кілька секунд)...")
+        candidates, unchecked = await _scan_inactive_clients(context)
+        INACTIVE_SCAN[admin_id] = [c_["chat_id"] for c_ in candidates]
+        extra = f"\n\n(Не вдалось перевірити через збій мережі: {unchecked} — спробуйте пізніше.)" if unchecked else ""
+        if not candidates:
+            await query.edit_message_text(
+                "✅ Таких немає — усім клієнтам бот може писати." + extra, reply_markup=_menu_clients_keyboard()
+            )
+            return
+        lines = [f"Знайдено клієнтів, яким бот більше не може писати: {len(candidates)}\n"]
+        for c_ in candidates[:40]:
+            uname = f"@{c_['username']}" if c_["username"] else "без @"
+            lines.append(f"• {c_['name'] or '—'} ({uname}) — {c_['reason']}")
+        if len(candidates) > 40:
+            lines.append(f"…і ще {len(candidates) - 40}")
+        lines.append(
+            "\nПрибрати їх зі списку клієнтів? Їхні замовлення й картки в історії залишаться; "
+            "якщо людина пізніше знову напише боту /start — вона повернеться в список." + extra
+        )
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"✅ Так, прибрати ({len(candidates)})", callback_data="menu_inactiveconfirm")],
+                [InlineKeyboardButton("❌ Не прибирати", callback_data="menu_clients")],
+            ]),
+        )
+        return
+
+    if data == "menu_inactiveconfirm":
+        ids = INACTIVE_SCAN.pop(admin_id, None)
+        if not ids:
+            await query.edit_message_text(
+                "Список застарів. Натисніть «🧹 Прибрати тих, хто видалив бота» ще раз.",
+                reply_markup=_menu_clients_keyboard(),
+            )
+            return
+        ids = [i for i in ids if i > 0 and i not in ADMIN_IDS]
+        removed = 0
+        if ids:
+            conn = db()
+            cur = conn.execute(
+                f"DELETE FROM subscribers WHERE chat_id IN ({','.join('?' * len(ids))})", ids
+            )
+            removed = cur.rowcount
+            conn.commit()
+            conn.close()
+        await query.edit_message_text(
+            f"✅ Прибрано зі списку клієнтів: {removed}.", reply_markup=_menu_clients_keyboard()
+        )
         return
 
     if data == "menu_broadcast":
@@ -7532,6 +7628,23 @@ def _seed_item_prices_if_empty():
         _set_setting("hermit_to_top_v1", "1")
         logger.info("[ASSORTMENT-RESTORE] Бленд Hermit піднято нагору списку блендів.")
 
+    # Позиції Палай, які закінчились: прибираємо з прайсу (усі ваги й тарифи) і з тексту
+    # асортименту. Дріп цих лотів і індивідуальні ціни клієнтів НЕ чіпаємо.
+    if _get_setting("remove_sold_out_palay_v1", "") != "1":
+        sold_out_keys = ["GAKUYUINI", "MUYINGA", "Decaf Cane Sugar", "Gayo"]
+        for key in sold_out_keys:
+            conn.execute("DELETE FROM item_prices WHERE category='palay' AND item_name LIKE ?", (f"%{key}%",))
+        conn.commit()
+        current_palay = _get_setting("assortment_palay", "")
+        if current_palay:
+            kept = [
+                ln for ln in current_palay.split("\n")
+                if not any(k.lower() in ln.lower() for k in sold_out_keys)
+            ]
+            _set_setting("assortment_palay", "\n".join(kept))
+        _set_setting("remove_sold_out_palay_v1", "1")
+        logger.info("[PRICE-REMOVE] Прибрано з прайсу й асортименту Палай: Кенія 22, Бурунді 20, Колумбія 27, Індонезія 24.")
+
     conn.close()
 
 
@@ -7539,6 +7652,56 @@ async def load_all_on_startup(application: Application):
     _seed_item_prices_if_empty()
     await load_schedules_on_startup(application)
     await load_broadcasts_on_startup(application)
+
+
+async def _scan_inactive_clients(context: ContextTypes.DEFAULT_TYPE):
+    """Знаходить клієнтів, яким бот більше не може писати: вимкнули бота (/stop), заблокували
+    його або видалили акаунт. Перевірка йде через невидиму дію «друкує…» - клієнти не отримують
+    жодних повідомлень. Групи й адміни не перевіряються і ніколи не потрапляють у список.
+    Повертає (кандидати, скільки_не_вдалось_перевірити)."""
+    conn = db()
+    rows = conn.execute("SELECT chat_id, name, username, active FROM subscribers WHERE chat_id > 0").fetchall()
+    conn.close()
+    candidates, unchecked = [], 0
+    for r in rows:
+        cid = r["chat_id"]
+        if cid in ADMIN_IDS:
+            continue
+        entry = {"chat_id": cid, "name": r["name"], "username": r["username"]}
+        if not r["active"]:
+            entry["reason"] = "сам вимкнув бота (/stop)"
+            candidates.append(entry)
+            continue
+        try:
+            await context.bot.send_chat_action(cid, "typing")
+        except Forbidden:
+            entry["reason"] = "заблокував бота або видалив акаунт"
+            candidates.append(entry)
+        except BadRequest as e:
+            if "chat not found" in str(e).lower():
+                entry["reason"] = "чат з ботом не знайдено"
+                candidates.append(entry)
+            else:
+                unchecked += 1
+        except Exception:
+            unchecked += 1
+        await asyncio.sleep(0.05)
+    return candidates, unchecked
+
+
+async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Коли клієнт блокує бота - одразу позначаємо його неактивним, щоб він не потрапляв у
+    розсилки (і не давав «помилок») і не плутав у списках. Коли розблокує й натисне /start -
+    /start сам знову активує його."""
+    cmu = update.my_chat_member
+    if not cmu or cmu.chat.type != "private":
+        return
+    if cmu.new_chat_member.status == "kicked":
+        conn = db()
+        conn.execute("UPDATE subscribers SET active=0 WHERE chat_id=?", (cmu.chat.id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"[BLOCKED] Клієнт {cmu.chat.id} заблокував бота - позначено неактивним.")
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -7599,6 +7762,7 @@ def main():
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("addshopgroup", addshopgroup_command))
+    application.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, shop_group_new_members))
     application.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handle_chat_migration))
     application.add_handler(CommandHandler("help", help_command))
