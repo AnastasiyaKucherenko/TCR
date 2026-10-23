@@ -2044,6 +2044,7 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧾 Кому показувати вибір накладної", callback_data="menu_invoice")],
         [InlineKeyboardButton("🚚 Кому завжди додавати доставку 190 грн", callback_data="menu_alwaysdelivery")],
         [InlineKeyboardButton("🏢 ФОП клієнта (на який платить)", callback_data="menu_fopclient")],
+        [InlineKeyboardButton("🧾 Рахунки (архів)", callback_data="menu_invoices")],
         [InlineKeyboardButton("🎯 Кому давати індивідуальні ціни", callback_data="menu_individualtoggle")],
         [InlineKeyboardButton("💰 Задати індивідуальну ціну клієнту", callback_data="menu_individualprices")],
         [InlineKeyboardButton("🏷 Ціновий рівень клієнта (20/50/100кг)", callback_data="menu_pricetierclient")],
@@ -2289,16 +2290,20 @@ async def client_delivery_back_callback(update: Update, context: ContextTypes.DE
     )
 
 
-async def client_show_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _group_guard_ok(update, context):
-        return
-    buttons = [
+def _client_details_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(CLIENT_BTN_ASSORTMENT, callback_data="clientdetails_assortment")],
         [InlineKeyboardButton(CLIENT_BTN_DELIVERY, callback_data="clientdetails_delivery")],
         [InlineKeyboardButton(CLIENT_BTN_INSTRUCTIONS, callback_data="clientdetails_instructions")],
         [InlineKeyboardButton(CLIENT_BTN_PROFILE, callback_data="clientdetails_profile")],
-    ]
-    await update.message.reply_text("📋 Оберіть, що вас цікавить:", reply_markup=InlineKeyboardMarkup(buttons))
+        [InlineKeyboardButton("🧾 Мої рахунки", callback_data="clientdetails_invoices")],
+    ])
+
+
+async def client_show_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _group_guard_ok(update, context):
+        return
+    await update.message.reply_text("📋 Оберіть, що вас цікавить:", reply_markup=_client_details_keyboard())
 
 
 async def clientdetails_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2308,6 +2313,36 @@ async def clientdetails_router(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     data = query.data
     chat_id = update.effective_chat.id
+
+    if data == "clientdetails_menu":
+        await query.edit_message_text("📋 Оберіть, що вас цікавить:", reply_markup=_client_details_keyboard())
+        return
+
+    if data == "clientdetails_invoices" or data.startswith("clientdetails_invoices:"):
+        offset = int(data.split(":", 1)[1]) if ":" in data else 0
+        text, kb = _client_invoices_screen(chat_id, offset)
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if data.startswith("clientdetails_invview:"):
+        _, inv_id_str, offset_str = data.split(":")
+        conn = db()
+        # клієнт бачить ТІЛЬКИ свої надіслані рахунки (перевірка за chat_id)
+        inv = conn.execute(
+            "SELECT text FROM invoices WHERE id=? AND client_chat_id=? AND status='sent'", (int(inv_id_str), chat_id)
+        ).fetchone()
+        conn.close()
+        if not inv:
+            await query.edit_message_text(
+                "Рахунок не знайдено.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До списку", callback_data="clientdetails_invoices:0")]]),
+            )
+            return
+        await query.edit_message_text(
+            inv["text"], parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До списку", callback_data=f"clientdetails_invoices:{int(offset_str)}")]]),
+        )
+        return
 
     if data == "clientdetails_assortment":
         await query.edit_message_text(
@@ -5434,6 +5469,77 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "menu_invoices":
+        await query.edit_message_text(
+            "🧾 Архів рахунків:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🕘 Останні рахунки", callback_data="menu_invlist:0")],
+                [InlineKeyboardButton("👤 Рахунки клієнта", callback_data="menu_invclients")],
+                [InlineKeyboardButton("🔙 До меню", callback_data="menu_clients")],
+            ]),
+        )
+        return
+
+    if data.startswith("menu_invlist:"):
+        text, kb = _admin_invoices_screen(int(data.split(":", 1)[1]))
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if data == "menu_invclients":
+        conn = db()
+        rows = conn.execute(
+            "SELECT client_chat_id, COUNT(*) n, MAX(id) last FROM invoices WHERE status!='cancelled' "
+            "GROUP BY client_chat_id ORDER BY last DESC LIMIT 60"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text(
+                "Рахунків поки немає.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="menu_invoices")]])
+            )
+            return
+        buttons = [
+            [InlineKeyboardButton(
+                f"{_invoice_client_label(r['client_chat_id'])[:40]} ({r['n']})",
+                callback_data=f"menu_invbyclient:{r['client_chat_id']}:0",
+            )]
+            for r in rows
+        ]
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_invoices")])
+        await query.edit_message_text("Чиї рахунки показати?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("menu_invbyclient:"):
+        _, cid_str, off_str = data.split(":", 2)
+        text, kb = _admin_invoices_screen(int(off_str), int(cid_str))
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if data.startswith("menu_invview:"):
+        _, inv_id_str, off_str, cid_str = data.split(":")
+        conn = db()
+        inv = conn.execute("SELECT * FROM invoices WHERE id=?", (int(inv_id_str),)).fetchone()
+        conn.close()
+        back_cb = f"menu_invlist:{int(off_str)}" if int(cid_str) == 0 else f"menu_invbyclient:{int(cid_str)}:{int(off_str)}"
+        if not inv:
+            await query.edit_message_text(
+                "Рахунок не знайдено.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=back_cb)]])
+            )
+            return
+        if inv["status"] == "sent":
+            status = f"✅ надіслано клієнту {_fmt_iso(inv['sent_at'], True)}"
+            action = [InlineKeyboardButton("📤 Надіслати клієнту ще раз", callback_data=f"inv_resend:{inv['id']}")]
+        elif inv["status"] == "draft":
+            status = "📝 чернетка (клієнту ще не надіслано)"
+            action = [InlineKeyboardButton("✅ Надіслати клієнту", callback_data=f"inv_send:{inv['id']}")]
+        else:
+            status = "❌ скасовано"
+            action = None
+        buttons = ([action] if action else []) + [[InlineKeyboardButton("🔙 Назад", callback_data=back_cb)]]
+        await query.edit_message_text(
+            inv["text"] + f"\n\n<i>Статус: {status}</i>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
     if data == "menu_alwaysdelivery":
         await query.edit_message_text(
             "Оберіть клієнтів, яким до КОЖНОГО замовлення додавати доставку 190 грн "
@@ -8444,6 +8550,21 @@ async def invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _invoice_make_draft(context, admin_id, st, number)
         return
 
+    if data.startswith("inv_resend:"):
+        conn = db()
+        inv = conn.execute("SELECT * FROM invoices WHERE id=?", (int(data.split(":", 1)[1]),)).fetchone()
+        conn.close()
+        if not inv or inv["status"] != "sent":
+            await context.bot.send_message(admin_id, "Цей рахунок ще не надсилався або не знайдений.")
+            return
+        try:
+            await context.bot.send_message(inv["client_chat_id"], inv["text"] + _invoice_hint(), parse_mode="HTML")
+        except Exception as e:
+            await context.bot.send_message(admin_id, f"❌ Не вдалось надіслати рахунок клієнту: {e}")
+            return
+        await context.bot.send_message(admin_id, f"✅ Рахунок № {inv['number']} повторно надіслано клієнту.")
+        return
+
     if data.startswith(("inv_send:", "inv_renum:", "inv_cancel:")):
         action, inv_id_str = data.split(":", 1)
         conn = db()
@@ -8480,7 +8601,7 @@ async def invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # inv_send
         try:
-            sent = await context.bot.send_message(inv["client_chat_id"], inv["text"], parse_mode="HTML")
+            sent = await context.bot.send_message(inv["client_chat_id"], inv["text"] + _invoice_hint(), parse_mode="HTML")
         except Exception as e:
             logger.warning(f"Не вдалось надіслати рахунок клієнту {inv['client_chat_id']}: {e}")
             await context.bot.send_message(
@@ -8551,6 +8672,111 @@ async def handle_fop_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ ФОП «{data['name']}» збережено.{extra}",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏢 До реквізитів ФОП", callback_data="menu_fops")]]),
     )
+
+
+# ---- Архів рахунків: для клієнта («Деталі → Мої рахунки») і для адміна (меню «Клієнти») ----
+INVOICES_PAGE_SIZE = 8
+
+
+def _fmt_iso(iso, with_time: bool = False) -> str:
+    try:
+        d = datetime.fromisoformat(iso)
+        return d.strftime("%d.%m.%Y %H:%M" if with_time else "%d.%m.%Y")
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _invoice_client_label(chat_id) -> str:
+    p = _get_client_profile(chat_id) or {}
+    label = p.get("point_name") or p.get("full_name")
+    if label:
+        return label
+    conn = db()
+    row = conn.execute("SELECT name FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    return row["name"] if row and row["name"] else str(chat_id)
+
+
+def _invoice_hint() -> str:
+    """Підказка, що додається до рахунку при надсиланні клієнту (в збережений текст не входить)."""
+    return "\n\n<i>Усі ваші рахунки можна знайти тут: 📋 Деталі → 🧾 Мої рахунки</i>"
+
+
+def _invoice_nav_row(offset: int, more: bool, make_cb) -> list:
+    row = []
+    if offset > 0:
+        row.append(InlineKeyboardButton("⬅️ Новіші", callback_data=make_cb(max(0, offset - INVOICES_PAGE_SIZE))))
+    if more:
+        row.append(InlineKeyboardButton("Старіші ➡️", callback_data=make_cb(offset + INVOICES_PAGE_SIZE)))
+    return row
+
+
+def _client_invoices_screen(chat_id: int, offset: int):
+    """Список рахунків, які бот надіслав цьому клієнту (тільки надіслані; нові зверху)."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, number, total, sent_at FROM invoices WHERE client_chat_id=? AND status='sent' "
+        "ORDER BY id DESC LIMIT ? OFFSET ?",
+        (chat_id, INVOICES_PAGE_SIZE + 1, offset),
+    ).fetchall()
+    conn.close()
+    more = len(rows) > INVOICES_PAGE_SIZE
+    rows = rows[:INVOICES_PAGE_SIZE]
+    back = [InlineKeyboardButton("🔙 Назад", callback_data="clientdetails_menu")]
+    if not rows:
+        return "Рахунків поки немає.", InlineKeyboardMarkup([back])
+    buttons = [
+        [InlineKeyboardButton(
+            f"№ {r['number']} · {_fmt_iso(r['sent_at'])} · {_money(r['total'])} грн",
+            callback_data=f"clientdetails_invview:{r['id']}:{offset}",
+        )]
+        for r in rows
+    ]
+    nav = _invoice_nav_row(offset, more, lambda o: f"clientdetails_invoices:{o}")
+    if nav:
+        buttons.append(nav)
+    buttons.append(back)
+    return "🧾 Ваші рахунки (нові зверху). Натисніть, щоб відкрити:", InlineKeyboardMarkup(buttons)
+
+
+def _admin_invoices_screen(offset: int, client_chat_id=None):
+    """Список рахунків для адміна: усі (крім скасованих) або одного клієнта."""
+    conn = db()
+    if client_chat_id:
+        rows = conn.execute(
+            "SELECT id, number, total, status, client_chat_id FROM invoices "
+            "WHERE status!='cancelled' AND client_chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (client_chat_id, INVOICES_PAGE_SIZE + 1, offset),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, number, total, status, client_chat_id FROM invoices "
+            "WHERE status!='cancelled' ORDER BY id DESC LIMIT ? OFFSET ?",
+            (INVOICES_PAGE_SIZE + 1, offset),
+        ).fetchall()
+    conn.close()
+    more = len(rows) > INVOICES_PAGE_SIZE
+    rows = rows[:INVOICES_PAGE_SIZE]
+    cid_part = client_chat_id or 0
+    back_cb = "menu_invclients" if client_chat_id else "menu_invoices"
+    back = [InlineKeyboardButton("🔙 Назад", callback_data=back_cb)]
+    if not rows:
+        return "Рахунків поки немає.", InlineKeyboardMarkup([back])
+    buttons = []
+    for r in rows:
+        mark = "✅" if r["status"] == "sent" else "📝"
+        label = f"{mark} № {r['number']} · {_invoice_client_label(r['client_chat_id'])[:24]} · {_money(r['total'])}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"menu_invview:{r['id']}:{offset}:{cid_part}")])
+    if client_chat_id:
+        make_cb = lambda o: f"menu_invbyclient:{client_chat_id}:{o}"
+    else:
+        make_cb = lambda o: f"menu_invlist:{o}"
+    nav = _invoice_nav_row(offset, more, make_cb)
+    if nav:
+        buttons.append(nav)
+    buttons.append(back)
+    title = "🧾 Рахунки клієнта (нові зверху):" if client_chat_id else "🧾 Останні рахунки (нові зверху). ✅ надіслано, 📝 чернетка:"
+    return title, InlineKeyboardMarkup(buttons)
 
 
 async def _scan_inactive_clients(context: ContextTypes.DEFAULT_TYPE):
