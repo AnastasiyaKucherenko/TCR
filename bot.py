@@ -232,6 +232,9 @@ def init_db():
             sent_at TEXT
         )
     """)
+    _inv_cols = [r["name"] for r in conn.execute("PRAGMA table_info(invoices)").fetchall()]
+    if "cash" not in _inv_cols:
+        conn.execute("ALTER TABLE invoices ADD COLUMN cash INTEGER DEFAULT 0")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS order_messages (
             group_chat_id INTEGER NOT NULL,
@@ -8213,14 +8216,32 @@ def _freeform_fop_fields(text: str) -> dict:
                 out["name"] = _clean_name(line)
                 break
     # банк (може бути розбитий на кілька рядків) і МФО
-    mb = re.search(r"Банк\s*:?\s*(.+?)(?=\s*,?\s*МФО|\n\s*(?:ІПН|код|IBAN|Р/р|Назва|Примітка)|\Z)", text, re.I | re.S)
+    mb = re.search(r"(?<![\w])Банк\s*:\s*(.+?)(?=\s*,?\s*МФО|\n\s*(?:ІПН|код|IBAN|Р/р|Назва|Примітка)|\Z)", text, re.I | re.S)
     mfo = re.search(r"МФО\s*:?\s*(\d{6})", text, re.I)
-    if mb:
-        bank = _normalize_bank(mb.group(1))
-        if bank:
-            if mfo and mfo.group(1) not in bank:
-                bank += f", МФО {mfo.group(1)}"
-            out["bank"] = bank
+    bank = _normalize_bank(mb.group(1)) if mb else ""
+    if not re.search(r"[A-Za-zА-Яа-яІіЇїЄєҐґ]{2,}", bank):
+        bank = ""
+    if not bank:
+        # слова «Банк:» нема - шукаємо рядок, схожий на назву банку (АТ КБ «ПРИВАТБАНК», ПАТ…, …БАНК…)
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or re.search(r"(?i)(?<![\w])(ФОП|ФО-П|ТОВ|ПП)(?![\w])", line):
+                continue
+            cand = re.sub(r"[UuУу][AaАа][ \t]*\d{2}(?:[ \t]*\d){25}", " ", line)
+            cand = re.sub(r"(?i)(?<![\w])(Р/р|IBAN|рахунок)(?![\w])\s*:?", " ", cand)
+            cand = re.split(r"(?i),?\s*МФО", cand)[0]
+            cand = re.sub(r"(?i)^\W*(в|у)\s+", "", cand)
+            cand = re.sub(r"(?i)^\W*Банк(?![\w])\s*:?\s+(?=\S)", "", cand)
+            cand = _normalize_bank(cand)
+            if not cand or cand.endswith(":") or re.search(r"(?i)реквізит|платник|пдв", cand):
+                continue
+            if re.search(r"(?i)банк", cand) or re.match(r"(?i)\s*(ПрАТ|ПАТ|АКБ|АТ|КБ|АБ)(?![\w])", cand):
+                bank = cand
+                break
+    if bank:
+        if mfo and mfo.group(1) not in bank:
+            bank += f", МФО {mfo.group(1)}"
+        out["bank"] = bank
     # примітка про податки
     for raw in text.splitlines():
         line = raw.strip(_QUOTE_CHARS + " \t")
@@ -8377,8 +8398,14 @@ def _invoice_payer_lines(profile: dict) -> list:
     return lines
 
 
-def _build_invoice(order_row, fop: dict, number: str, issue_date: str, profile: dict, client_chat_id):
-    """Складає текст рахунку (HTML) із підтвердженого замовлення. Повертає (текст, сума, попередження)."""
+def _is_cash_payment(method) -> bool:
+    """Чи це готівкова оплата («Готівка»; «Безготівковий» - ні)."""
+    return (method or "").strip().lower().startswith("готівк")
+
+
+def _build_invoice(order_row, fop: dict, number: str, issue_date: str, profile: dict, client_chat_id, cash: bool = False):
+    """Складає текст рахунку (HTML) із підтвердженого замовлення. Повертає (текст, сума, попередження).
+    Для готівкового рахунку замість реквізитів ФОП друкується просто слово «Готівка»."""
     try:
         items = json.loads(order_row["items_json"] or "[]")
     except (json.JSONDecodeError, TypeError):
@@ -8404,23 +8431,29 @@ def _build_invoice(order_row, fop: dict, number: str, issue_date: str, profile: 
     fee = _order_delivery_fee({"items": items, "client_chat_id": client_chat_id}, profile)
     total = round(items_total + fee, 2)
 
-    purpose = f"Оплата за товар згідно рахунку № {number} від {issue_date}"
-    if fop.get("note"):
-        purpose += f". {fop['note']}"
-    out = [
-        f"🧾 <b>Рахунок на оплату № {_esc(number)}</b> від {issue_date}",
-        "",
-        "<b>Отримувач:</b>",
-        _esc(fop["name"]),
-        f"ІПН/ЄДРПОУ: {_esc(fop['tax_id'])}",
-        f"IBAN: <code>{_esc(fop['iban'])}</code>",
-    ]
-    if fop.get("bank"):
-        out.append(f"Банк: {_esc(fop['bank'])}")
+    header = f"🧾 <b>Рахунок на оплату № {_esc(number)}</b> від {issue_date}"
+    if cash:
+        out = [header, "", "<b>Готівка</b>"]
+    else:
+        purpose = f"Оплата за товар згідно рахунку № {number} від {issue_date}"
+        if fop.get("note"):
+            purpose += f". {fop['note']}"
+        out = [
+            header,
+            "",
+            "<b>Отримувач:</b>",
+            _esc(fop["name"]),
+            f"ІПН/ЄДРПОУ: {_esc(fop['tax_id'])}",
+            f"IBAN: <code>{_esc(fop['iban'])}</code>",
+        ]
+        if fop.get("bank"):
+            out.append(f"Банк: {_esc(fop['bank'])}")
     out += [""] + _invoice_payer_lines(profile) + ["", "<b>Позиції:</b>"] + lines
     if fee:
         out.append(f"Доставка — {_money(fee)} грн")
-    out += ["", f"<b>Разом до сплати: {_money(total)} грн</b>", "", f"<b>Призначення платежу:</b> {_esc(purpose)}"]
+    out += ["", f"<b>Разом до сплати: {_money(total)} грн</b>"]
+    if not cash:
+        out += ["", f"<b>Призначення платежу:</b> {_esc(purpose)}"]
     return "\n".join(out), total, warnings
 
 
@@ -8528,6 +8561,23 @@ async def grouporder_invoice_callback(update: Update, context: ContextTypes.DEFA
     await query.answer("Продовжіть у приватних повідомленнях з ботом 👇")
 
 
+def _invoice_preview(inv_id: int, text: str, warnings: list, cash: bool):
+    """Текст і кнопки екрана «Перевірте рахунок перед відправкою»."""
+    warn = ("\n\n⚠️ " + "\n⚠️ ".join(_esc(w) for w in warnings)) if warnings else ""
+    body = (
+        "👀 Перевірте рахунок перед відправкою клієнту:\n\n" + text + warn +
+        "\n\n<i>Рахунок складено за замовленням, яке підтвердив клієнт; правки тексту замовлення "
+        "в групі сюди не потрапляють.</i>"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Надіслати клієнту", callback_data=f"inv_send:{inv_id}")],
+        [InlineKeyboardButton("🏦 Зробити безготівковим" if cash else "💵 Зробити готівковим", callback_data=f"inv_cash:{inv_id}")],
+        [InlineKeyboardButton("✏️ Змінити номер", callback_data=f"inv_renum:{inv_id}")],
+        [InlineKeyboardButton("❌ Скасувати рахунок", callback_data=f"inv_cancel:{inv_id}")],
+    ])
+    return body, kb
+
+
 async def _invoice_make_draft(context, admin_id: int, st: dict, number: str):
     conn = db()
     order_row = conn.execute("SELECT * FROM orders WHERE id=?", (st["order_id"],)).fetchone()
@@ -8535,38 +8585,29 @@ async def _invoice_make_draft(context, admin_id: int, st: dict, number: str):
     fop = _get_fop(st["fop_id"])
     profile = _get_client_profile(st["client_chat_id"]) or {}
     issue_date = datetime.now(TZ).strftime("%d.%m.%Y")
-    text, total, warnings = _build_invoice(order_row, fop, number, issue_date, profile, st["client_chat_id"])
+    # готівка визначається способом оплати в замовленні; при зміні номера лишається те, що було
+    cash = bool(st.get("cash")) if st.get("invoice_id") else _is_cash_payment(order_row["payment_method"])
+    text, total, warnings = _build_invoice(order_row, fop, number, issue_date, profile, st["client_chat_id"], cash=cash)
     conn = db()
     if st.get("invoice_id"):
         conn.execute(
-            "UPDATE invoices SET number=?, text=?, total=?, fop_id=?, status='draft' WHERE id=? AND status!='sent'",
-            (number, text, total, st["fop_id"], st["invoice_id"]),
+            "UPDATE invoices SET number=?, text=?, total=?, fop_id=?, cash=?, status='draft' WHERE id=? AND status!='sent'",
+            (number, text, total, st["fop_id"], int(cash), st["invoice_id"]),
         )
         inv_id = st["invoice_id"]
     else:
         cur = conn.execute(
             "INSERT INTO invoices (order_id, client_chat_id, fop_id, number, text, total, status, "
-            "group_chat_id, group_message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)",
+            "group_chat_id, group_message_id, created_at, cash) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
             (st["order_id"], st["client_chat_id"], st["fop_id"], number, text, total,
-             st["group_chat_id"], st["group_message_id"], datetime.now(TZ).isoformat()),
+             st["group_chat_id"], st["group_message_id"], datetime.now(TZ).isoformat(), int(cash)),
         )
         inv_id = cur.lastrowid
     conn.commit()
     conn.close()
     INVOICE_PENDING.pop(admin_id, None)
-    warn = ("\n\n⚠️ " + "\n⚠️ ".join(_esc(w) for w in warnings)) if warnings else ""
-    await context.bot.send_message(
-        admin_id,
-        "👀 Перевірте рахунок перед відправкою клієнту:\n\n" + text + warn +
-        "\n\n<i>Рахунок складено за замовленням, яке підтвердив клієнт; правки тексту замовлення "
-        "в групі сюди не потрапляють.</i>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Надіслати клієнту", callback_data=f"inv_send:{inv_id}")],
-            [InlineKeyboardButton("✏️ Змінити номер", callback_data=f"inv_renum:{inv_id}")],
-            [InlineKeyboardButton("❌ Скасувати рахунок", callback_data=f"inv_cancel:{inv_id}")],
-        ]),
-    )
+    body, kb = _invoice_preview(inv_id, text, warnings, cash)
+    await context.bot.send_message(admin_id, body, parse_mode="HTML", reply_markup=kb)
 
 
 async def handle_invoice_number_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8660,7 +8701,7 @@ async def invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(admin_id, f"✅ Рахунок № {inv['number']} повторно надіслано клієнту.")
         return
 
-    if data.startswith(("inv_send:", "inv_renum:", "inv_cancel:")):
+    if data.startswith(("inv_send:", "inv_renum:", "inv_cancel:", "inv_cash:")):
         action, inv_id_str = data.split(":", 1)
         conn = db()
         inv = conn.execute("SELECT * FROM invoices WHERE id=?", (int(inv_id_str),)).fetchone()
@@ -8683,11 +8724,32 @@ async def invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"Рахунок № {inv['number']} скасовано, клієнту нічого не надіслано.")
             return
 
+        if action == "inv_cash":
+            conn = db()
+            order_row = conn.execute("SELECT * FROM orders WHERE id=?", (inv["order_id"],)).fetchone()
+            conn.close()
+            fop = _get_fop(inv["fop_id"])
+            if not order_row or not fop:
+                await query.edit_message_text("Не вдалось перерахувати рахунок: замовлення або ФОП більше не існує.")
+                return
+            new_cash = not bool(inv["cash"])
+            profile = _get_client_profile(inv["client_chat_id"]) or {}
+            text, total, warnings = _build_invoice(
+                order_row, fop, inv["number"], _fmt_iso(inv["created_at"]), profile, inv["client_chat_id"], cash=new_cash
+            )
+            conn = db()
+            conn.execute("UPDATE invoices SET cash=?, text=?, total=? WHERE id=?", (int(new_cash), text, total, inv["id"]))
+            conn.commit()
+            conn.close()
+            body, kb = _invoice_preview(inv["id"], text, warnings, new_cash)
+            await query.edit_message_text(body, parse_mode="HTML", reply_markup=kb)
+            return
+
         if action == "inv_renum":
             st = {
                 "invoice_id": inv["id"], "order_id": inv["order_id"], "client_chat_id": inv["client_chat_id"],
                 "group_chat_id": inv["group_chat_id"], "group_message_id": inv["group_message_id"],
-                "fop_id": inv["fop_id"], "stage": "number",
+                "fop_id": inv["fop_id"], "stage": "number", "cash": inv["cash"],
             }
             INVOICE_PENDING[admin_id] = st
             await query.edit_message_reply_markup(reply_markup=None)
