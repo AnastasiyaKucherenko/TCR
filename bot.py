@@ -196,6 +196,8 @@ def init_db():
         conn.execute("ALTER TABLE subscribers ADD COLUMN needs_packaging INTEGER DEFAULT 0")
     if "needs_invoice_choice" not in existing_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN needs_invoice_choice INTEGER DEFAULT 0")
+    if "always_delivery" not in existing_cols:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN always_delivery INTEGER DEFAULT 0")
     bc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
     if "is_question" not in bc_cols:
         conn.execute("ALTER TABLE broadcasts ADD COLUMN is_question INTEGER DEFAULT 0")
@@ -1356,6 +1358,22 @@ def _packaging_toggle_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def _alwaysdelivery_toggle_keyboard() -> InlineKeyboardMarkup:
+    conn = db()
+    rows = conn.execute(
+        "SELECT chat_id, name, username, always_delivery FROM subscribers WHERE active=1 AND chat_id > 0 "
+        "ORDER BY always_delivery DESC, name COLLATE NOCASE LIMIT 90"
+    ).fetchall()
+    conn.close()
+    buttons = []
+    for r in rows:
+        mark = "✅" if r["always_delivery"] else "⬜"
+        label = f"{mark} {_client_display_label(r['chat_id'], r['name'], r['username'])}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"menu_alwaysdeliverytoggle:{r['chat_id']}")])
+    buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def _client_needs_packaging(chat_id: int) -> bool:
     conn = db()
     row = conn.execute("SELECT needs_packaging FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
@@ -1970,6 +1988,7 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🪪 Редагувати картку клієнта", callback_data="menu_editclientprofile")],
         [InlineKeyboardButton("📦 Кому показувати вибір пакування", callback_data="menu_packaging")],
         [InlineKeyboardButton("🧾 Кому показувати вибір накладної", callback_data="menu_invoice")],
+        [InlineKeyboardButton("🚚 Кому завжди додавати доставку 190 грн", callback_data="menu_alwaysdelivery")],
         [InlineKeyboardButton("🎯 Кому давати індивідуальні ціни", callback_data="menu_individualtoggle")],
         [InlineKeyboardButton("💰 Задати індивідуальну ціну клієнту", callback_data="menu_individualprices")],
         [InlineKeyboardButton("🏷 Ціновий рівень клієнта (20/50/100кг)", callback_data="menu_pricetierclient")],
@@ -2031,8 +2050,8 @@ CLIENT_BTN_ORDER_OLD = "📝 Замовити"
 CLIENT_BTN_INSTRUCTIONS_OLD = "ℹ️ Інструкція"
 
 DELIVERY_COMMON_TAIL = (
-    "\n\nЗамовлення прийняті до 09:00 - можуть бути доставлені КУР'ЄРОМ в той самий день.\n\n"
-    "Замовлення новою поштою прийняті до 11:00 - відправляються у той самий день.\n\n"
+    "\n\nЗамовлення прийняті до 11:00 - можуть бути доставлені КУР'ЄРОМ в той самий день.\n\n"
+    "Замовлення новою поштою прийняті до 12:00 (пн-пт) - відправляються у той самий день.\n\n"
     "Доставка на наступний після замовлення день з понеділка по п'ятницю, з 10 до 16.\n\n"
     "Доставка замовлень відбувається за умови повної передплати на рахунок, або по факту "
     "отримання кави.\n\n"
@@ -2047,8 +2066,8 @@ DEFAULT_DELIVERY_RETAIL_TEXT = (
 
 DEFAULT_DELIVERY_WHOLESALE_TEXT = (
     "Умови доставки (гурт):\n\n"
-    "Доставка гуртових замовлень від 10 кг будь-якої кави - безкоштовно. "
-    "До 10-ти кг - 190 грн. по Києву, або за тарифами нової пошти.\n\n"
+    "Доставка гуртових замовлень від 8 кг будь-якої кави - безкоштовно. "
+    "До 8 кг - 190 грн. по Києву, або за тарифами нової пошти.\n\n"
     "Ви можете обрати по одному кілограму різних сортів, та отримати знижку в залежності "
     "від загального об'єму замовлення." + DELIVERY_COMMON_TAIL
 )
@@ -3407,6 +3426,85 @@ def _item_line_total(item: dict) -> float | None:
         return None
 
 
+# ---- Доставка та години прийому замовлень ---------------------------------------------
+DELIVERY_FEE = 190.0          # грн
+DELIVERY_FREE_FROM_KG = 8.0   # менше 8 кг кави в замовленні - доставка платна; від 8 кг - безкоштовно
+NP_ZONE = "НП (Нова Пошта)"
+PICKUP_ZONE = "Самовивіз"
+SAME_DAY_CUTOFF_NP = 12       # замовлення «день у день» для клієнтів Нової пошти - до 12:00
+SAME_DAY_CUTOFF_OTHER = 11    # для всіх інших - до 11:00 (сб і нд замовлення не приймаємо взагалі)
+_UNIT_KG = {"1 кг": 1.0, "250 г": 0.25, "40 г": 0.04}
+
+
+def _order_coffee_kg(items: list) -> float:
+    """Скільки кілограмів кави в замовленні (арабіка, бленд, палай). Дріп і супутні товари
+    у вагу не рахуються."""
+    total = 0.0
+    for it in items:
+        if it.get("category") not in COFFEE_CATEGORIES:
+            continue
+        per = _UNIT_KG.get(it.get("weight"))
+        if per is None:
+            continue
+        try:
+            qty = float(str(it.get("qty")).replace(",", "."))
+        except (TypeError, ValueError):
+            continue
+        total += per * qty
+    return round(total, 3)
+
+
+def _client_always_delivery(chat_id) -> bool:
+    if not chat_id:
+        return False
+    conn = db()
+    row = conn.execute("SELECT always_delivery FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    return bool(row and row["always_delivery"])
+
+
+def _order_delivery_fee(order: dict, profile: dict | None) -> float:
+    """Скільки грошей додати до суми замовлення за доставку:
+    - клієнтам із позначкою «завжди доставка» - 190 грн до кожного замовлення;
+    - Нова пошта та самовивіз - 0 (доставки від нас немає);
+    - решті (Київ) - 190 грн, якщо кави менше 8 кг."""
+    profile = profile or {}
+    cid = profile.get("chat_id") or order.get("client_chat_id")
+    if _client_always_delivery(cid):
+        return DELIVERY_FEE
+    zone = profile.get("delivery_zone")
+    if not zone or zone in (NP_ZONE, PICKUP_ZONE):
+        return 0.0
+    if _order_coffee_kg(order.get("items", [])) < DELIVERY_FREE_FROM_KG:
+        return DELIVERY_FEE
+    return 0.0
+
+
+def _same_day_cutoff_hour(client_chat_id) -> int:
+    profile = _get_client_profile(client_chat_id) if client_chat_id else None
+    if profile and profile.get("delivery_zone") == NP_ZONE:
+        return SAME_DAY_CUTOFF_NP
+    return SAME_DAY_CUTOFF_OTHER
+
+
+def _same_day_cutoff_problem(order: dict, client_chat_id):
+    """Якщо замовлення на СЬОГОДНІ, а час прийому вже минув - повертає текст пояснення."""
+    try:
+        d = datetime.strptime((order.get("date") or "")[:10], "%d.%m.%Y").date()
+    except ValueError:
+        return None
+    now = datetime.now(TZ)
+    if d != now.date():
+        return None
+    cutoff = _same_day_cutoff_hour(client_chat_id)
+    if now.hour >= cutoff:
+        return (
+            f"⏰ Замовлення на сьогодні приймаються до {cutoff}:00, цей час уже минув. "
+            "Оберіть, будь ласка, іншу дату (решту замовлення збережено):"
+        )
+    return None
+
+
 def _order_cancel_row(back_callback: str | None = None) -> list:
     row = []
     if back_callback:
@@ -3415,15 +3513,16 @@ def _order_cancel_row(back_callback: str | None = None) -> list:
     return row
 
 
-def _order_date_keyboard(callback_prefix: str = "order_date") -> InlineKeyboardMarkup:
+def _order_date_keyboard(callback_prefix: str = "order_date", client_chat_id=None) -> InlineKeyboardMarkup:
     now = datetime.now(TZ)
     today = now.date()
+    cutoff_hour = _same_day_cutoff_hour(client_chat_id)
     buttons, row = [], []
     for i in range(21):
         d = today + timedelta(days=i)
         if d.weekday() >= 5:  # субота(5), неділя(6) — не приймаємо замовлення
             continue
-        if i == 0 and now.hour >= 10:  # сьогоднішній день доступний тільки до 10:00
+        if i == 0 and now.hour >= cutoff_hour:  # сьогодні: до 12:00 для НП, до 11:00 для решти
             continue
         label = f"{d.strftime('%d.%m')} ({WEEKDAY_LABELS_SHORT[d.weekday()]})"
         row.append(InlineKeyboardButton(label, callback_data=f"{callback_prefix}:{d.isoformat()}"))
@@ -3538,7 +3637,13 @@ def _order_review_step_screen(order: dict):
                     order_total += line_total
             lines.append(f"{i+1}) {item.get('item_text', '—')} — {item.get('weight', '—')} × {item.get('qty', '—')} ({cat_label}){price_part}")
         if order_total:
-            lines.append(f"\n💰 Разом: {order_total:g} грн")
+            _cid = order.get("client_chat_id")
+            fee = _order_delivery_fee(order, _get_client_profile(_cid) if _cid else None)
+            if fee:
+                lines.append(f"\n🚚 Доставка: {fee:g} грн")
+                lines.append(f"💰 Разом: {order_total + fee:g} грн")
+            else:
+                lines.append(f"\n💰 Разом: {order_total:g} грн")
         buttons = [
             [InlineKeyboardButton("➕ Додати нову позицію", callback_data="order_addmore")],
             [InlineKeyboardButton("✅ Все ок, продовжити", callback_data="order_finish")],
@@ -3661,7 +3766,10 @@ def _order_client_summary_text(order: dict, profile: dict) -> str:
     order_total = sum(t for t in (_item_line_total(i) for i in order.get("items", [])) if t is not None)
     lines.append("")
     if order_total:
-        lines.append(f"💰 Разом: {order_total:g} грн")
+        fee = _order_delivery_fee(order, profile)
+        if fee:
+            lines.append(f"🚚 Доставка: {fee:g} грн")
+        lines.append(f"💰 Разом: {order_total + fee:g} грн")
     lines.append(f"💳 Оплата: {_esc(order.get('payment_method') or '—')}")
     if "invoice" in order:
         lines.append(f"🧾 Накладна: {_esc(order.get('invoice'))}")
@@ -3718,7 +3826,10 @@ def _order_summary_text(order: dict, profile: dict) -> str:
         )
     order_total = sum(t for t in (_item_line_total(i) for i in order.get("items", [])) if t is not None)
     if order_total:
-        lines.append(f"💰 <b>Разом: {order_total:g} грн</b>")
+        fee = _order_delivery_fee(order, profile)
+        if fee:
+            lines.append(f"🚚 Доставка: {fee:g} грн")
+        lines.append(f"💰 <b>Разом: {order_total + fee:g} грн</b>")
     note = profile.get("notes")
     if note:
         lines.append("")
@@ -3899,7 +4010,7 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     ORDER_PENDING[chat_id] = {"step": "date", "items": []}
-    await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+    await update.message.reply_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard(client_chat_id=chat_id))
 
 
 async def qna_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3963,7 +4074,7 @@ async def qna_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
     ORDER_PENDING[chat_id] = {"step": "date", "items": []}
-    await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+    await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard(client_chat_id=chat_id))
 
 
 async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3971,6 +4082,7 @@ async def handle_order_text_step(update: Update, context: ContextTypes.DEFAULT_T
     order = ORDER_PENDING.get(chat_id)
     if not order:
         return
+    order["client_chat_id"] = order.get("on_behalf_of", chat_id)
     step = order.get("step")
     text = update.message.text or ""
 
@@ -4009,6 +4121,8 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     order = ORDER_PENDING.get(chat_id)
     target_chat_id = order.get("on_behalf_of", chat_id) if order else chat_id
+    if order is not None:
+        order["client_chat_id"] = target_chat_id
     data = query.data
 
     if data == "order_cancel":
@@ -4023,7 +4137,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if prev_on_behalf:
             new_order["on_behalf_of"] = prev_on_behalf
         ORDER_PENDING[chat_id] = new_order
-        await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+        await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard(client_chat_id=target_chat_id))
         return
 
     if data == "order_repeat":
@@ -4043,9 +4157,9 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if prev_on_behalf:
                 new_order["on_behalf_of"] = prev_on_behalf
             ORDER_PENDING[chat_id] = new_order
-            await query.edit_message_text(note + "На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+            await query.edit_message_text(note + "На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard(client_chat_id=target_chat_id))
             return
-        order = ORDER_PENDING[chat_id] = {"step": "review", "items": available, "review_idx": 0}
+        order = ORDER_PENDING[chat_id] = {"step": "review", "items": available, "review_idx": 0, "client_chat_id": target_chat_id}
         if prev_on_behalf:
             order["on_behalf_of"] = prev_on_behalf
         text, kb = _order_review_step_screen(order)
@@ -4080,7 +4194,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "order_back_to_date":
         order["step"] = "date"
-        await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+        await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard(client_chat_id=target_chat_id))
         return
 
     if data.startswith("order_addr:"):
@@ -4296,7 +4410,7 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not order.get("date"):
             order["step"] = "finaldate"
             await query.edit_message_text(
-                "На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard("order_finaldate")
+                "На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard("order_finaldate", target_chat_id)
             )
             return
         if order.get("payment_method"):
@@ -4373,6 +4487,17 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order = ORDER_PENDING.pop(chat_id, None)
         if not order:
             await query.edit_message_text("Це замовлення вже неактуальне.")
+            return
+        problem = _same_day_cutoff_problem(order, target_chat_id)
+        if problem:
+            # час прийому на сьогодні минув, поки клієнт оформлював - просимо обрати іншу дату
+            order.pop("date", None)
+            order["awaiting_confirm"] = False
+            order["step"] = "finaldate"
+            ORDER_PENDING[chat_id] = order
+            await query.edit_message_text(
+                problem, reply_markup=_order_date_keyboard("order_finaldate", target_chat_id)
+            )
             return
         cancel_order_confirm_reminder(context.application, chat_id)
         _refresh_order_prices(order.get("items", []), target_chat_id)
@@ -4631,7 +4756,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             ORDER_PENDING[admin_id] = {"step": "date", "items": [], "on_behalf_of": target_chat_id}
-            await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard())
+            await query.edit_message_text("На яку дату потрібне замовлення?", reply_markup=_order_date_keyboard(client_chat_id=target_chat_id))
             return
         ORDER_PENDING[admin_id] = {"on_behalf_of": target_chat_id}
         return
@@ -5106,6 +5231,27 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         await query.edit_message_reply_markup(reply_markup=_invoice_toggle_keyboard())
+        return
+
+    if data == "menu_alwaysdelivery":
+        await query.edit_message_text(
+            "Оберіть клієнтів, яким до КОЖНОГО замовлення додавати доставку 190 грн "
+            "(незалежно від ваги та способу доставки). Тап додає/прибирає позначку, зберігається одразу. "
+            "Позначені ✅ — завжди нагорі списку.",
+            reply_markup=_alwaysdelivery_toggle_keyboard(),
+        )
+        return
+
+    if data.startswith("menu_alwaysdeliverytoggle:"):
+        _, target_chat_id_str = data.split(":", 1)
+        target_chat_id = int(target_chat_id_str)
+        conn = db()
+        row = conn.execute("SELECT always_delivery FROM subscribers WHERE chat_id=?", (target_chat_id,)).fetchone()
+        new_val = 0 if (row and row["always_delivery"]) else 1
+        conn.execute("UPDATE subscribers SET always_delivery=? WHERE chat_id=?", (new_val, target_chat_id))
+        conn.commit()
+        conn.close()
+        await query.edit_message_reply_markup(reply_markup=_alwaysdelivery_toggle_keyboard())
         return
 
     if data == "menu_individualtoggle":
@@ -7548,6 +7694,22 @@ def _seed_item_prices_if_empty():
         conn.commit()
         _set_setting("dedupe_client_prices_v1", "1")
         logger.info(f"[DEDUPE] Прибрано дублікатів індивідуальних цін клієнтів: {len(to_delete)}")
+
+    # Клієнту «Мотрохіна» - доставка 190 грн до кожного замовлення. Шукаємо за прізвищем у
+    # імені / нікнеймі / картці. Позначені клієнти видно нагорі списку в меню
+    # «Клієнти → Кому завжди додавати доставку», там можна виправити вручну.
+    if _get_setting("always_delivery_motrokh_v1", "") != "1":
+        rows = conn.execute(
+            "SELECT s.chat_id, s.name, s.username, p.full_name, p.point_name FROM subscribers s "
+            "LEFT JOIN client_profiles p ON p.chat_id = s.chat_id WHERE s.chat_id > 0"
+        ).fetchall()
+        for r in rows:
+            blob = " ".join(str(x or "") for x in (r["name"], r["username"], r["full_name"], r["point_name"])).lower()
+            if "мотрох" in blob:
+                conn.execute("UPDATE subscribers SET always_delivery=1 WHERE chat_id=?", (r["chat_id"],))
+        conn.commit()
+        _set_setting("always_delivery_motrokh_v1", "1")
+        logger.info("[DELIVERY] Позначено клієнтів «Мотрох*» для постійної доставки 190 грн.")
 
     # Повне оновлення прайсу з нового PDF - лише item_prices, client_item_prices не чіпаємо.
     if _get_setting("price_update_full_v2", "") != "1":
