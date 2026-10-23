@@ -5337,7 +5337,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fops = _list_fops()
         default_id = _default_fop_id()
         buttons = [
-            [InlineKeyboardButton(("⭐ " if f["id"] == default_id else "") + f["name"], callback_data=f"menu_fopview:{f['id']}")]
+            [InlineKeyboardButton(("⭐ " if f["id"] == default_id else "") + _fop_short_name(f["name"]), callback_data=f"menu_fopview:{f['id']}")]
             for f in fops
         ]
         buttons.append([InlineKeyboardButton("➕ Додати ФОП", callback_data="menu_fopadd")])
@@ -5350,7 +5350,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_fopadd":
         FOP_PENDING[admin_id] = {"mode": "add"}
         await query.edit_message_text(
-            "Надішліть реквізити ФОП одним повідомленням за шаблоном (скопіюйте, підставте свої дані):\n\n"
+            "Надішліть реквізити ФОП одним повідомленням. Найпростіше — вставити їх так, як вони у вашому "
+            "рахунку: ФОП із прізвищем, код (ДРФО/ІПН/ЄДРПОУ), IBAN, банк. Бот сам усе знайде, а в списках "
+            "називатиме ФОП за прізвищем.\n\nАбо за шаблоном (можна скопіювати):\n\n"
             f"<code>{_esc(FOP_TEMPLATE)}</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="menu_fops")]]),
@@ -5425,7 +5427,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await query.edit_message_text("Поки немає активних клієнтів.", reply_markup=_menu_back_keyboard())
             return
-        names = {f["id"]: f["name"] for f in _list_fops()}
+        names = {f["id"]: _fop_short_name(f["name"]) for f in _list_fops()}
         buttons = [
             [InlineKeyboardButton(
                 f"{_client_display_label(r['chat_id'], r['name'], r['username'])} — "
@@ -5449,7 +5451,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Спершу додайте ФОП: ⚙️ Налаштування → 🏢 Реквізити ФОП.", reply_markup=_menu_back_keyboard()
             )
             return
-        buttons = [[InlineKeyboardButton(f["name"], callback_data=f"menu_fopset:{cid}:{f['id']}")] for f in fops]
+        buttons = [[InlineKeyboardButton(_fop_short_name(f["name"]), callback_data=f"menu_fopset:{cid}:{f['id']}")] for f in fops]
         buttons.append([InlineKeyboardButton("↩️ Прибрати закріплення (буде основний)", callback_data=f"menu_fopset:{cid}:0")])
         buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_fopclient")])
         await query.edit_message_text("Оберіть ФОП для цього клієнта:", reply_markup=InlineKeyboardMarkup(buttons))
@@ -5464,7 +5466,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         fop = _get_fop(fop_id)
         await query.edit_message_text(
-            f"✅ Збережено: {fop['name'] if fop else 'основний ФОП'}.",
+            f"✅ Збережено: {_fop_short_name(fop['name']) if fop else 'основний ФОП'}.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏢 До списку клієнтів", callback_data="menu_fopclient")]]),
         )
         return
@@ -8155,39 +8157,118 @@ def _valid_iban(raw: str):
     return s if number % 97 == 1 else None
 
 
+_QUOTE_CHARS = '"“”«»„‟'
+_TAX_KEYWORDS = r"(?:ДРФО|[ІI]ПН|РНОКПП|[ЄЕ]ДРПОУ|ідентифікаційний\s+код|код)"
+
+
+def _clean_name(s: str) -> str:
+    # Прибирає зайві лапки на початку; кінцеві - лише якщо лапок непарна кількість (не ламає ТОВ "Назва").
+    s = re.sub(r"\s+", " ", s).strip(" ,;.")
+    s = s.lstrip(_QUOTE_CHARS + " ")
+    if sum(ch in _QUOTE_CHARS for ch in s) % 2 == 1:
+        s = s.rstrip(_QUOTE_CHARS + " ")
+    return s
+
+
+def _normalize_bank(raw: str) -> str:
+    # Склеює рядки та зводить подвоєні лапки до «…»: назва банку з кількох рядків стає однією.
+    b = re.sub(r"\s+", " ", raw)
+    b = re.sub(r'["“”«»„‟]+\s*([^"“”«»„‟]+?)\s*["“”«»„‟]+', r"«\1»", b)
+    b = re.sub(r'["“”„‟]', "", b)
+    return b.strip(" ,;")
+
+
+def _freeform_fop_fields(text: str) -> dict:
+    """Шукає реквізити у вільному тексті, скопійованому з рахунку (без слів-ключів-шаблону):
+    ФОП/ТОВ із назвою, код (ДРФО/ІПН/ЄДРПОУ), IBAN, банк, МФО, примітку про податки."""
+    out = {}
+    # IBAN: UA + 27 цифр, можливо з пробілами та словом «IBAN» перед ним; бувають кирилична А чи У
+    m = re.search(r"[UuУу][AaАа][ \t]*\d{2}(?:[ \t]*\d){25}(?!\d)", text)
+    if m:
+        out["iban"] = "UA" + re.sub(r"\D", "", m.group(0))
+    rest = (text[:m.start()] + " " + text[m.end():]) if m else text
+    # код: після слова-ключа, інакше - окреме число з 10 або 8 цифр
+    m2 = re.search(_TAX_KEYWORDS + r"[^\d\n]{0,30}?(?<!\d)(\d{10}|\d{8})(?!\d)", rest, re.I)
+    if m2:
+        out["tax_id"] = m2.group(1)
+    else:
+        nums = re.findall(r"(?<!\d)(\d{10}|\d{8})(?!\d)", rest)
+        if nums:
+            out["tax_id"] = nums[0]
+    # назва: перший рядок із ФОП/ТОВ/ПП; інакше - перший рядок без цифр
+    for raw in text.splitlines():
+        # IBAN з рядка прибираємо, щоб він не потрапив у назву (якщо все написано в один рядок)
+        line = re.sub(r"[UuУу][AaАа][ \t]*\d{2}(?:[ \t]*\d){25}", " ", raw.strip())
+        m3 = re.search(r"(?i)(?<![\w])(ФОП|ФО-П|ТОВ|ПП)(?![\w]).*", line)
+        if m3:
+            cand = re.split(r"(?i)[,;]|\s(?:код|[ІI]ПН|ДРФО|[ЄЕ]ДРПОУ|РНОКПП|IBAN|Р/р)(?![\w])", m3.group(0))[0]
+            name = _clean_name(cand)
+            if name:
+                out["name"] = name
+                break
+    if "name" not in out:
+        for raw in text.splitlines():
+            line = raw.strip(_QUOTE_CHARS + " \t")
+            if line and not re.search(r"\d", line) and ":" not in line and len(line) <= 80:
+                out["name"] = _clean_name(line)
+                break
+    # банк (може бути розбитий на кілька рядків) і МФО
+    mb = re.search(r"Банк\s*:?\s*(.+?)(?=\s*,?\s*МФО|\n\s*(?:ІПН|код|IBAN|Р/р|Назва|Примітка)|\Z)", text, re.I | re.S)
+    mfo = re.search(r"МФО\s*:?\s*(\d{6})", text, re.I)
+    if mb:
+        bank = _normalize_bank(mb.group(1))
+        if bank:
+            if mfo and mfo.group(1) not in bank:
+                bank += f", МФО {mfo.group(1)}"
+            out["bank"] = bank
+    # примітка про податки
+    for raw in text.splitlines():
+        line = raw.strip(_QUOTE_CHARS + " \t")
+        if re.search(r"(?i)\bпдв\b|платник|єдин\w*\s+податк", line) and not re.search(r"IBAN|[UuУу][AaАа]\s*\d{2}", line):
+            out["note"] = re.sub(r"\s+", " ", line).strip(" ,;")
+            break
+    return out
+
+
 def _parse_fop_template(text: str):
-    """Розбирає повідомлення з реквізитами ФОП. Повертає (дані, список_помилок)."""
+    """Розбирає реквізити ФОП. Працює і за шаблоном («Назва: …», «IBAN: …»), і з тексту, вставленого
+    з рахунку як є (бот сам знаходить ФОП, код, IBAN, банк). Повертає (дані, список_помилок)."""
     data = {"name": None, "tax_id": None, "iban": None, "bank": None, "note": None}
     for raw in (text or "").splitlines():
         if ":" not in raw:
             continue
         key, value = raw.split(":", 1)
         k = re.sub(r"[\s./'’]", "", key.lower())
-        v = value.strip()
+        v = value.strip().strip(_QUOTE_CHARS + " ")
         if not v:
             continue
         if k.startswith(("назв", "фоп", "отримув")):
-            data["name"] = v
+            data["name"] = _clean_name(value)
         elif k.startswith(("іпн", "ipn", "єдрпоу", "едрпоу", "код", "рнокпп")):
             data["tax_id"] = v
         elif k.startswith(("iban", "іban", "рр", "рахун")):
             data["iban"] = v
         elif k.startswith("банк"):
-            data["bank"] = v
+            data["bank"] = _normalize_bank(value)
         elif k.startswith(("примітк", "статус", "подат", "пдв")):
             data["note"] = v
+    if not all(data.values()):
+        free = _freeform_fop_fields(text or "")
+        for key, val in free.items():
+            if not data.get(key):
+                data[key] = val
     errors = []
     if not data["name"]:
-        errors.append("не вказано назву (рядок «Назва: …»)")
+        errors.append("не знайшла назву (рядок з «ФОП Прізвище Ім'я По батькові»)")
     tid = re.sub(r"\s+", "", data["tax_id"] or "")
     if not tid:
-        errors.append("не вказано ІПН/ЄДРПОУ (рядок «ІПН/ЄДРПОУ: …»)")
+        errors.append("не знайшла код (ІПН/ДРФО/ЄДРПОУ — 10 або 8 цифр)")
     elif not (tid.isdigit() and len(tid) in (8, 10)):
-        errors.append("ІПН має містити 10 цифр, а ЄДРПОУ — 8 цифр")
+        errors.append("код ІПН має містити 10 цифр, а ЄДРПОУ — 8 цифр")
     else:
         data["tax_id"] = tid
     if not data["iban"]:
-        errors.append("не вказано IBAN (рядок «IBAN: …»)")
+        errors.append("не знайшла IBAN (UA і ще 27 цифр)")
     else:
         iban = _valid_iban(data["iban"])
         if not iban:
@@ -8198,6 +8279,20 @@ def _parse_fop_template(text: str):
         else:
             data["iban"] = iban
     return data, errors
+
+
+def _fop_short_name(name: str) -> str:
+    """«ФОП Миколенко Андрій Олегович» -> «ФОП Миколенко А.О.» (для кнопок і списків).
+    Інші назви (ТОВ тощо) лишаються як є, лише обрізаються, якщо задовгі."""
+    name = (name or "").strip()
+    m = re.fullmatch(r"(?i)ФОП\s+(\S+)\s+(\S+)(?:\s+(\S+))?", name)
+    if m and m.group(1)[0].isalpha() and m.group(2)[0].isalpha() and "." not in m.group(2) \
+            and (not m.group(3) or m.group(3)[0].isalpha()):
+        initials = m.group(2)[0].upper() + "."
+        if m.group(3):
+            initials += m.group(3)[0].upper() + "."
+        return f"ФОП {m.group(1)} {initials}"
+    return name if len(name) <= 40 else name[:37] + "…"
 
 
 def _fop_template_text(fop: dict) -> str:
@@ -8355,7 +8450,7 @@ async def _invoice_ask_number(context, admin_id: int, st: dict, renumber: bool =
     who = profile.get("point_name") or profile.get("full_name") or str(st["client_chat_id"])
     lines = [
         f"🧾 Рахунок для: {who}",
-        f"ФОП: {fop['name']}",
+        f"ФОП: {_fop_short_name(fop['name'])}",
         f"Сума: {_money(total)} грн",
     ]
     if prev:
@@ -8388,7 +8483,7 @@ async def _invoice_start(context, admin_id: int, group_chat_id, message_id, orde
     if not st["fop_id"]:
         st["stage"] = "fop"
         INVOICE_PENDING[admin_id] = st
-        buttons = [[InlineKeyboardButton(f["name"], callback_data=f"inv_pickfop:{f['id']}")] for f in fops]
+        buttons = [[InlineKeyboardButton(_fop_short_name(f["name"]), callback_data=f"inv_pickfop:{f['id']}")] for f in fops]
         buttons.append([InlineKeyboardButton("❌ Скасувати", callback_data="inv_abort")])
         await context.bot.send_message(
             admin_id,
@@ -8527,7 +8622,7 @@ async def invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("UPDATE subscribers SET fop_id=? WHERE chat_id=?", (fop["id"], st["client_chat_id"]))
         conn.commit()
         conn.close()
-        await query.edit_message_text(f"Обрано ФОП: {fop['name']} (закріплено за клієнтом).")
+        await query.edit_message_text(f"Обрано ФОП: {_fop_short_name(fop['name'])} (закріплено за клієнтом).")
         await _invoice_ask_number(context, admin_id, st)
         return
 
@@ -8623,7 +8718,7 @@ async def invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"✅ Рахунок № {inv['number']} надіслано клієнту.")
         fop = _get_fop(inv["fop_id"])
         if inv["group_chat_id"] and inv["group_message_id"]:
-            note = f"🧾 Рахунок № {inv['number']} надіслано клієнту — {fop['name'] if fop else 'ФОП'}, {_money(inv['total'])} грн"
+            note = f"🧾 Рахунок № {inv['number']} надіслано клієнту — {_fop_short_name(fop['name']) if fop else 'ФОП'}, {_money(inv['total'])} грн"
             try:
                 await context.bot.send_message(inv["group_chat_id"], note, reply_to_message_id=inv["group_message_id"])
             except Exception:
@@ -8644,7 +8739,8 @@ async def handle_fop_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if errors:
         await update.message.reply_text(
             "Не вдалось зберегти реквізити:\n• " + "\n• ".join(errors) +
-            "\n\nВиправте і надішліть повідомлення ще раз (або /cancel)."
+            "\n\nНадішліть ще раз: можна вставити реквізити з вашого рахунку як є (потрібні ФОП із прізвищем, "
+            "код, IBAN) або за шаблоном. Скасувати — /cancel."
         )
         return
     conn = db()
@@ -8669,8 +8765,17 @@ async def handle_fop_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _set_setting("default_fop_id", str(fop_id))
         extra = "\nЦе ваш єдиний ФОП, тому він став основним: рахунки всім клієнтам без окремого призначення виставлятимуться на нього."
     await update.message.reply_text(
-        f"✅ ФОП «{data['name']}» збережено.{extra}",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏢 До реквізитів ФОП", callback_data="menu_fops")]]),
+        f"✅ ФОП «{_esc(_fop_short_name(data['name']))}» збережено. Перевірте, чи все розпізнано правильно:\n\n"
+        f"<b>{_esc(data['name'])}</b>\n"
+        f"ІПН/ЄДРПОУ: {_esc(data['tax_id'])}\n"
+        f"IBAN: <code>{_esc(data['iban'])}</code>\n"
+        f"Банк: {_esc(data['bank'] or '—')}\n"
+        f"Примітка: {_esc(data['note'] or '—')}{extra}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Виправити", callback_data=f"menu_fopedit:{fop_id}")],
+            [InlineKeyboardButton("🏢 До реквізитів ФОП", callback_data="menu_fops")],
+        ]),
     )
 
 
