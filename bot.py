@@ -61,11 +61,6 @@ SENDTO_SELECTIONS: dict[int, set[int]] = {}
 
 # Результат останньої перевірки «хто видалив бота»: admin_chat_id -> [chat_id, ...] (для підтвердження)
 INACTIVE_SCAN: dict[int, list] = {}
-
-# Адмін зараз вводить реквізити ФОП: admin_chat_id -> {"mode": "add"|"edit", "fop_id": ...}
-FOP_PENDING: dict[int, dict] = {}
-# Адмін зараз виставляє рахунок: admin_chat_id -> {stage, order_id, client_chat_id, fop_id, ...}
-INVOICE_PENDING: dict[int, dict] = {}
 SENDTO_AWAITING_TEXT: dict[int, list[int]] = {}
 
 # Стан для кроків меню з кнопками (наприклад, очікування тексту після вибору дії)
@@ -203,48 +198,6 @@ def init_db():
         conn.execute("ALTER TABLE subscribers ADD COLUMN needs_invoice_choice INTEGER DEFAULT 0")
     if "always_delivery" not in existing_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN always_delivery INTEGER DEFAULT 0")
-    if "fop_id" not in existing_cols:
-        conn.execute("ALTER TABLE subscribers ADD COLUMN fop_id INTEGER")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS fops (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            tax_id TEXT NOT NULL,
-            iban TEXT NOT NULL,
-            bank TEXT,
-            note TEXT,
-            created_at TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS invoices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id INTEGER,
-            client_chat_id INTEGER,
-            fop_id INTEGER,
-            number TEXT NOT NULL,
-            text TEXT,
-            total REAL,
-            status TEXT DEFAULT 'draft',
-            group_chat_id INTEGER,
-            group_message_id INTEGER,
-            created_at TEXT,
-            sent_at TEXT
-        )
-    """)
-    _inv_cols = [r["name"] for r in conn.execute("PRAGMA table_info(invoices)").fetchall()]
-    if "cash" not in _inv_cols:
-        conn.execute("ALTER TABLE invoices ADD COLUMN cash INTEGER DEFAULT 0")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS order_messages (
-            group_chat_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL,
-            order_id INTEGER NOT NULL,
-            client_chat_id INTEGER,
-            created_at TEXT,
-            PRIMARY KEY (group_chat_id, message_id)
-        )
-    """)
     bc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
     if "is_question" not in bc_cols:
         conn.execute("ALTER TABLE broadcasts ADD COLUMN is_question INTEGER DEFAULT 0")
@@ -1750,8 +1703,6 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or chat_id in ADMIN_MSGEDIT_PENDING
         or chat_id in ADMIN_GROUPEDIT_PENDING
         or chat_id in ADMIN_NOTE_PENDING
-        or chat_id in FOP_PENDING
-        or chat_id in INVOICE_PENDING
         or chat_id in MENU_PENDING
         or chat_id in SENDTO_AWAITING_TEXT
         or reply_matches_forward
@@ -1795,14 +1746,6 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if admin_id in ADMIN_NOTE_PENDING:
         await handle_admin_note_text(update, context)
-        return
-
-    if admin_id in FOP_PENDING:
-        await handle_fop_text(update, context)
-        return
-
-    if admin_id in INVOICE_PENDING:
-        await handle_invoice_number_text(update, context)
         return
 
     # 0) Якщо адмін відповідає (Reply) на переслане повідомлення клієнта — надсилаємо відповідь клієнту
@@ -2044,10 +1987,7 @@ def _menu_clients_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("🪪 Редагувати картку клієнта", callback_data="menu_editclientprofile")],
         [InlineKeyboardButton("📦 Кому показувати вибір пакування", callback_data="menu_packaging")],
-        [InlineKeyboardButton("🧾 Кому показувати вибір накладної", callback_data="menu_invoice")],
         [InlineKeyboardButton("🚚 Кому завжди додавати доставку 190 грн", callback_data="menu_alwaysdelivery")],
-        [InlineKeyboardButton("🏢 ФОП клієнта (на який платить)", callback_data="menu_fopclient")],
-        [InlineKeyboardButton("🧾 Рахунки (архів)", callback_data="menu_invoices")],
         [InlineKeyboardButton("🎯 Кому давати індивідуальні ціни", callback_data="menu_individualtoggle")],
         [InlineKeyboardButton("💰 Задати індивідуальну ціну клієнту", callback_data="menu_individualprices")],
         [InlineKeyboardButton("🏷 Ціновий рівень клієнта (20/50/100кг)", callback_data="menu_pricetierclient")],
@@ -2065,7 +2005,6 @@ def _menu_settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("☕ Асортимент", callback_data="menu_editassortment"),
          InlineKeyboardButton("🚚 Доставка", callback_data="menu_editdelivery")],
         [InlineKeyboardButton("💰 Прайс", callback_data="menu_price")],
-        [InlineKeyboardButton("🏢 Реквізити ФОП", callback_data="menu_fops")],
         [InlineKeyboardButton("✏️ Повідомлення групи", callback_data="menu_setmsg")],
         [InlineKeyboardButton("📁 Переглянути групи", callback_data="menu_viewsegments")],
         [InlineKeyboardButton("🔙 До меню", callback_data="menu_back")],
@@ -2299,7 +2238,6 @@ def _client_details_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(CLIENT_BTN_DELIVERY, callback_data="clientdetails_delivery")],
         [InlineKeyboardButton(CLIENT_BTN_INSTRUCTIONS, callback_data="clientdetails_instructions")],
         [InlineKeyboardButton(CLIENT_BTN_PROFILE, callback_data="clientdetails_profile")],
-        [InlineKeyboardButton("🧾 Мої рахунки", callback_data="clientdetails_invoices")],
     ])
 
 
@@ -2316,36 +2254,6 @@ async def clientdetails_router(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     data = query.data
     chat_id = update.effective_chat.id
-
-    if data == "clientdetails_menu":
-        await query.edit_message_text("📋 Оберіть, що вас цікавить:", reply_markup=_client_details_keyboard())
-        return
-
-    if data == "clientdetails_invoices" or data.startswith("clientdetails_invoices:"):
-        offset = int(data.split(":", 1)[1]) if ":" in data else 0
-        text, kb = _client_invoices_screen(chat_id, offset)
-        await query.edit_message_text(text, reply_markup=kb)
-        return
-
-    if data.startswith("clientdetails_invview:"):
-        _, inv_id_str, offset_str = data.split(":")
-        conn = db()
-        # клієнт бачить ТІЛЬКИ свої надіслані рахунки (перевірка за chat_id)
-        inv = conn.execute(
-            "SELECT text FROM invoices WHERE id=? AND client_chat_id=? AND status='sent'", (int(inv_id_str), chat_id)
-        ).fetchone()
-        conn.close()
-        if not inv:
-            await query.edit_message_text(
-                "Рахунок не знайдено.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До списку", callback_data="clientdetails_invoices:0")]]),
-            )
-            return
-        await query.edit_message_text(
-            inv["text"], parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До списку", callback_data=f"clientdetails_invoices:{int(offset_str)}")]]),
-        )
-        return
 
     if data == "clientdetails_assortment":
         await query.edit_message_text(
@@ -4046,16 +3954,6 @@ async def _order_go_to_confirm_or_invoice(send_func, context, chat_id: int, orde
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Пропустити", callback_data="order_skipcomment")]]),
         )
         return
-    if _client_needs_invoice_choice(target_chat_id) and "invoice" not in order:
-        order["step"] = "invoice"
-        await send_func(
-            "Чи потрібна вам товарна накладна на це замовлення?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Так", callback_data="order_invoice:Так")],
-                [InlineKeyboardButton("❌ Ні", callback_data="order_invoice:Ні")],
-            ]),
-        )
-        return
     order["awaiting_confirm"] = True
     schedule_order_confirm_reminder(context.application, chat_id)
     _refresh_order_prices(order.get("items", []), target_chat_id)
@@ -4657,14 +4555,6 @@ async def order_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 group_text = summary + from_line
                 sent_group = await context.bot.send_message(orders_group_id, group_text, parse_mode="HTML")
                 GROUP_ORDER_TEXT[(orders_group_id, sent_group.message_id)] = group_text
-                _conn_om = db()
-                _conn_om.execute(
-                    "INSERT OR REPLACE INTO order_messages (group_chat_id, message_id, order_id, client_chat_id, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (orders_group_id, sent_group.message_id, order_id, target_chat_id, datetime.now(TZ).isoformat()),
-                )
-                _conn_om.commit()
-                _conn_om.close()
                 if is_self_order:
                     locations = PICKUP_MESSAGE_LOCATIONS.setdefault(order_id, [])
                     locations.append((orders_group_id, sent_group.message_id))
@@ -4768,7 +4658,6 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ADMIN_NEW_PROFILE_PENDING.pop(admin_id, None)
     ADMIN_EDIT_PROFILE_PENDING.pop(admin_id, None)
     ADMIN_ADD_ADDRESS_PENDING.pop(admin_id, None)
-    FOP_PENDING.pop(admin_id, None)
 
     if data == "menu_back":
         MENU_PENDING.pop(admin_id, None)
@@ -5334,215 +5223,6 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         await query.edit_message_reply_markup(reply_markup=_invoice_toggle_keyboard())
-        return
-
-    if data == "menu_fops":
-        fops = _list_fops()
-        default_id = _default_fop_id()
-        buttons = [
-            [InlineKeyboardButton(("⭐ " if f["id"] == default_id else "") + _fop_short_name(f["name"]), callback_data=f"menu_fopview:{f['id']}")]
-            for f in fops
-        ]
-        buttons.append([InlineKeyboardButton("➕ Додати ФОП", callback_data="menu_fopadd")])
-        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
-        text = "🏢 Реквізити ФОП, на які клієнти оплачують рахунки."
-        text += "\n\nПоки що жодного ФОП не додано." if not fops else "\n⭐ — основний (на нього виставляється рахунок клієнту без окремого призначення)."
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data == "menu_fopadd":
-        FOP_PENDING[admin_id] = {"mode": "add"}
-        await query.edit_message_text(
-            "Надішліть реквізити ФОП одним повідомленням. Найпростіше — вставити їх так, як вони у вашому "
-            "рахунку: ФОП із прізвищем, код (ДРФО/ІПН/ЄДРПОУ), IBAN, банк. Бот сам усе знайде, а в списках "
-            "називатиме ФОП за прізвищем.\n\nАбо за шаблоном (можна скопіювати):\n\n"
-            f"<code>{_esc(FOP_TEMPLATE)}</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="menu_fops")]]),
-        )
-        return
-
-    if data.startswith("menu_fopview:"):
-        text, kb = _fop_view_screen(int(data.split(":", 1)[1]))
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
-        return
-
-    if data.startswith("menu_fopedit:"):
-        fop_id = int(data.split(":", 1)[1])
-        fop = _get_fop(fop_id)
-        if not fop:
-            await query.edit_message_text("ФОП не знайдено.", reply_markup=_menu_back_keyboard())
-            return
-        FOP_PENDING[admin_id] = {"mode": "edit", "fop_id": fop_id}
-        await query.edit_message_text(
-            "Скопіюйте реквізити нижче, виправте що треба і надішліть повідомленням цілком:\n\n"
-            f"<code>{_esc(_fop_template_text(fop))}</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data=f"menu_fopview:{fop_id}")]]),
-        )
-        return
-
-    if data.startswith("menu_fopdefault:"):
-        fop_id = int(data.split(":", 1)[1])
-        if _get_fop(fop_id):
-            _set_setting("default_fop_id", str(fop_id))
-        text, kb = _fop_view_screen(fop_id)
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
-        return
-
-    if data.startswith("menu_fopdel:"):
-        fop_id = int(data.split(":", 1)[1])
-        fop = _get_fop(fop_id)
-        if not fop:
-            await query.edit_message_text("ФОП не знайдено.", reply_markup=_menu_back_keyboard())
-            return
-        await query.edit_message_text(
-            f"Видалити ФОП «{fop['name']}»?\n\nКлієнти, закріплені за ним, лишаться без окремого ФОП "
-            "(рахунок виставлятиметься на основний). Уже надіслані рахунки не зміняться.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑 Так, видалити", callback_data=f"menu_fopdelyes:{fop_id}")],
-                [InlineKeyboardButton("❌ Ні", callback_data=f"menu_fopview:{fop_id}")],
-            ]),
-        )
-        return
-
-    if data.startswith("menu_fopdelyes:"):
-        fop_id = int(data.split(":", 1)[1])
-        conn = db()
-        conn.execute("UPDATE subscribers SET fop_id=NULL WHERE fop_id=?", (fop_id,))
-        conn.execute("DELETE FROM fops WHERE id=?", (fop_id,))
-        conn.commit()
-        conn.close()
-        if _default_fop_id() == fop_id:
-            _set_setting("default_fop_id", "")
-        await query.edit_message_text("🗑 ФОП видалено.", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🏢 До реквізитів ФОП", callback_data="menu_fops")]
-        ]))
-        return
-
-    if data == "menu_fopclient":
-        conn = db()
-        rows = conn.execute(
-            "SELECT chat_id, name, username, fop_id FROM subscribers WHERE active=1 AND chat_id != 0 "
-            "ORDER BY name COLLATE NOCASE LIMIT 90"
-        ).fetchall()
-        conn.close()
-        if not rows:
-            await query.edit_message_text("Поки немає активних клієнтів.", reply_markup=_menu_back_keyboard())
-            return
-        names = {f["id"]: _fop_short_name(f["name"]) for f in _list_fops()}
-        buttons = [
-            [InlineKeyboardButton(
-                f"{_client_display_label(r['chat_id'], r['name'], r['username'])} — "
-                f"{names.get(r['fop_id'], 'основний' if _default_fop_id() else 'не обрано')}",
-                callback_data=f"menu_foppick:{r['chat_id']}",
-            )]
-            for r in rows
-        ]
-        buttons.append([InlineKeyboardButton("🔙 До меню", callback_data="menu_back")])
-        await query.edit_message_text(
-            "Кому призначити ФОП для оплати? (після тире — поточний ФОП клієнта)",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return
-
-    if data.startswith("menu_foppick:"):
-        cid = int(data.split(":", 1)[1])
-        fops = _list_fops()
-        if not fops:
-            await query.edit_message_text(
-                "Спершу додайте ФОП: ⚙️ Налаштування → 🏢 Реквізити ФОП.", reply_markup=_menu_back_keyboard()
-            )
-            return
-        buttons = [[InlineKeyboardButton(_fop_short_name(f["name"]), callback_data=f"menu_fopset:{cid}:{f['id']}")] for f in fops]
-        buttons.append([InlineKeyboardButton("↩️ Прибрати закріплення (буде основний)", callback_data=f"menu_fopset:{cid}:0")])
-        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_fopclient")])
-        await query.edit_message_text("Оберіть ФОП для цього клієнта:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data.startswith("menu_fopset:"):
-        _, cid_str, fop_id_str = data.split(":", 2)
-        fop_id = int(fop_id_str) or None
-        conn = db()
-        conn.execute("UPDATE subscribers SET fop_id=? WHERE chat_id=?", (fop_id, int(cid_str)))
-        conn.commit()
-        conn.close()
-        fop = _get_fop(fop_id)
-        await query.edit_message_text(
-            f"✅ Збережено: {_fop_short_name(fop['name']) if fop else 'основний ФОП'}.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏢 До списку клієнтів", callback_data="menu_fopclient")]]),
-        )
-        return
-
-    if data == "menu_invoices":
-        await query.edit_message_text(
-            "🧾 Архів рахунків:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🕘 Останні рахунки", callback_data="menu_invlist:0")],
-                [InlineKeyboardButton("👤 Рахунки клієнта", callback_data="menu_invclients")],
-                [InlineKeyboardButton("🔙 До меню", callback_data="menu_clients")],
-            ]),
-        )
-        return
-
-    if data.startswith("menu_invlist:"):
-        text, kb = _admin_invoices_screen(int(data.split(":", 1)[1]))
-        await query.edit_message_text(text, reply_markup=kb)
-        return
-
-    if data == "menu_invclients":
-        conn = db()
-        rows = conn.execute(
-            "SELECT client_chat_id, COUNT(*) n, MAX(id) last FROM invoices WHERE status!='cancelled' "
-            "GROUP BY client_chat_id ORDER BY last DESC LIMIT 60"
-        ).fetchall()
-        conn.close()
-        if not rows:
-            await query.edit_message_text(
-                "Рахунків поки немає.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="menu_invoices")]])
-            )
-            return
-        buttons = [
-            [InlineKeyboardButton(
-                f"{_invoice_client_label(r['client_chat_id'])[:40]} ({r['n']})",
-                callback_data=f"menu_invbyclient:{r['client_chat_id']}:0",
-            )]
-            for r in rows
-        ]
-        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_invoices")])
-        await query.edit_message_text("Чиї рахунки показати?", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data.startswith("menu_invbyclient:"):
-        _, cid_str, off_str = data.split(":", 2)
-        text, kb = _admin_invoices_screen(int(off_str), int(cid_str))
-        await query.edit_message_text(text, reply_markup=kb)
-        return
-
-    if data.startswith("menu_invview:"):
-        _, inv_id_str, off_str, cid_str = data.split(":")
-        conn = db()
-        inv = conn.execute("SELECT * FROM invoices WHERE id=?", (int(inv_id_str),)).fetchone()
-        conn.close()
-        back_cb = f"menu_invlist:{int(off_str)}" if int(cid_str) == 0 else f"menu_invbyclient:{int(cid_str)}:{int(off_str)}"
-        if not inv:
-            await query.edit_message_text(
-                "Рахунок не знайдено.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=back_cb)]])
-            )
-            return
-        if inv["status"] == "sent":
-            status = f"✅ надіслано клієнту {_fmt_iso(inv['sent_at'], True)}"
-            action = [InlineKeyboardButton("📤 Надіслати клієнту ще раз", callback_data=f"inv_resend:{inv['id']}")]
-        elif inv["status"] == "draft":
-            status = "📝 чернетка (клієнту ще не надіслано)"
-            action = [InlineKeyboardButton("✅ Надіслати клієнту", callback_data=f"inv_send:{inv['id']}")]
-        else:
-            status = "❌ скасовано"
-            action = None
-        buttons = ([action] if action else []) + [[InlineKeyboardButton("🔙 Назад", callback_data=back_cb)]]
-        await query.edit_message_text(
-            inv["text"] + f"\n\n<i>Статус: {status}</i>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
-        )
         return
 
     if data == "menu_alwaysdelivery":
@@ -6943,7 +6623,6 @@ def _group_order_buttons(message_id: int, show_np_buttons: bool = False) -> Inli
             InlineKeyboardButton("➕ Дописати", callback_data=f"grouporder_append:{message_id}"),
             InlineKeyboardButton("🗑 Видалити", callback_data=f"grouporder_del:{message_id}"),
         ],
-        [InlineKeyboardButton("🧾 Рахунок", callback_data=f"grouporder_invoice:{message_id}")],
     ]
     if show_np_buttons:
         rows.append([
@@ -7257,8 +6936,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ADMIN_MSGEDIT_PENDING.pop(chat_id, None) is not None,
         ADMIN_GROUPEDIT_PENDING.pop(chat_id, None) is not None,
         ADMIN_NOTE_PENDING.pop(chat_id, None) is not None,
-        FOP_PENDING.pop(chat_id, None) is not None,
-        INVOICE_PENDING.pop(chat_id, None) is not None,
         SENDTO_AWAITING_TEXT.pop(chat_id, None) is not None,
         SENDTO_SELECTIONS.pop(chat_id, None) is not None,
         BC_PENDING.pop(chat_id, None) is not None,
@@ -7381,6 +7058,131 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # Оновлення прайсу від 11.08 - структура (category, item_name, unit, roz, p20, p50, p100, p300)
+# Оновлення цін за прайсом від 12.11.2026 (PDF «повний») - структура (category, item_name, unit, roz, p20, p50, p100, p300)
+PRICE_UPDATE_20261112 = [
+    ('arabika', 'Без Кофеїну Колумбія', '1 кг', 1525.0, 1156.0, 1035.0, 975.0, 910.0),
+    ('arabika', 'Без Кофеїну Колумбія', '250 г', 415.0, 314.0, 280.0, 265.0, 247.0),
+    ('arabika', 'Бразилія Сантос +', '1 кг', 1029.0, 761.0, 737.0, 676.0, 626.1),
+    ('arabika', 'Бразилія Сантос +', '250 г', 285.0, 216.0, 205.0, 190.0, 172.0),
+    ('arabika', 'Бразилія Сантос ++', '1 кг', 1029.0, 761.0, 737.0, 676.0, 626.1),
+    ('arabika', 'Бразилія Сантос ++', '250 г', 285.0, 216.0, 205.0, 190.0, 172.0),
+    ('arabika', 'Бразилія Сантос', '1 кг', 1029.0, 761.0, 737.0, 676.0, 626.1),
+    ('arabika', 'Бразилія Сантос', '250 г', 285.0, 216.0, 205.0, 190.0, 172.0),
+    ('arabika', 'Гватемала Huehuetenango', '1 кг', 1194.0, 885.0, 821.0, 760.7, 720.7),
+    ('arabika', 'Гватемала Huehuetenango', '250 г', 326.0, 243.0, 226.0, 212.0, 195.7),
+    ('arabika', 'Гондурас SHG EP', '1 кг', 1118.0, 828.0, 778.0, 718.0, 676.9),
+    ('arabika', 'Гондурас SHG EP', '250 г', 307.0, 230.0, 216.0, 201.0, 184.8),
+    ('arabika', 'Ефіопія Джима Грейд 5', '1 кг', 900.0, 682.0, 676.0, 616.0, 552.0),
+    ('arabika', 'Ефіопія Джима Грейд 5', '250 г', 259.0, 196.0, 190.0, 176.0, 157.0),
+    ('arabika', 'Ефіопія Йоргачеф', '1 кг', 1295.0, 981.0, 904.0, 844.0, 779.0),
+    ('arabika', 'Ефіопія Йоргачеф', '250 г', 357.0, 271.0, 247.0, 232.0, 214.0),
+    ('arabika', 'Ефіопія Сідамо Грейд 4', '1 кг', 1067.0, 791.0, 748.0, 687.8, 647.8),
+    ('arabika', 'Ефіопія Сідамо Грейд 4', '250 г', 300.0, 223.0, 207.0, 191.5, 181.3),
+    ('arabika', 'Індія Плантейшен', '1 кг', 1158.0, 858.0, 795.0, 735.1, 699.8),
+    ('arabika', 'Індія Плантейшен', '250 г', 317.0, 234.0, 219.0, 204.0, 190.5),
+    ('arabika', 'Колумбія Supremo', '1 кг', 1165.0, 872.0, 821.0, 761.0, 704.0),
+    ('arabika', 'Колумбія Supremo', '250 г', 325.0, 244.0, 226.0, 212.0, 195.0),
+    ('arabika', 'Коста-Ріка SHG EP', '1 кг', 1251.0, 931.0, 865.0, 805.0, 754.0),
+    ('arabika', 'Коста-Ріка SHG EP', '250 г', 346.0, 258.0, 238.0, 223.0, 208.0),
+    ('arabika', 'Перу SHB Gr.1', '1 кг', 1164.0, 862.0, 803.0, 743.2, 703.2),
+    ('arabika', 'Перу SHB Gr.1', '250 г', 318.0, 236.0, 219.0, 204.0, 191.3),
+    ('arabika', 'Сальвадор SHG EP', '1 кг', 1166.0, 863.0, 804.0, 744.2, 704.2),
+    ('arabika', 'Сальвадор SHG EP', '250 г', 325.0, 241.0, 221.0, 205.6, 195.4),
+    ('arabika', 'Руанда Тропікал Кофі', '1 кг', 1074.0, 814.0, 767.0, 707.0, 652.0),
+    ('arabika', 'Руанда Тропікал Кофі', '250 г', 302.0, 229.0, 211.0, 196.0, 182.0),
+    ('arabika', 'Руанда Бахо', '1 кг', 1088.0, 807.0, 763.0, 692.0, 647.8),
+    ('arabika', 'Руанда Бахо', '250 г', 305.0, 227.0, 212.0, 194.0, 181.3),
+    ('arabika', 'Колумбія Infuse Ripe Cherry', '1 кг', 1331.0, 1005.0, 943.0, 953.0, 753.0),
+    ('arabika', 'Колумбія Infuse Ripe Cherry', '250 г', 368.0, 278.0, 256.0, 234.0, 208.0),
+    ('palay', 'Палай - Гондурас №34 Montecillos', '1 кг', 1632.0, 1077.0, 970.0, 934.0, 753.0),
+    ('palay', 'Палай - Гондурас №34 Montecillos', '250 г', 466.0, 308.0, 277.0, 267.0, 220.0),
+    ('palay', 'Палай - Руанда №30 Cyato', '1 кг', 1832.0, 1210.0, 1089.0, 1048.0, 841.0),
+    ('palay', 'Палай - Руанда №30 Cyato', '250 г', 516.0, 341.0, 306.0, 295.0, 242.0),
+    ('palay', 'Палай - Бразилія №31 Boa Vista', '1 кг', 1873.0, 1236.0, 1113.0, 1072.0, 859.0),
+    ('palay', 'Палай - Бразилія №31 Boa Vista', '250 г', 526.0, 347.0, 313.0, 301.0, 247.0),
+    ('palay', 'Палай - Гондурас №33 Volcano natural', '1 кг', 1988.0, 1312.0, 1181.0, 1137.0, 910.0),
+    ('palay', 'Палай - Гондурас №33 Volcano natural', '250 г', 555.0, 366.0, 330.0, 317.0, 259.0),
+    ('palay', 'Палай - Мікролот Колумбія №28 Pink Bourbon Mosto Recirculated', '250 г', 1034.0, 690.0, 674.0, 664.0, 546.0),
+    ('palay', 'Палай - Мікролот Колумбія №28 Pink Bourbon Mosto Recirculated', '40 г', 223.0, 149.0, 146.0, 143.0, 125.0),
+    ('palay', 'Палай - Мікролот Колумбія №29 Caturra Mosto Dragon Fruit', '250 г', 1049.0, 700.0, 684.0, 674.0, 554.0),
+    ('palay', 'Палай - Мікролот Колумбія №29 Caturra Mosto Dragon Fruit', '40 г', 226.0, 151.0, 148.0, 145.0, 127.0),
+    ('palay', 'Палай - Сальвадор №19 ACALEM', '1 кг', 1925.0, 1237.0, 1202.0, 1142.0, 987.0),
+    ('palay', 'Палай - Сальвадор №19 ACALEM', '250 г', 533.0, 342.0, 331.0, 316.0, 278.0),
+    ('palay', 'Палай - Кенія Tiriku', '1 кг', 1480.0, 1026.0, 895.0, 885.0, 705.0),
+    ('palay', 'Палай - Кенія Tiriku', '250 г', 435.0, 295.0, 266.0, 256.0, 211.0),
+    ('palay', 'Палай - Танзанія Edelweiss Oldeani Est.', '1 кг', 1450.0, 1036.0, 889.0, 829.0, 726.0),
+    ('palay', 'Палай - Танзанія Edelweiss Oldeani Est.', '250 г', 430.0, 297.0, 253.0, 238.0, 213.0),
+    ('drip', 'Палай - Дріп Колумбія №26 EL MIRADOR - T-SHOK', 'шт', 42.0, 30.0, 30.0, 26.0, 23.0),
+    ('drip', 'Палай - Дріп Колумбія №26 EL MIRADOR', 'упаковка', 327.0, 230.0, 216.0, 201.0, 179.0),
+    ('drip', 'Палай - Дріп Колумбія №27 Decaf Cane Sugar', 'шт', 37.0, 26.0, 26.0, 23.0, 20.0),
+    ('drip', 'Палай - Дріп Колумбія №27 Decaf Cane Sugar', 'упаковка', 294.0, 207.0, 194.0, 181.0, 164.0),
+    ('drip', 'Палай - Дріп Сальвадор №19 ACALEM', 'шт', 39.0, 27.0, 27.0, 24.0, 21.0),
+    ('drip', 'Палай - Дріп Сальвадор №19 ACALEM', 'упаковка', 381.0, 268.0, 251.0, 235.0, 203.0),
+    ('drip', 'Палай - Дріп Ефіопія №23 Yirgacheffe Idido', 'шт', 38.0, 27.0, 27.0, 23.0, 21.0),
+    ('drip', 'Палай - Дріп Ефіопія №23 Yirgacheffe Idido', 'упаковка', 370.0, 261.0, 244.0, 228.0, 198.0),
+    ('drip', 'Палай - Дріп Кенія №22 GAKUYUINI', 'шт', 38.0, 27.0, 27.0, 23.0, 21.0),
+    ('drip', 'Палай - Дріп Кенія №22 GAKUYUINI', 'упаковка', 370.0, 261.0, 244.0, 228.0, 198.0),
+    ('drip', 'Палай - Мікс Дріп №2', 'упаковка', 293.0, 206.0, 193.0, 180.0, 164.0),
+    ('drip', 'Tvoi - Дріп Сальвадор', 'шт', 34.0, 24.0, 24.0, 21.0, 19.0),
+    ('drip', 'Tvoi - Дріп Сальвадор', 'упаковка', 222.0, 157.0, 147.0, 137.0, 133.0),
+    ('drip', 'Tvoi - Дріп Сідамо', 'шт', 33.0, 23.0, 23.0, 20.0, 18.0),
+    ('drip', 'Tvoi - Дріп Сідамо', 'упаковка', 213.0, 150.0, 140.0, 131.0, 129.0),
+    ('drip', 'Tvoi - Дріп Колумбія', 'шт', 34.0, 24.0, 24.0, 21.0, 19.0),
+    ('drip', 'Tvoi - Дріп Колумбія', 'упаковка', 221.0, 156.0, 146.0, 136.0, 132.0),
+    ('drip', 'Tvoi - Tasting Pack', 'упаковка', 218.0, 153.0, 144.0, 134.0, 131.0),
+    ('blend', 'Бленд Арабіки Diamond', '1 кг', 961.0, 721.0, 692.0, 632.0, 587.0),
+    ('blend', 'Бленд Арабіки Diamond', '250 г', 274.0, 206.0, 193.0, 178.0, 166.0),
+    ('blend', 'Бленд Арабіки Sapphire', '1 кг', 1082.0, 802.0, 757.0, 697.0, 657.0),
+    ('blend', 'Бленд Арабіки Sapphire', '250 г', 304.0, 226.0, 209.0, 194.0, 183.0),
+    ('blend', 'Бленд Арабіки Ruby', '1 кг', 979.0, 725.0, 697.0, 637.0, 597.0),
+    ('blend', 'Бленд Арабіки Ruby', '250 г', 278.0, 206.0, 194.0, 179.0, 169.0),
+    ('blend', 'Бленд Black', '1 кг', 770.0, 549.0, 555.0, 497.0, 457.0),
+    ('blend', 'Бленд Black', '250 г', 218.0, 155.0, 155.0, 140.0, 130.0),
+    ('blend', 'Бленд Black Classic', '1 кг', 770.0, 549.0, 543.0, 497.0, 457.0),
+    ('blend', 'Бленд Black Classic', '250 г', 218.0, 155.0, 151.0, 140.0, 130.0),
+    ('blend', 'Бленд Brown', '1 кг', 879.0, 651.0, 640.0, 580.0, 540.0),
+    ('blend', 'Бленд Brown', '250 г', 247.0, 185.0, 177.0, 162.0, 150.0),
+    ('blend', 'Бленд Brown Classic', '1 кг', 866.0, 642.0, 632.0, 572.0, 532.0),
+    ('blend', 'Бленд Brown Classic', '250 г', 244.0, 181.0, 174.0, 159.0, 149.0),
+    ('blend', 'Бленд Crimson Classic', '1 кг', 786.0, 582.0, 586.0, 526.0, 486.0),
+    ('blend', 'Бленд Crimson Classic', '250 г', 225.0, 171.0, 162.0, 151.0, 138.0),
+    ('blend', 'Бленд Amber', '1 кг', 939.0, 696.0, 674.0, 614.0, 574.0),
+    ('blend', 'Бленд Amber', '250 г', 262.0, 198.0, 187.0, 172.0, 159.0),
+    ('blend', 'Бленд Amber Classic', '1 кг', 929.0, 688.0, 668.0, 608.0, 568.0),
+    ('blend', 'Бленд Amber Classic', '250 г', 259.0, 195.0, 184.0, 169.0, 158.0),
+    ('blend', 'Бленд Velvet', '1 кг', 906.0, 681.0, 661.0, 601.0, 555.0),
+    ('blend', 'Бленд Velvet', '250 г', 258.0, 196.0, 185.0, 170.0, 157.0),
+    ('blend', 'Бленд Velvet Classic', '1 кг', 873.0, 647.0, 636.0, 576.0, 536.0),
+    ('blend', 'Бленд Velvet Classic', '250 г', 245.0, 182.0, 175.0, 160.0, 150.0),
+    ('blend', 'Бленд Ivory', '1 кг', 969.0, 718.0, 692.0, 632.0, 592.0),
+    ('blend', 'Бленд Ivory', '250 г', 269.0, 210.0, 204.0, 191.0, 176.0),
+    ('blend', 'Бленд Ivory Classic', '1 кг', 969.0, 718.0, 692.0, 632.0, 592.0),
+    ('blend', 'Бленд Ivory Classic', '250 г', 269.0, 210.0, 204.0, 191.0, 176.0),
+    ('arabika', "Робуста В'єтнам WP 18", '1 кг', 705.0, 522.0, 525.0, 480.0, 440.0),
+    ('arabika', "Робуста В'єтнам WP 18", '250 г', 203.0, 151.0, 152.0, 137.0, 125.0),
+    ('arabika', 'Робуста Індія Черрі АА', '1 кг', 726.0, 560.0, 552.0, 492.0, 452.0),
+    ('arabika', 'Робуста Індія Черрі АА', '250 г', 209.0, 159.0, 155.0, 144.0, 128.0),
+    ('suputni', 'Хімія рідка "Оптімал" від кавових масел 1 л', 'шт', 260.0, 240.0, 240.0, 220.0, 200.0),
+    ('suputni', 'Хімія рідка "Оптімал" для молочних систем 1 л', 'шт', 260.0, 240.0, 240.0, 220.0, 200.0),
+    ('suputni', 'Порошок "Coffein Clean" від кавових масел 900г', 'шт', 319.0, 269.0, 269.0, 269.0, 249.0),
+    ('suputni', 'HARIO BOX V60 паперові фільтри - 01 - 40шт', 'шт', 112.0, 110.0, 110.0, 110.0, 110.0),
+    ('suputni', 'HARIO BOX V60 паперові фільтри - 02 - 40шт', 'шт', 132.0, 110.0, 110.0, 110.0, 100.0),
+    ('suputni', 'HARIO V60 білі фільтри Набір 100 шт - Білий, 02', 'шт', 220.0, 220.0, 220.0, 220.0, 220.0),
+    ('suputni', 'Фільтри Bravilor (Mondo|Novo|Matic) 50 шт.', 'шт', 100.0, 90.0, 90.0, 90.0, 80.0),
+    ('suputni', 'Фільтри Bravilor (Mondo|Novo|Matic) 250 шт.', 'шт', 440.0, 405.0, 405.0, 405.0, 405.0),
+    ('suputni', 'Фільтри Bravilor (Mondo|Novo|Matic) 1000 шт.', 'шт', 1499.0, 1499.0, 1499.0, 1499.0, 1499.0),
+    ('suputni', 'Пітчер для молока, 350 мл, срібний', 'шт', 400.0, 360.0, 360.0, 360.0, 360.0),
+    ('suputni', 'Пітчер для молока, 600 мл, срібний', 'шт', 470.0, 440.0, 440.0, 440.0, 440.0),
+    ('suputni', 'Щітка для чищення групи кавомашини VD, чорна', 'шт', 110.0, 95.0, 95.0, 95.0, 95.0),
+    ('suputni', 'Щітка для чищення групи кавомашини VD big brush', 'шт', 150.0, 135.0, 135.0, 135.0, 135.0),
+    ('suputni', 'Темпер VD Coffee Classic чорний 53 мм', 'шт', 590.0, 530.0, 530.0, 530.0, 530.0),
+    ('suputni', 'Темпер VD Coffee Classic чорний 58 мм', 'шт', 590.0, 530.0, 530.0, 530.0, 530.0),
+    ('suputni', 'Килимок кутовий VD Coffee Small', 'шт', 230.0, 215.0, 215.0, 215.0, 215.0),
+    ('suputni', 'Килимок кутовий VD Coffee', 'шт', 350.0, 310.0, 310.0, 310.0, 310.0),
+    ('suputni', 'Сито сліпе 54-58', 'шт', 120.0, 95.0, 95.0, 95.0, 85.0),
+]
+
+
 # Повне оновлення прайсу (повний PDF) - структура (category, item_name, unit, roz, p20, p50, p100, p300)
 PRICE_UPDATE_FULL_V2 = [
     ('arabika', 'Без Кофеїну Колумбія', '1 кг', 1506.0, 1116.0, 1000.0, 940.0, 900.0),
@@ -8122,6 +7924,47 @@ def _seed_item_prices_if_empty():
         _set_setting("remove_sold_out_palay_v1", "1")
         logger.info("[PRICE-REMOVE] Прибрано з прайсу й асортименту Палай: Кенія 22, Бурунді 20, Колумбія 27, Індонезія 24.")
 
+    # Оновлення цін за прайсом від 12.11.2026 (PDF «повний»). Пише ЛИШЕ в item_prices (загальний прайс):
+    # індивідуальні ціни клієнтів (client_item_prices) не чіпає, позиції, яких немає в новому прайсі, не видаляє.
+    if _get_setting("price_update_20261112", "") != "1":
+        for cat, base, unit, roz, p20, p50, p100, p300 in PRICE_UPDATE_20261112:
+            for tier, price in (("Роздріб", roz), ("20 кг", p20), ("50 кг", p50), ("100 кг", p100), ("300 кг", p300)):
+                conn.execute(
+                    "INSERT INTO item_prices (category, item_name, unit, tier, price) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(category, item_name, unit, tier) DO UPDATE SET price=excluded.price",
+                    (cat, base, unit, tier, price),
+                )
+        # Орієнтовна ціна за 1 шт для наборів (ціна упаковки з 6 шт ÷ 6) - перераховуємо за новими цінами упаковок
+        for base in ("Палай - Мікс Дріп №2", "Tvoi - Tasting Pack"):
+            for tier in PRICE_TIERS:
+                pack = conn.execute(
+                    "SELECT price FROM item_prices WHERE category='drip' AND item_name=? AND unit='упаковка' AND tier=?",
+                    (base, tier),
+                ).fetchone()
+                if pack:
+                    conn.execute(
+                        "INSERT INTO item_prices (category, item_name, unit, tier, price) VALUES ('drip', ?, 'шт', ?, ?) "
+                        "ON CONFLICT(category, item_name, unit, tier) DO UPDATE SET price=excluded.price",
+                        (base, tier, round(pack["price"] / 6, 1)),
+                    )
+        conn.commit()
+        _set_setting("price_update_20261112", "1")
+        logger.info(f"[PRICE-UPDATE-20261112] Оновлено ціни: {len(PRICE_UPDATE_20261112)} позицій (тільки item_prices).")
+
+    # Позицій, яких немає в прайсі від 12.11.2026, у боті теж не лишаємо: прибираємо ціни (усі ваги й тарифи)
+    # і рядки з тексту асортименту. Індивідуальні ціни клієнтів не чіпаємо.
+    if _get_setting("remove_not_in_price_20261112", "") != "1":
+        for cat, key in (("arabika", "Apricot Brandy"), ("palay", "Gedeo")):
+            conn.execute("DELETE FROM item_prices WHERE category=? AND item_name LIKE ?", (cat, f"%{key}%"))
+        conn.commit()
+        for setting_key, key in (("assortment_arabika", "Apricot Brandy"), ("assortment_palay", "Gedeo")):
+            current = _get_setting(setting_key, "")
+            if current:
+                kept = [ln for ln in current.split("\n") if key.lower() not in ln.lower()]
+                _set_setting(setting_key, "\n".join(kept))
+        _set_setting("remove_not_in_price_20261112", "1")
+        logger.info("[PRICE-REMOVE] Прибрано з прайсу й асортименту: Infuse Apricot Brandy, Палай Ефіопія №32 Gedeo.")
+
     conn.close()
 
 
@@ -8129,821 +7972,6 @@ async def load_all_on_startup(application: Application):
     _seed_item_prices_if_empty()
     await load_schedules_on_startup(application)
     await load_broadcasts_on_startup(application)
-
-
-# ============================================================================================
-# ФОП та рахунки на оплату
-# Нумерацію рахунків бот НЕ веде: номер вводить адмін (з власного обліку). Реквізити ФОП
-# зберігаються в базі й редагуються через меню бота (⚙️ Налаштування → 🏢 Реквізити ФОП).
-# ============================================================================================
-FOP_TEMPLATE = (
-    "Назва: ФОП Прізвище Ім'я По батькові\n"
-    "ІПН/ЄДРПОУ: 10 цифр (для ФОП) або 8 цифр (для ТОВ)\n"
-    "IBAN: UA і ще 27 цифр\n"
-    "Банк: назва банку\n"
-    "Примітка: (необов'язково) наприклад, платник єдиного податку, без ПДВ"
-)
-_NO_FOP_WORDS = {"", "немає", "нема", "-", "—", "ні", "no", "none"}
-
-
-def _valid_iban(raw: str):
-    """Повертає IBAN без пробілів, якщо він коректний (UA + 27 цифр + збігаються контрольні
-    цифри mod 97), інакше None. Так відловлюються друкарські помилки в номері."""
-    s = re.sub(r"\s+", "", raw or "").upper()
-    if not re.fullmatch(r"UA\d{27}", s):
-        return None
-    rearranged = s[4:] + s[:4]
-    try:
-        number = int("".join(str(int(ch, 36)) for ch in rearranged))
-    except ValueError:
-        return None
-    return s if number % 97 == 1 else None
-
-
-_QUOTE_CHARS = '"“”«»„‟'
-_TAX_KEYWORDS = r"(?:ДРФО|[ІI]ПН|РНОКПП|[ЄЕ]ДРПОУ|ідентифікаційний\s+код|код)"
-
-
-def _clean_name(s: str) -> str:
-    # Прибирає зайві лапки на початку; кінцеві - лише якщо лапок непарна кількість (не ламає ТОВ "Назва").
-    s = re.sub(r"\s+", " ", s).strip(" ,;.")
-    s = s.lstrip(_QUOTE_CHARS + " ")
-    if sum(ch in _QUOTE_CHARS for ch in s) % 2 == 1:
-        s = s.rstrip(_QUOTE_CHARS + " ")
-    return s
-
-
-def _normalize_bank(raw: str) -> str:
-    # Склеює рядки та зводить подвоєні лапки до «…»: назва банку з кількох рядків стає однією.
-    b = re.sub(r"\s+", " ", raw)
-    b = re.sub(r'["“”«»„‟]+\s*([^"“”«»„‟]+?)\s*["“”«»„‟]+', r"«\1»", b)
-    b = re.sub(r'["“”„‟]', "", b)
-    return b.strip(" ,;")
-
-
-def _freeform_fop_fields(text: str) -> dict:
-    """Шукає реквізити у вільному тексті, скопійованому з рахунку (без слів-ключів-шаблону):
-    ФОП/ТОВ із назвою, код (ДРФО/ІПН/ЄДРПОУ), IBAN, банк, МФО, примітку про податки."""
-    out = {}
-    # IBAN: UA + 27 цифр, можливо з пробілами та словом «IBAN» перед ним; бувають кирилична А чи У
-    m = re.search(r"[UuУу][AaАа][ \t]*\d{2}(?:[ \t]*\d){25}(?!\d)", text)
-    if m:
-        out["iban"] = "UA" + re.sub(r"\D", "", m.group(0))
-    rest = (text[:m.start()] + " " + text[m.end():]) if m else text
-    # код: після слова-ключа, інакше - окреме число з 10 або 8 цифр
-    m2 = re.search(_TAX_KEYWORDS + r"[^\d\n]{0,30}?(?<!\d)(\d{10}|\d{8})(?!\d)", rest, re.I)
-    if m2:
-        out["tax_id"] = m2.group(1)
-    else:
-        nums = re.findall(r"(?<!\d)(\d{10}|\d{8})(?!\d)", rest)
-        if nums:
-            out["tax_id"] = nums[0]
-    # назва: перший рядок із ФОП/ТОВ/ПП; інакше - перший рядок без цифр
-    for raw in text.splitlines():
-        # IBAN з рядка прибираємо, щоб він не потрапив у назву (якщо все написано в один рядок)
-        line = re.sub(r"[UuУу][AaАа][ \t]*\d{2}(?:[ \t]*\d){25}", " ", raw.strip())
-        m3 = re.search(r"(?i)(?<![\w])(ФОП|ФО-П|ТОВ|ПП)(?![\w]).*", line)
-        if m3:
-            cand = re.split(r"(?i)[,;]|\s(?:код|[ІI]ПН|ДРФО|[ЄЕ]ДРПОУ|РНОКПП|IBAN|Р/р)(?![\w])", m3.group(0))[0]
-            name = _clean_name(cand)
-            if name:
-                out["name"] = name
-                break
-    if "name" not in out:
-        for raw in text.splitlines():
-            line = raw.strip(_QUOTE_CHARS + " \t")
-            if line and not re.search(r"\d", line) and ":" not in line and len(line) <= 80:
-                out["name"] = _clean_name(line)
-                break
-    # банк (може бути розбитий на кілька рядків) і МФО
-    mb = re.search(r"(?<![\w])Банк\s*:\s*(.+?)(?=\s*,?\s*МФО|\n\s*(?:ІПН|код|IBAN|Р/р|Назва|Примітка)|\Z)", text, re.I | re.S)
-    mfo = re.search(r"МФО\s*:?\s*(\d{6})", text, re.I)
-    bank = _normalize_bank(mb.group(1)) if mb else ""
-    if not re.search(r"[A-Za-zА-Яа-яІіЇїЄєҐґ]{2,}", bank):
-        bank = ""
-    if not bank:
-        # слова «Банк:» нема - шукаємо рядок, схожий на назву банку (АТ КБ «ПРИВАТБАНК», ПАТ…, …БАНК…)
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line or re.search(r"(?i)(?<![\w])(ФОП|ФО-П|ТОВ|ПП)(?![\w])", line):
-                continue
-            cand = re.sub(r"[UuУу][AaАа][ \t]*\d{2}(?:[ \t]*\d){25}", " ", line)
-            cand = re.sub(r"(?i)(?<![\w])(Р/р|IBAN|рахунок)(?![\w])\s*:?", " ", cand)
-            cand = re.split(r"(?i),?\s*МФО", cand)[0]
-            cand = re.sub(r"(?i)^\W*(в|у)\s+", "", cand)
-            cand = re.sub(r"(?i)^\W*Банк(?![\w])\s*:?\s+(?=\S)", "", cand)
-            cand = _normalize_bank(cand)
-            if not cand or cand.endswith(":") or re.search(r"(?i)реквізит|платник|пдв", cand):
-                continue
-            if re.search(r"(?i)банк", cand) or re.match(r"(?i)\s*(ПрАТ|ПАТ|АКБ|АТ|КБ|АБ)(?![\w])", cand):
-                bank = cand
-                break
-    if bank:
-        if mfo and mfo.group(1) not in bank:
-            bank += f", МФО {mfo.group(1)}"
-        out["bank"] = bank
-    # примітка про податки
-    for raw in text.splitlines():
-        line = raw.strip(_QUOTE_CHARS + " \t")
-        if re.search(r"(?i)\bпдв\b|платник|єдин\w*\s+податк", line) and not re.search(r"IBAN|[UuУу][AaАа]\s*\d{2}", line):
-            out["note"] = re.sub(r"\s+", " ", line).strip(" ,;")
-            break
-    return out
-
-
-def _parse_fop_template(text: str):
-    """Розбирає реквізити ФОП. Працює і за шаблоном («Назва: …», «IBAN: …»), і з тексту, вставленого
-    з рахунку як є (бот сам знаходить ФОП, код, IBAN, банк). Повертає (дані, список_помилок)."""
-    data = {"name": None, "tax_id": None, "iban": None, "bank": None, "note": None}
-    for raw in (text or "").splitlines():
-        if ":" not in raw:
-            continue
-        key, value = raw.split(":", 1)
-        k = re.sub(r"[\s./'’]", "", key.lower())
-        v = value.strip().strip(_QUOTE_CHARS + " ")
-        if not v:
-            continue
-        if k.startswith(("назв", "фоп", "отримув")):
-            data["name"] = _clean_name(value)
-        elif k.startswith(("іпн", "ipn", "єдрпоу", "едрпоу", "код", "рнокпп")):
-            data["tax_id"] = v
-        elif k.startswith(("iban", "іban", "рр", "рахун")):
-            data["iban"] = v
-        elif k.startswith("банк"):
-            data["bank"] = _normalize_bank(value)
-        elif k.startswith(("примітк", "статус", "подат", "пдв")):
-            data["note"] = v
-    if not all(data.values()):
-        free = _freeform_fop_fields(text or "")
-        for key, val in free.items():
-            if not data.get(key):
-                data[key] = val
-    errors = []
-    if not data["name"]:
-        errors.append("не знайшла назву (рядок з «ФОП Прізвище Ім'я По батькові»)")
-    tid = re.sub(r"\s+", "", data["tax_id"] or "")
-    if not tid:
-        errors.append("не знайшла код (ІПН/ДРФО/ЄДРПОУ — 10 або 8 цифр)")
-    elif not (tid.isdigit() and len(tid) in (8, 10)):
-        errors.append("код ІПН має містити 10 цифр, а ЄДРПОУ — 8 цифр")
-    else:
-        data["tax_id"] = tid
-    if not data["iban"]:
-        errors.append("не знайшла IBAN (UA і ще 27 цифр)")
-    else:
-        iban = _valid_iban(data["iban"])
-        if not iban:
-            errors.append(
-                "IBAN некоректний: має бути UA і 27 цифр, а контрольні цифри мають сходитись — "
-                "перевірте, чи немає помилки в номері"
-            )
-        else:
-            data["iban"] = iban
-    return data, errors
-
-
-def _fop_short_name(name: str) -> str:
-    """«ФОП Миколенко Андрій Олегович» -> «ФОП Миколенко А.О.» (для кнопок і списків).
-    Інші назви (ТОВ тощо) лишаються як є, лише обрізаються, якщо задовгі."""
-    name = (name or "").strip()
-    m = re.fullmatch(r"(?i)ФОП\s+(\S+)\s+(\S+)(?:\s+(\S+))?", name)
-    if m and m.group(1)[0].isalpha() and m.group(2)[0].isalpha() and "." not in m.group(2) \
-            and (not m.group(3) or m.group(3)[0].isalpha()):
-        initials = m.group(2)[0].upper() + "."
-        if m.group(3):
-            initials += m.group(3)[0].upper() + "."
-        return f"ФОП {m.group(1)} {initials}"
-    return name if len(name) <= 40 else name[:37] + "…"
-
-
-def _fop_template_text(fop: dict) -> str:
-    return (
-        f"Назва: {fop['name']}\n"
-        f"ІПН/ЄДРПОУ: {fop['tax_id']}\n"
-        f"IBAN: {fop['iban']}\n"
-        f"Банк: {fop.get('bank') or ''}\n"
-        f"Примітка: {fop.get('note') or ''}"
-    )
-
-
-def _get_fop(fop_id):
-    if not fop_id:
-        return None
-    conn = db()
-    row = conn.execute("SELECT * FROM fops WHERE id=?", (fop_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def _list_fops() -> list:
-    conn = db()
-    rows = conn.execute("SELECT * FROM fops ORDER BY id").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def _default_fop_id():
-    v = _get_setting("default_fop_id", "")
-    return int(v) if v.isdigit() else None
-
-
-def _client_fop_id(chat_id):
-    """ФОП, на який цей клієнт платить: призначений йому, а якщо нема - основний."""
-    conn = db()
-    row = conn.execute("SELECT fop_id FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
-    conn.close()
-    fid = row["fop_id"] if row and row["fop_id"] else None
-    if fid and _get_fop(fid):
-        return fid
-    d = _default_fop_id()
-    return d if d and _get_fop(d) else None
-
-
-def _money(x) -> str:
-    return f"{float(x):,.2f}".replace(",", " ")
-
-
-def _fop_view_screen(fop_id: int):
-    fop = _get_fop(fop_id)
-    if not fop:
-        return "ФОП не знайдено.", _menu_back_keyboard()
-    conn = db()
-    n = conn.execute("SELECT COUNT(*) c FROM subscribers WHERE fop_id=? AND active=1", (fop_id,)).fetchone()["c"]
-    conn.close()
-    is_default = _default_fop_id() == fop_id
-    text = (
-        f"🏢 <b>{_esc(fop['name'])}</b>{' ⭐ основний' if is_default else ''}\n\n"
-        f"ІПН/ЄДРПОУ: {_esc(fop['tax_id'])}\n"
-        f"IBAN: <code>{_esc(fop['iban'])}</code>\n"
-        f"Банк: {_esc(fop.get('bank') or '—')}\n"
-        f"Примітка: {_esc(fop.get('note') or '—')}\n\n"
-        f"Закріплено клієнтів: {n}"
-    )
-    buttons = [[InlineKeyboardButton("✏️ Редагувати", callback_data=f"menu_fopedit:{fop_id}")]]
-    if not is_default:
-        buttons.append([InlineKeyboardButton("⭐ Зробити основним", callback_data=f"menu_fopdefault:{fop_id}")])
-    buttons.append([InlineKeyboardButton("🗑 Видалити", callback_data=f"menu_fopdel:{fop_id}")])
-    buttons.append([InlineKeyboardButton("🔙 До списку ФОП", callback_data="menu_fops")])
-    return text, InlineKeyboardMarkup(buttons)
-
-
-def _invoice_payer_lines(profile: dict) -> list:
-    own = (profile.get("fop") or "").strip()
-    point = (profile.get("point_name") or "").strip()
-    person = (profile.get("full_name") or "").strip()
-    payer = own if own.lower() not in _NO_FOP_WORDS else (person or point or "—")
-    lines = [f"<b>Платник:</b> {_esc(payer)}"]
-    if point and point.lower() != payer.lower():
-        lines.append(f"Заклад: {_esc(point)}")
-    return lines
-
-
-def _is_cash_payment(method) -> bool:
-    """Чи це готівкова оплата («Готівка»; «Безготівковий» - ні)."""
-    return (method or "").strip().lower().startswith("готівк")
-
-
-def _build_invoice(order_row, fop: dict, number: str, issue_date: str, profile: dict, client_chat_id, cash: bool = False):
-    """Складає текст рахунку (HTML) із підтвердженого замовлення. Повертає (текст, сума, попередження).
-    Для готівкового рахунку замість реквізитів ФОП друкується просто слово «Готівка»."""
-    try:
-        items = json.loads(order_row["items_json"] or "[]")
-    except (json.JSONDecodeError, TypeError):
-        items = []
-    warnings, lines, items_total = [], [], 0.0
-    for i, it in enumerate(items, 1):
-        name = it.get("item_text") or "—"
-        weight = it.get("weight") or "—"
-        price = it.get("price")
-        try:
-            q = float(str(it.get("qty")).replace(",", "."))
-        except (TypeError, ValueError):
-            q = None
-        if price is None or q is None:
-            warnings.append(f"позиція {i} («{name}») без ціни або з нечисловою кількістю — суму не пораховано")
-            lines.append(f"{i}) {_esc(name)}, {_esc(weight)} × {_esc(it.get('qty'))}")
-            continue
-        line_total = round(float(price) * q, 2)
-        items_total += line_total
-        lines.append(f"{i}) {_esc(name)}, {_esc(weight)} × {q:g} по {_money(price)} = {_money(line_total)} грн")
-    if not items:
-        warnings.append("у замовленні немає позицій")
-    fee = _order_delivery_fee({"items": items, "client_chat_id": client_chat_id}, profile)
-    total = round(items_total + fee, 2)
-
-    header = f"🧾 <b>Рахунок на оплату № {_esc(number)}</b> від {issue_date}"
-    if cash:
-        out = [header, "", "<b>Готівка</b>"]
-    else:
-        purpose = f"Оплата за товар згідно рахунку № {number} від {issue_date}"
-        if fop.get("note"):
-            purpose += f". {fop['note']}"
-        out = [
-            header,
-            "",
-            "<b>Отримувач:</b>",
-            _esc(fop["name"]),
-            f"ІПН/ЄДРПОУ: {_esc(fop['tax_id'])}",
-            f"IBAN: <code>{_esc(fop['iban'])}</code>",
-        ]
-        if fop.get("bank"):
-            out.append(f"Банк: {_esc(fop['bank'])}")
-    out += [""] + _invoice_payer_lines(profile) + ["", "<b>Позиції:</b>"] + lines
-    if fee:
-        out.append(f"Доставка — {_money(fee)} грн")
-    out += ["", f"<b>Разом до сплати: {_money(total)} грн</b>"]
-    if not cash:
-        out += ["", f"<b>Призначення платежу:</b> {_esc(purpose)}"]
-    return "\n".join(out), total, warnings
-
-
-def _invoice_number_taken(fop_id, number: str, order_id, invoice_id=None):
-    """Чи вже є рахунок із таким номером для цього ФОП в ІНШОМУ замовленні."""
-    conn = db()
-    rows = conn.execute(
-        "SELECT id, order_id, number FROM invoices WHERE fop_id=? AND status!='cancelled'", (fop_id,)
-    ).fetchall()
-    conn.close()
-    for r in rows:
-        if r["number"].strip().lower() == number.strip().lower() and r["order_id"] != order_id and r["id"] != invoice_id:
-            return dict(r)
-    return None
-
-
-async def _invoice_ask_number(context, admin_id: int, st: dict, renumber: bool = False):
-    fop = _get_fop(st["fop_id"])
-    profile = _get_client_profile(st["client_chat_id"]) or {}
-    conn = db()
-    order_row = conn.execute("SELECT * FROM orders WHERE id=?", (st["order_id"],)).fetchone()
-    prev = conn.execute(
-        "SELECT number FROM invoices WHERE order_id=? AND status='sent' ORDER BY id DESC LIMIT 1", (st["order_id"],)
-    ).fetchone()
-    conn.close()
-    _, total, _ = _build_invoice(order_row, fop, "…", "…", profile, st["client_chat_id"])
-    who = profile.get("point_name") or profile.get("full_name") or str(st["client_chat_id"])
-    lines = [
-        f"🧾 Рахунок для: {who}",
-        f"ФОП: {_fop_short_name(fop['name'])}",
-        f"Сума: {_money(total)} грн",
-    ]
-    if prev:
-        lines.append(f"ℹ️ Для цього замовлення вже надсилався рахунок № {prev['number']}.")
-    lines += ["", ("Введіть новий номер рахунку:" if renumber else "Введіть номер рахунку (як у вашому обліку):")]
-    await context.bot.send_message(
-        admin_id, "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="inv_abort")]]),
-    )
-
-
-async def _invoice_start(context, admin_id: int, group_chat_id, message_id, order_id, client_chat_id):
-    conn = db()
-    order_row = conn.execute("SELECT id FROM orders WHERE id=?", (order_id,)).fetchone()
-    conn.close()
-    if not order_row:
-        await context.bot.send_message(admin_id, "Не знайшла це замовлення в базі, рахунок виставити не можна.")
-        return
-    fops = _list_fops()
-    if not fops:
-        await context.bot.send_message(
-            admin_id, "Спершу додайте реквізити ФОП: ⚙️ Налаштування → 🏢 Реквізити ФОП."
-        )
-        return
-    st = {
-        "order_id": order_id, "client_chat_id": client_chat_id,
-        "group_chat_id": group_chat_id, "group_message_id": message_id,
-        "fop_id": _client_fop_id(client_chat_id),
-    }
-    if not st["fop_id"]:
-        st["stage"] = "fop"
-        INVOICE_PENDING[admin_id] = st
-        buttons = [[InlineKeyboardButton(_fop_short_name(f["name"]), callback_data=f"inv_pickfop:{f['id']}")] for f in fops]
-        buttons.append([InlineKeyboardButton("❌ Скасувати", callback_data="inv_abort")])
-        await context.bot.send_message(
-            admin_id,
-            "За цим клієнтом ще не закріплено ФОП. Оберіть, на який ФОП виставити рахунок "
-            "(вибір збережеться для цього клієнта):",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return
-    st["stage"] = "number"
-    INVOICE_PENDING[admin_id] = st
-    await _invoice_ask_number(context, admin_id, st)
-
-
-async def grouporder_invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка «🧾 Рахунок» під замовленням у групі: далі все відбувається в особистих повідомленнях."""
-    query = update.callback_query
-    user = update.effective_user
-    if not user or user.id not in ADMIN_IDS:
-        await query.answer("Тільки адміністратор може виставляти рахунок.", show_alert=True)
-        return
-    _, msg_id_str = query.data.split(":", 1)
-    group_chat_id = update.effective_chat.id
-    conn = db()
-    row = conn.execute(
-        "SELECT order_id, client_chat_id FROM order_messages WHERE group_chat_id=? AND message_id=?",
-        (group_chat_id, int(msg_id_str)),
-    ).fetchone()
-    conn.close()
-    if not row:
-        await query.answer(
-            "Для цього замовлення рахунок із бота виставити не можна (воно створене до оновлення).",
-            show_alert=True,
-        )
-        return
-    try:
-        await _invoice_start(context, user.id, group_chat_id, int(msg_id_str), row["order_id"], row["client_chat_id"])
-    except Exception as e:
-        logger.warning(f"Не вдалось почати виставлення рахунку: {e}")
-        INVOICE_PENDING.pop(user.id, None)
-        await query.answer("Спочатку напишіть боту в особисті хоча б /start, потім спробуйте ще раз.", show_alert=True)
-        return
-    await query.answer("Продовжіть у приватних повідомленнях з ботом 👇")
-
-
-def _invoice_preview(inv_id: int, text: str, warnings: list, cash: bool):
-    """Текст і кнопки екрана «Перевірте рахунок перед відправкою»."""
-    warn = ("\n\n⚠️ " + "\n⚠️ ".join(_esc(w) for w in warnings)) if warnings else ""
-    body = (
-        "👀 Перевірте рахунок перед відправкою клієнту:\n\n" + text + warn +
-        "\n\n<i>Рахунок складено за замовленням, яке підтвердив клієнт; правки тексту замовлення "
-        "в групі сюди не потрапляють.</i>"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Надіслати клієнту", callback_data=f"inv_send:{inv_id}")],
-        [InlineKeyboardButton("🏦 Зробити безготівковим" if cash else "💵 Зробити готівковим", callback_data=f"inv_cash:{inv_id}")],
-        [InlineKeyboardButton("✏️ Змінити номер", callback_data=f"inv_renum:{inv_id}")],
-        [InlineKeyboardButton("❌ Скасувати рахунок", callback_data=f"inv_cancel:{inv_id}")],
-    ])
-    return body, kb
-
-
-async def _invoice_make_draft(context, admin_id: int, st: dict, number: str):
-    conn = db()
-    order_row = conn.execute("SELECT * FROM orders WHERE id=?", (st["order_id"],)).fetchone()
-    conn.close()
-    fop = _get_fop(st["fop_id"])
-    profile = _get_client_profile(st["client_chat_id"]) or {}
-    issue_date = datetime.now(TZ).strftime("%d.%m.%Y")
-    # готівка визначається способом оплати в замовленні; при зміні номера лишається те, що було
-    cash = bool(st.get("cash")) if st.get("invoice_id") else _is_cash_payment(order_row["payment_method"])
-    text, total, warnings = _build_invoice(order_row, fop, number, issue_date, profile, st["client_chat_id"], cash=cash)
-    conn = db()
-    if st.get("invoice_id"):
-        conn.execute(
-            "UPDATE invoices SET number=?, text=?, total=?, fop_id=?, cash=?, status='draft' WHERE id=? AND status!='sent'",
-            (number, text, total, st["fop_id"], int(cash), st["invoice_id"]),
-        )
-        inv_id = st["invoice_id"]
-    else:
-        cur = conn.execute(
-            "INSERT INTO invoices (order_id, client_chat_id, fop_id, number, text, total, status, "
-            "group_chat_id, group_message_id, created_at, cash) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
-            (st["order_id"], st["client_chat_id"], st["fop_id"], number, text, total,
-             st["group_chat_id"], st["group_message_id"], datetime.now(TZ).isoformat(), int(cash)),
-        )
-        inv_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    INVOICE_PENDING.pop(admin_id, None)
-    body, kb = _invoice_preview(inv_id, text, warnings, cash)
-    await context.bot.send_message(admin_id, body, parse_mode="HTML", reply_markup=kb)
-
-
-async def handle_invoice_number_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_chat.id
-    st = INVOICE_PENDING.get(admin_id)
-    if not st:
-        return
-    if st.get("stage") != "number":
-        await update.message.reply_text("Спершу оберіть ФОП кнопкою вище (або /cancel).")
-        return
-    number = (update.message.text or "").strip()
-    if not number or len(number) > 40:
-        await update.message.reply_text("Номер має бути коротким (до 40 символів). Надішліть ще раз або /cancel.")
-        return
-    clash = _invoice_number_taken(st["fop_id"], number, st["order_id"], st.get("invoice_id"))
-    if clash:
-        st["pending_number"] = number
-        await update.message.reply_text(
-            f"⚠️ Номер {number} уже використано для цього ФОП в іншому замовленні (замовлення №{clash['order_id']}). "
-            "Використати його знову?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Все одно використати", callback_data="inv_dupok")],
-                [InlineKeyboardButton("✏️ Ввести інший", callback_data="inv_again")],
-                [InlineKeyboardButton("❌ Скасувати", callback_data="inv_abort")],
-            ]),
-        )
-        return
-    await _invoice_make_draft(context, admin_id, st, number)
-
-
-async def invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(update):
-        return
-    admin_id = update.effective_chat.id
-    data = query.data
-
-    if data == "inv_abort":
-        INVOICE_PENDING.pop(admin_id, None)
-        await query.edit_message_text("Скасовано.")
-        return
-
-    if data.startswith("inv_pickfop:"):
-        st = INVOICE_PENDING.get(admin_id)
-        fop = _get_fop(int(data.split(":", 1)[1]))
-        if not st or st.get("stage") != "fop" or not fop:
-            await query.edit_message_text("Ці дані вже неактуальні. Натисніть «🧾 Рахунок» під замовленням ще раз.")
-            return
-        st["fop_id"] = fop["id"]
-        st["stage"] = "number"
-        conn = db()
-        conn.execute("UPDATE subscribers SET fop_id=? WHERE chat_id=?", (fop["id"], st["client_chat_id"]))
-        conn.commit()
-        conn.close()
-        await query.edit_message_text(f"Обрано ФОП: {_fop_short_name(fop['name'])} (закріплено за клієнтом).")
-        await _invoice_ask_number(context, admin_id, st)
-        return
-
-    if data == "inv_again":
-        st = INVOICE_PENDING.get(admin_id)
-        if not st:
-            await query.edit_message_text("Ці дані вже неактуальні.")
-            return
-        st.pop("pending_number", None)
-        await query.edit_message_text("Введіть інший номер рахунку:")
-        return
-
-    if data == "inv_dupok":
-        st = INVOICE_PENDING.get(admin_id)
-        number = st.get("pending_number") if st else None
-        if not st or not number:
-            await query.edit_message_text("Ці дані вже неактуальні.")
-            return
-        await query.edit_message_text(f"Використовую номер {number}.")
-        await _invoice_make_draft(context, admin_id, st, number)
-        return
-
-    if data.startswith("inv_resend:"):
-        conn = db()
-        inv = conn.execute("SELECT * FROM invoices WHERE id=?", (int(data.split(":", 1)[1]),)).fetchone()
-        conn.close()
-        if not inv or inv["status"] != "sent":
-            await context.bot.send_message(admin_id, "Цей рахунок ще не надсилався або не знайдений.")
-            return
-        try:
-            await context.bot.send_message(inv["client_chat_id"], inv["text"] + _invoice_hint(), parse_mode="HTML")
-        except Exception as e:
-            await context.bot.send_message(admin_id, f"❌ Не вдалось надіслати рахунок клієнту: {e}")
-            return
-        await context.bot.send_message(admin_id, f"✅ Рахунок № {inv['number']} повторно надіслано клієнту.")
-        return
-
-    if data.startswith(("inv_send:", "inv_renum:", "inv_cancel:", "inv_cash:")):
-        action, inv_id_str = data.split(":", 1)
-        conn = db()
-        inv = conn.execute("SELECT * FROM invoices WHERE id=?", (int(inv_id_str),)).fetchone()
-        conn.close()
-        if not inv:
-            await query.edit_message_text("Рахунок не знайдено.")
-            return
-        if inv["status"] == "sent":
-            await query.edit_message_text(f"Рахунок № {inv['number']} уже надіслано клієнту.")
-            return
-        if inv["status"] == "cancelled":
-            await query.edit_message_text(f"Рахунок № {inv['number']} скасовано.")
-            return
-
-        if action == "inv_cancel":
-            conn = db()
-            conn.execute("UPDATE invoices SET status='cancelled' WHERE id=?", (inv["id"],))
-            conn.commit()
-            conn.close()
-            await query.edit_message_text(f"Рахунок № {inv['number']} скасовано, клієнту нічого не надіслано.")
-            return
-
-        if action == "inv_cash":
-            conn = db()
-            order_row = conn.execute("SELECT * FROM orders WHERE id=?", (inv["order_id"],)).fetchone()
-            conn.close()
-            fop = _get_fop(inv["fop_id"])
-            if not order_row or not fop:
-                await query.edit_message_text("Не вдалось перерахувати рахунок: замовлення або ФОП більше не існує.")
-                return
-            new_cash = not bool(inv["cash"])
-            profile = _get_client_profile(inv["client_chat_id"]) or {}
-            text, total, warnings = _build_invoice(
-                order_row, fop, inv["number"], _fmt_iso(inv["created_at"]), profile, inv["client_chat_id"], cash=new_cash
-            )
-            conn = db()
-            conn.execute("UPDATE invoices SET cash=?, text=?, total=? WHERE id=?", (int(new_cash), text, total, inv["id"]))
-            conn.commit()
-            conn.close()
-            body, kb = _invoice_preview(inv["id"], text, warnings, new_cash)
-            await query.edit_message_text(body, parse_mode="HTML", reply_markup=kb)
-            return
-
-        if action == "inv_renum":
-            st = {
-                "invoice_id": inv["id"], "order_id": inv["order_id"], "client_chat_id": inv["client_chat_id"],
-                "group_chat_id": inv["group_chat_id"], "group_message_id": inv["group_message_id"],
-                "fop_id": inv["fop_id"], "stage": "number", "cash": inv["cash"],
-            }
-            INVOICE_PENDING[admin_id] = st
-            await query.edit_message_reply_markup(reply_markup=None)
-            await _invoice_ask_number(context, admin_id, st, renumber=True)
-            return
-
-        # inv_send
-        try:
-            sent = await context.bot.send_message(inv["client_chat_id"], inv["text"] + _invoice_hint(), parse_mode="HTML")
-        except Exception as e:
-            logger.warning(f"Не вдалось надіслати рахунок клієнту {inv['client_chat_id']}: {e}")
-            await context.bot.send_message(
-                admin_id,
-                f"❌ Не вдалось надіслати рахунок клієнту (можливо, він заблокував бота): {e}\n"
-                "Рахунок лишається чернеткою, можна спробувати ще раз.",
-            )
-            return
-        conn = db()
-        conn.execute(
-            "UPDATE invoices SET status='sent', sent_at=? WHERE id=?", (datetime.now(TZ).isoformat(), inv["id"])
-        )
-        conn.commit()
-        conn.close()
-        try:
-            _log_message(inv["client_chat_id"], "out", inv["text"], sent.message_id)
-        except Exception:
-            pass
-        await query.edit_message_text(f"✅ Рахунок № {inv['number']} надіслано клієнту.")
-        fop = _get_fop(inv["fop_id"])
-        if inv["group_chat_id"] and inv["group_message_id"]:
-            note = f"🧾 Рахунок № {inv['number']} надіслано клієнту — {_fop_short_name(fop['name']) if fop else 'ФОП'}, {_money(inv['total'])} грн"
-            try:
-                await context.bot.send_message(inv["group_chat_id"], note, reply_to_message_id=inv["group_message_id"])
-            except Exception:
-                try:
-                    await context.bot.send_message(inv["group_chat_id"], note)
-                except Exception as e:
-                    logger.warning(f"Не вдалось написати в групу про рахунок: {e}")
-        return
-
-
-async def handle_fop_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Адмін надіслав реквізити ФОП за шаблоном (додавання або редагування)."""
-    admin_id = update.effective_chat.id
-    st = FOP_PENDING.get(admin_id)
-    if not st:
-        return
-    data, errors = _parse_fop_template(update.message.text or "")
-    if errors:
-        await update.message.reply_text(
-            "Не вдалось зберегти реквізити:\n• " + "\n• ".join(errors) +
-            "\n\nНадішліть ще раз: можна вставити реквізити з вашого рахунку як є (потрібні ФОП із прізвищем, "
-            "код, IBAN) або за шаблоном. Скасувати — /cancel."
-        )
-        return
-    conn = db()
-    if st.get("mode") == "edit" and st.get("fop_id"):
-        conn.execute(
-            "UPDATE fops SET name=?, tax_id=?, iban=?, bank=?, note=? WHERE id=?",
-            (data["name"], data["tax_id"], data["iban"], data["bank"], data["note"], st["fop_id"]),
-        )
-        fop_id = st["fop_id"]
-    else:
-        cur = conn.execute(
-            "INSERT INTO fops (name, tax_id, iban, bank, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (data["name"], data["tax_id"], data["iban"], data["bank"], data["note"], datetime.now(TZ).isoformat()),
-        )
-        fop_id = cur.lastrowid
-    conn.commit()
-    total = conn.execute("SELECT COUNT(*) c FROM fops").fetchone()["c"]
-    conn.close()
-    FOP_PENDING.pop(admin_id, None)
-    extra = ""
-    if total == 1 and not _default_fop_id():
-        _set_setting("default_fop_id", str(fop_id))
-        extra = "\nЦе ваш єдиний ФОП, тому він став основним: рахунки всім клієнтам без окремого призначення виставлятимуться на нього."
-    await update.message.reply_text(
-        f"✅ ФОП «{_esc(_fop_short_name(data['name']))}» збережено. Перевірте, чи все розпізнано правильно:\n\n"
-        f"<b>{_esc(data['name'])}</b>\n"
-        f"ІПН/ЄДРПОУ: {_esc(data['tax_id'])}\n"
-        f"IBAN: <code>{_esc(data['iban'])}</code>\n"
-        f"Банк: {_esc(data['bank'] or '—')}\n"
-        f"Примітка: {_esc(data['note'] or '—')}{extra}",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Виправити", callback_data=f"menu_fopedit:{fop_id}")],
-            [InlineKeyboardButton("🏢 До реквізитів ФОП", callback_data="menu_fops")],
-        ]),
-    )
-
-
-# ---- Архів рахунків: для клієнта («Деталі → Мої рахунки») і для адміна (меню «Клієнти») ----
-INVOICES_PAGE_SIZE = 8
-
-
-def _fmt_iso(iso, with_time: bool = False) -> str:
-    try:
-        d = datetime.fromisoformat(iso)
-        return d.strftime("%d.%m.%Y %H:%M" if with_time else "%d.%m.%Y")
-    except (TypeError, ValueError):
-        return "—"
-
-
-def _invoice_client_label(chat_id) -> str:
-    p = _get_client_profile(chat_id) or {}
-    label = p.get("point_name") or p.get("full_name")
-    if label:
-        return label
-    conn = db()
-    row = conn.execute("SELECT name FROM subscribers WHERE chat_id=?", (chat_id,)).fetchone()
-    conn.close()
-    return row["name"] if row and row["name"] else str(chat_id)
-
-
-def _invoice_hint() -> str:
-    """Підказка, що додається до рахунку при надсиланні клієнту (в збережений текст не входить)."""
-    return "\n\n<i>Усі ваші рахунки можна знайти тут: 📋 Деталі → 🧾 Мої рахунки</i>"
-
-
-def _invoice_nav_row(offset: int, more: bool, make_cb) -> list:
-    row = []
-    if offset > 0:
-        row.append(InlineKeyboardButton("⬅️ Новіші", callback_data=make_cb(max(0, offset - INVOICES_PAGE_SIZE))))
-    if more:
-        row.append(InlineKeyboardButton("Старіші ➡️", callback_data=make_cb(offset + INVOICES_PAGE_SIZE)))
-    return row
-
-
-def _client_invoices_screen(chat_id: int, offset: int):
-    """Список рахунків, які бот надіслав цьому клієнту (тільки надіслані; нові зверху)."""
-    conn = db()
-    rows = conn.execute(
-        "SELECT id, number, total, sent_at FROM invoices WHERE client_chat_id=? AND status='sent' "
-        "ORDER BY id DESC LIMIT ? OFFSET ?",
-        (chat_id, INVOICES_PAGE_SIZE + 1, offset),
-    ).fetchall()
-    conn.close()
-    more = len(rows) > INVOICES_PAGE_SIZE
-    rows = rows[:INVOICES_PAGE_SIZE]
-    back = [InlineKeyboardButton("🔙 Назад", callback_data="clientdetails_menu")]
-    if not rows:
-        return "Рахунків поки немає.", InlineKeyboardMarkup([back])
-    buttons = [
-        [InlineKeyboardButton(
-            f"№ {r['number']} · {_fmt_iso(r['sent_at'])} · {_money(r['total'])} грн",
-            callback_data=f"clientdetails_invview:{r['id']}:{offset}",
-        )]
-        for r in rows
-    ]
-    nav = _invoice_nav_row(offset, more, lambda o: f"clientdetails_invoices:{o}")
-    if nav:
-        buttons.append(nav)
-    buttons.append(back)
-    return "🧾 Ваші рахунки (нові зверху). Натисніть, щоб відкрити:", InlineKeyboardMarkup(buttons)
-
-
-def _admin_invoices_screen(offset: int, client_chat_id=None):
-    """Список рахунків для адміна: усі (крім скасованих) або одного клієнта."""
-    conn = db()
-    if client_chat_id:
-        rows = conn.execute(
-            "SELECT id, number, total, status, client_chat_id FROM invoices "
-            "WHERE status!='cancelled' AND client_chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
-            (client_chat_id, INVOICES_PAGE_SIZE + 1, offset),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, number, total, status, client_chat_id FROM invoices "
-            "WHERE status!='cancelled' ORDER BY id DESC LIMIT ? OFFSET ?",
-            (INVOICES_PAGE_SIZE + 1, offset),
-        ).fetchall()
-    conn.close()
-    more = len(rows) > INVOICES_PAGE_SIZE
-    rows = rows[:INVOICES_PAGE_SIZE]
-    cid_part = client_chat_id or 0
-    back_cb = "menu_invclients" if client_chat_id else "menu_invoices"
-    back = [InlineKeyboardButton("🔙 Назад", callback_data=back_cb)]
-    if not rows:
-        return "Рахунків поки немає.", InlineKeyboardMarkup([back])
-    buttons = []
-    for r in rows:
-        mark = "✅" if r["status"] == "sent" else "📝"
-        label = f"{mark} № {r['number']} · {_invoice_client_label(r['client_chat_id'])[:24]} · {_money(r['total'])}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"menu_invview:{r['id']}:{offset}:{cid_part}")])
-    if client_chat_id:
-        make_cb = lambda o: f"menu_invbyclient:{client_chat_id}:{o}"
-    else:
-        make_cb = lambda o: f"menu_invlist:{o}"
-    nav = _invoice_nav_row(offset, more, make_cb)
-    if nav:
-        buttons.append(nav)
-    buttons.append(back)
-    title = "🧾 Рахунки клієнта (нові зверху):" if client_chat_id else "🧾 Останні рахунки (нові зверху). ✅ надіслано, 📝 чернетка:"
-    return title, InlineKeyboardMarkup(buttons)
 
 
 async def _scan_inactive_clients(context: ContextTypes.DEFAULT_TYPE):
@@ -9126,8 +8154,6 @@ def main():
     application.add_handler(CallbackQueryHandler(grouporder_append_callback, pattern=r"^grouporder_append:"))
     application.add_handler(CallbackQueryHandler(grouporder_accept_callback, pattern=r"^grouporder_accept:"))
     application.add_handler(CallbackQueryHandler(grouporder_np_callback, pattern=r"^grouporder_np:"))
-    application.add_handler(CallbackQueryHandler(grouporder_invoice_callback, pattern=r"^grouporder_invoice:"))
-    application.add_handler(CallbackQueryHandler(invoice_callback, pattern=r"^inv_"))
     application.add_handler(CallbackQueryHandler(grouporder_del_callback, pattern=r"^grouporder_del:"))
     application.add_handler(CallbackQueryHandler(grouporder_delconfirm_callback, pattern=r"^grouporder_delconfirm:"))
     application.add_handler(CallbackQueryHandler(grouporder_delcancel_callback, pattern=r"^grouporder_delcancel:"))
