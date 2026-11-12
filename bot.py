@@ -7965,6 +7965,47 @@ def _seed_item_prices_if_empty():
         _set_setting("remove_not_in_price_20261112", "1")
         logger.info("[PRICE-REMOVE] Прибрано з прайсу й асортименту: Infuse Apricot Brandy, Палай Ефіопія №32 Gedeo.")
 
+    # Повертаємо «Бленд White на сідамо» в асортимент (його було прибрано разом з іншими позиціями без загальної ціни).
+    # Загальної ціни в нього нема - ціни задаються клієнтам індивідуально; уже задані індивідуальні ціни нікуди
+    # не зникали, тож з поверненням позиції вони знову працюють. Ставимо одразу після «Hermit» (або нагору).
+    if _get_setting("restore_white_sidamo_v1", "") != "1":
+        current_blend = _get_setting("assortment_blend", "")
+        if current_blend.strip():
+            blend_lines = current_blend.split("\n")
+            if not any("white" in ln.lower() and "сідамо" in ln.lower() for ln in blend_lines):
+                hermit_idx = next((i for i, ln in enumerate(blend_lines) if "ermit" in ln.lower()), None)
+                blend_lines.insert(hermit_idx + 1 if hermit_idx is not None else 0, "Бленд White на сідамо")
+                _set_setting("assortment_blend", "\n".join(blend_lines))
+            _set_setting("restore_white_sidamo_v1", "1")
+            logger.info("[ASSORTMENT-RESTORE] Повернено Бленд White на сідамо в асортимент.")
+
+    # Клієнту «Можекави»: індивідуальні ціни за 1 кг - Бленд White на сідамо 645 грн, Кенія Tiriku 780 грн.
+    # Клієнта шукаємо за назвою (ім'я / нік / картка); якщо не знайшли - наступного запуску спробуємо ще раз.
+    if _get_setting("mozhekavy_prices_v1", "") != "1":
+        def _norm_client_text(x):
+            return re.sub(r"[\s\-_'’`\"«»]+", "", str(x or "").lower())
+        client_rows = conn.execute(
+            "SELECT s.chat_id, s.name, s.username, p.full_name, p.point_name FROM subscribers s "
+            "LEFT JOIN client_profiles p ON p.chat_id = s.chat_id"
+        ).fetchall()
+        matched_ids = [
+            r["chat_id"] for r in client_rows
+            if any("можекав" in _norm_client_text(r[f]) for f in ("name", "username", "full_name", "point_name"))
+        ]
+        if matched_ids:
+            white_name = next(
+                (ln for ln in _parse_assortment_items("blend") if "white" in ln.lower() and "сідамо" in ln.lower()),
+                "Бленд White на сідамо",
+            )
+            kenya_name = next((ln for ln in _parse_assortment_items("palay") if "tiriku" in ln.lower()), "Кенія Tiriku")
+            for cid in matched_ids:
+                _set_client_item_price(cid, "blend", white_name, "1 кг", 645.0)
+                _set_client_item_price(cid, "palay", kenya_name, "1 кг", 780.0)
+            _set_setting("mozhekavy_prices_v1", "1")
+            logger.info(f"[CLIENT-PRICES] Можекави: задано індивідуальні ціни (клієнтів: {len(matched_ids)}).")
+        else:
+            logger.warning("[CLIENT-PRICES] Клієнта «Можекави» не знайдено - ціни не задано, спробую при наступному запуску.")
+
     conn.close()
 
 
