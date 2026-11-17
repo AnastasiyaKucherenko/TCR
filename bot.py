@@ -13,12 +13,13 @@ import html
 import json
 import re
 import sqlite3
+import time as _time_module
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Conflict, Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -8065,6 +8066,35 @@ async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"[BLOCKED] Клієнт {cmu.chat.id} заблокував бота - позначено неактивним.")
 
 
+# ---- Конфлікт «two bot instances» ----------------------------------------------------------
+# Під час деплою на Railway стара й нова версії кілька секунд працюють разом, і Telegram дає
+# «Conflict: terminated by other getUpdates request». Це нормально і саме минає, тому адміна не
+# турбуємо. Сповіщаємо лише коли конфлікт триває довго - тоді десь справді запущена друга копія.
+CONFLICT_SUSTAINED_SECONDS = 180      # скільки хвилин безперервного конфлікту вважаємо проблемою
+CONFLICT_GAP_SECONDS = 120            # пауза без конфліктів довше за це - «серія» закінчилась
+CONFLICT_NOTIFY_COOLDOWN = 3600       # повторне сповіщення не частіше ніж раз на годину
+_CONFLICT_STATE = {"streak_start": None, "last": None, "notified_at": None}
+
+
+def _conflict_now() -> float:
+    return _time_module.monotonic()
+
+
+def _register_conflict() -> bool:
+    """Записує ще один конфлікт. Повертає True, якщо про це треба повідомити адміна."""
+    now = _conflict_now()
+    st = _CONFLICT_STATE
+    if st["last"] is None or now - st["last"] > CONFLICT_GAP_SECONDS:
+        st["streak_start"] = now           # нова серія конфліктів
+    st["last"] = now
+    if now - st["streak_start"] < CONFLICT_SUSTAINED_SECONDS:
+        return False
+    if st["notified_at"] is not None and now - st["notified_at"] < CONFLICT_NOTIFY_COOLDOWN:
+        return False
+    st["notified_at"] = now
+    return True
+
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Ловить УСІ необроблені помилки в будь-якому обробнику бота. Без цього помилка була б
     повністю "тихою" - ні адмін, ні клієнт нічого не бачили б, окрім рядка в логах Railway."""
@@ -8074,6 +8104,26 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     # ту саму кнопку (подвійний тап). Нічого не зламано, нікого не турбуємо через це.
     if "Message is not modified" in str(context.error):
         logger.info(f"[IGNORED] Подвійний тап (нешкідливо): {error_text}")
+        return
+
+    # Конфлікт двох копій бота (зазвичай - накладання старої й нової версії під час деплою).
+    if isinstance(context.error, Conflict) or "terminated by other getUpdates request" in str(context.error):
+        if not _register_conflict():
+            logger.info("[CONFLICT] Коротке накладання двох копій бота (зазвичай деплой) - не турбуємо адміна.")
+            return
+        logger.error("[CONFLICT] Конфлікт триває кілька хвилин - ймовірно, запущена друга копія бота.")
+        if ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    ADMIN_IDS[0],
+                    "⚠️ Конфлікт триває вже кілька хвилин: з цим токеном бота запущена ще одна копія.\n\n"
+                    "Перевірте на Railway, що в сервісі лише один активний деплой і одна репліка, і що бот "
+                    "не запущений ще десь (інший сервіс, комп'ютер). Якщо не знайдете - перевипустіть токен у "
+                    "@BotFather (/mybots → ваш бот → API Token → Revoke current token) і вставте новий у "
+                    "змінну BOT_TOKEN на Railway.",
+                )
+            except Exception:
+                pass
         return
 
     # Мережеві збої (моментна нестабільність з'єднання з Telegram чи хостингом) - НЕ помилка
