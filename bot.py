@@ -8095,6 +8095,28 @@ def _register_conflict() -> bool:
     return True
 
 
+# ---- Мережеві збої ---------------------------------------------------------------------------
+# Поодинокі обриви зв'язку з Telegram трапляються постійно і минають самі - адміна не турбуємо.
+# Пишемо лише коли їх багато за короткий час (тоді справді проблема з мережею/хостингом).
+NETWORK_ERR_WINDOW = 600              # вікно, секунд
+NETWORK_ERR_THRESHOLD = 5             # скільки збоїв у вікні вважаємо проблемою
+NETWORK_ERR_COOLDOWN = 3600           # не частіше ніж раз на годину
+_NETWORK_ERR_STATE = {"times": [], "notified_at": None}
+
+
+def _register_network_error() -> bool:
+    """Записує мережевий збій. Повертає True, якщо про це час повідомити адміна."""
+    now = _conflict_now()
+    st = _NETWORK_ERR_STATE
+    st["times"] = [t for t in st["times"] if now - t <= NETWORK_ERR_WINDOW] + [now]
+    if len(st["times"]) < NETWORK_ERR_THRESHOLD:
+        return False
+    if st["notified_at"] is not None and now - st["notified_at"] < NETWORK_ERR_COOLDOWN:
+        return False
+    st["notified_at"] = now
+    return True
+
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Ловить УСІ необроблені помилки в будь-якому обробнику бота. Без цього помилка була б
     повністю "тихою" - ні адмін, ні клієнт нічого не бачили б, окрім рядка в логах Railway."""
@@ -8133,14 +8155,21 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         for marker in ("NetworkError", "ConnectError", "Bad Gateway", "TimedOut", "ReadTimeout", "ConnectTimeout")
     )
 
-    logger.error("Необроблена помилка в обробнику:", exc_info=context.error)
+    if is_network_error:
+        if not _register_network_error():
+            logger.warning(f"[NETWORK] Разовий збій з'єднання (адміна не турбуємо): {error_text}")
+            return
+        logger.error(f"[NETWORK] Багато мережевих збоїв поспіль: {error_text}")
+    else:
+        logger.error("Необроблена помилка в обробнику:", exc_info=context.error)
     if ADMIN_IDS:
         try:
             chat_info = ""
             if isinstance(update, Update) and update.effective_chat:
                 chat_info = f"\nchat_id: {update.effective_chat.id}"
             if is_network_error:
-                header = "🌐 Тимчасовий збій з'єднання (не проблема в самому боті, зазвичай минає само)"
+                header = ("🌐 Мережеві збої повторюються (кілька за 10 хвилин). Перевірте статус Railway "
+                          "та telegram-status; якщо все працює - це тимчасове")
             else:
                 header = "⚠️ У боті сталася помилка при обробці повідомлення"
             await context.bot.send_message(
